@@ -1,0 +1,152 @@
+_out/Linux_x86_64/therm_lr10.o: \
+ ../common/nvswitch/kernel/lr10/therm_lr10.c \
+ ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/nvswitch/interface/export_nvswitch.h \
+ ../common/sdk/nvidia/inc/nv_stdarg.h \
+ ../common/nvlink/interface/nvlink_common.h \
+ ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/inc/nvCpuUuid.h ../common/nvlink/interface/nvlink_errors.h \
+ ../common/nvswitch/interface/ioctl_common_nvswitch.h \
+ ../common/nvswitch/kernel/inc/common_nvswitch.h \
+ ../common/nvlink/interface/nvlink.h \
+ ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
+ ../common/nvlink/interface/nvlink_common.h \
+ ../common/nvlink/interface/nvlink_lib_ctrl.h ../common/inc/nv_list.h \
+ ../common/sdk/nvidia/inc/nvmisc.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/nvswitch/kernel/inc/error_nvswitch.h \
+ ../common/nvswitch/interface/ctrl_dev_nvswitch.h \
+ ../common/sdk/nvidia/inc/nvfixedtypes.h \
+ ../common/nvswitch/kernel/inc/io_nvswitch.h \
+ ../common/nvswitch/kernel/inc/rom_nvswitch.h \
+ ../common/nvswitch/kernel/inc/pmgr_nvswitch.h \
+ ../common/nvswitch/kernel/inc/haldef_nvswitch.h \
+ arch/nvalloc/common/inc/inforom/ifrstruct.h \
+ arch/nvalloc/common/inc/inforom/types.h \
+ arch/nvalloc/common/inc/inforom/ifrnvl.h \
+ arch/nvalloc/common/inc/inforom/ifrecc.h \
+ arch/nvalloc/common/inc/inforom/ifrdem.h \
+ arch/nvalloc/common/inc/inforom/omsdef.h ../common/inc/nvctassert.h \
+ ../common/nvswitch/kernel/inc/flcn/flcnable_nvswitch.h \
+ ../common/nvswitch/kernel/inc/flcn/haldefs_flcnable_nvswitch.h \
+ ../common/sdk/nvidia/inc/nvstatus.h \
+ ../common/sdk/nvidia/inc/nvstatuscodes.h \
+ arch/nvalloc/common/inc/flcnifcmn.h arch/nvalloc/common/inc/flcnretval.h \
+ ../common/nvlink/interface/nvlink_errors.h \
+ ../common/nvswitch/kernel/inc/inforom/inforom_nvswitch.h \
+ ../common/nvswitch/common/inc/smbpbi_shared_nvswitch.h \
+ ../common/nvswitch/kernel/inc/spi_nvswitch.h \
+ ../common/nvswitch/kernel/inc/smbpbi_nvswitch.h \
+ ../common/nvswitch/common/inc/soe/soeifsmbpbi.h \
+ arch/nvalloc/common/inc/oob/smbpbi.h \
+ arch/nvalloc/common/inc/oob/smbpbi_impl.h \
+ arch/nvalloc/common/inc/oob/smbpbi_priv.h \
+ ../common/nvswitch/kernel/inc/fsprpc_nvswitch.h \
+ arch/nvalloc/common/inc/fsp/fsp_emem_channels.h \
+ arch/nvalloc/common/inc/fsp/nvdm_payload_cmd_response.h \
+ arch/nvalloc/common/inc/fsp/fsp_nvdm_format.h \
+ arch/nvalloc/common/inc/fsp/fsp_mctp_format.h \
+ arch/nvalloc/common/inc/fsp/fsp_tnvl_rpc.h \
+ ../common/nvswitch/common/inc/soe/cci/cpld_machx03.h \
+ ../common/nvswitch/kernel/inc/error_nvswitch.h \
+ ../common/nvswitch/kernel/inc/lr10/lr10.h \
+ ../common/nvswitch/kernel/inc/pmgr_nvswitch.h \
+ ../common/nvswitch/kernel/inc/rom_nvswitch.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvs_master.h \
+ ../common/nvswitch/kernel/inc/lr10/therm_lr10.h \
+ ../common/nvswitch/common/inc/soe/soeiftherm.h \
+ ../common/nvswitch/common/inc/rmflcncmdif_nvswitch.h \
+ ../common/nvswitch/common/inc/rmsoecmdif.h \
+ ../common/nvswitch/common/inc/soe/soebif.h \
+ ../common/nvswitch/common/inc/soe/soeifcmn.h \
+ ../common/nvswitch/common/inc/soe/soeifsoe.h \
+ ../common/nvswitch/common/inc/soe/soeiftest.h \
+ ../common/nvswitch/common/inc/soe/soeiftherm.h \
+ ../common/nvswitch/common/inc/soe/soeifspi.h \
+ ../common/nvswitch/common/inc/soe/soeififr.h \
+ ../common/nvswitch/common/inc/soe/soeifsmbpbi.h \
+ ../common/nvswitch/common/inc/soe/soeifcore.h \
+ ../common/nvswitch/common/inc/soe/soeifchnmgmt.h \
+ ../common/nvswitch/common/inc/soe/soeiftnvl.h \
+ ../common/nvswitch/common/inc/soe/soeifcci.h \
+ ../common/nvswitch/common/inc/soe/soeifheartbeat.h \
+ ../common/nvswitch/kernel/inc/soe/soe_nvswitch.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_therm.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvlsaw_ip.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/nvswitch/interface/export_nvswitch.h:
+../common/sdk/nvidia/inc/nv_stdarg.h:
+../common/nvlink/interface/nvlink_common.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/inc/nvCpuUuid.h:
+../common/nvlink/interface/nvlink_errors.h:
+../common/nvswitch/interface/ioctl_common_nvswitch.h:
+../common/nvswitch/kernel/inc/common_nvswitch.h:
+../common/nvlink/interface/nvlink.h:
+../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
+../common/nvlink/interface/nvlink_common.h:
+../common/nvlink/interface/nvlink_lib_ctrl.h:
+../common/inc/nv_list.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/nvswitch/kernel/inc/error_nvswitch.h:
+../common/nvswitch/interface/ctrl_dev_nvswitch.h:
+../common/sdk/nvidia/inc/nvfixedtypes.h:
+../common/nvswitch/kernel/inc/io_nvswitch.h:
+../common/nvswitch/kernel/inc/rom_nvswitch.h:
+../common/nvswitch/kernel/inc/pmgr_nvswitch.h:
+../common/nvswitch/kernel/inc/haldef_nvswitch.h:
+arch/nvalloc/common/inc/inforom/ifrstruct.h:
+arch/nvalloc/common/inc/inforom/types.h:
+arch/nvalloc/common/inc/inforom/ifrnvl.h:
+arch/nvalloc/common/inc/inforom/ifrecc.h:
+arch/nvalloc/common/inc/inforom/ifrdem.h:
+arch/nvalloc/common/inc/inforom/omsdef.h:
+../common/inc/nvctassert.h:
+../common/nvswitch/kernel/inc/flcn/flcnable_nvswitch.h:
+../common/nvswitch/kernel/inc/flcn/haldefs_flcnable_nvswitch.h:
+../common/sdk/nvidia/inc/nvstatus.h:
+../common/sdk/nvidia/inc/nvstatuscodes.h:
+arch/nvalloc/common/inc/flcnifcmn.h:
+arch/nvalloc/common/inc/flcnretval.h:
+../common/nvlink/interface/nvlink_errors.h:
+../common/nvswitch/kernel/inc/inforom/inforom_nvswitch.h:
+../common/nvswitch/common/inc/smbpbi_shared_nvswitch.h:
+../common/nvswitch/kernel/inc/spi_nvswitch.h:
+../common/nvswitch/kernel/inc/smbpbi_nvswitch.h:
+../common/nvswitch/common/inc/soe/soeifsmbpbi.h:
+arch/nvalloc/common/inc/oob/smbpbi.h:
+arch/nvalloc/common/inc/oob/smbpbi_impl.h:
+arch/nvalloc/common/inc/oob/smbpbi_priv.h:
+../common/nvswitch/kernel/inc/fsprpc_nvswitch.h:
+arch/nvalloc/common/inc/fsp/fsp_emem_channels.h:
+arch/nvalloc/common/inc/fsp/nvdm_payload_cmd_response.h:
+arch/nvalloc/common/inc/fsp/fsp_nvdm_format.h:
+arch/nvalloc/common/inc/fsp/fsp_mctp_format.h:
+arch/nvalloc/common/inc/fsp/fsp_tnvl_rpc.h:
+../common/nvswitch/common/inc/soe/cci/cpld_machx03.h:
+../common/nvswitch/kernel/inc/error_nvswitch.h:
+../common/nvswitch/kernel/inc/lr10/lr10.h:
+../common/nvswitch/kernel/inc/pmgr_nvswitch.h:
+../common/nvswitch/kernel/inc/rom_nvswitch.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvs_master.h:
+../common/nvswitch/kernel/inc/lr10/therm_lr10.h:
+../common/nvswitch/common/inc/soe/soeiftherm.h:
+../common/nvswitch/common/inc/rmflcncmdif_nvswitch.h:
+../common/nvswitch/common/inc/rmsoecmdif.h:
+../common/nvswitch/common/inc/soe/soebif.h:
+../common/nvswitch/common/inc/soe/soeifcmn.h:
+../common/nvswitch/common/inc/soe/soeifsoe.h:
+../common/nvswitch/common/inc/soe/soeiftest.h:
+../common/nvswitch/common/inc/soe/soeiftherm.h:
+../common/nvswitch/common/inc/soe/soeifspi.h:
+../common/nvswitch/common/inc/soe/soeififr.h:
+../common/nvswitch/common/inc/soe/soeifsmbpbi.h:
+../common/nvswitch/common/inc/soe/soeifcore.h:
+../common/nvswitch/common/inc/soe/soeifchnmgmt.h:
+../common/nvswitch/common/inc/soe/soeiftnvl.h:
+../common/nvswitch/common/inc/soe/soeifcci.h:
+../common/nvswitch/common/inc/soe/soeifheartbeat.h:
+../common/nvswitch/kernel/inc/soe/soe_nvswitch.h:
+../common/inc/swref/published/nvswitch/lr10/dev_therm.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvlsaw_ip.h:

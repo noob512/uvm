@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_PRESENT_timer_delete_sync 1

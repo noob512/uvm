@@ -1,0 +1,35 @@
+_out/Linux_x86_64/nvlink_ioctl_entry.o: \
+ ../common/nvlink/kernel/nvlink/interface/nvlink_ioctl_entry.c \
+ ../common/sdk/nvidia/inc/cpuopsys.h ../common/nvlink/interface/nvlink.h \
+ ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
+ ../common/nvlink/interface/nvlink_common.h \
+ ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/inc/nvCpuUuid.h ../common/nvlink/interface/nvlink_errors.h \
+ ../common/nvlink/interface/nvlink_lib_ctrl.h ../common/inc/nv_list.h \
+ ../common/sdk/nvidia/inc/nvmisc.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/inc/nvVer.h ../common/inc/nvUnixVersion.h \
+ ../common/nvlink/interface/nvlink_os.h \
+ ../common/nvlink/interface/nvlink_lib_ctrl.h \
+ ../common/nvlink/kernel/nvlink/interface/../nvlink_ctx.h \
+ ../common/nvlink/kernel/nvlink/interface/../nvlink_helper.h \
+ ../common/nvlink/interface/nvlink_lock.h ../common/inc/nvctassert.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/nvlink/interface/nvlink.h:
+../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
+../common/nvlink/interface/nvlink_common.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/inc/nvCpuUuid.h:
+../common/nvlink/interface/nvlink_errors.h:
+../common/nvlink/interface/nvlink_lib_ctrl.h:
+../common/inc/nv_list.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/inc/nvVer.h:
+../common/inc/nvUnixVersion.h:
+../common/nvlink/interface/nvlink_os.h:
+../common/nvlink/interface/nvlink_lib_ctrl.h:
+../common/nvlink/kernel/nvlink/interface/../nvlink_ctx.h:
+../common/nvlink/kernel/nvlink/interface/../nvlink_helper.h:
+../common/nvlink/interface/nvlink_lock.h:
+../common/inc/nvctassert.h:

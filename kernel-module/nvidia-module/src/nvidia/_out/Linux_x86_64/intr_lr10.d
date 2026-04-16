@@ -1,0 +1,167 @@
+_out/Linux_x86_64/intr_lr10.o: \
+ ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/nvswitch/kernel/inc/common_nvswitch.h \
+ ../common/nvlink/interface/nvlink.h \
+ ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
+ ../common/nvlink/interface/nvlink_common.h \
+ ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/inc/nvCpuUuid.h ../common/nvlink/interface/nvlink_errors.h \
+ ../common/nvlink/interface/nvlink_lib_ctrl.h ../common/inc/nv_list.h \
+ ../common/sdk/nvidia/inc/nvmisc.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/nvswitch/interface/export_nvswitch.h \
+ ../common/sdk/nvidia/inc/nv_stdarg.h \
+ ../common/nvlink/interface/nvlink_common.h \
+ ../common/nvswitch/interface/ioctl_common_nvswitch.h \
+ ../common/nvswitch/kernel/inc/error_nvswitch.h \
+ ../common/nvswitch/interface/ctrl_dev_nvswitch.h \
+ ../common/sdk/nvidia/inc/nvfixedtypes.h \
+ ../common/nvswitch/kernel/inc/io_nvswitch.h \
+ ../common/nvswitch/kernel/inc/rom_nvswitch.h \
+ ../common/nvswitch/kernel/inc/pmgr_nvswitch.h \
+ ../common/nvswitch/kernel/inc/haldef_nvswitch.h \
+ arch/nvalloc/common/inc/inforom/ifrstruct.h \
+ arch/nvalloc/common/inc/inforom/types.h \
+ arch/nvalloc/common/inc/inforom/ifrnvl.h \
+ arch/nvalloc/common/inc/inforom/ifrecc.h \
+ arch/nvalloc/common/inc/inforom/ifrdem.h \
+ arch/nvalloc/common/inc/inforom/omsdef.h ../common/inc/nvctassert.h \
+ ../common/nvswitch/kernel/inc/flcn/flcnable_nvswitch.h \
+ ../common/nvswitch/kernel/inc/flcn/haldefs_flcnable_nvswitch.h \
+ ../common/sdk/nvidia/inc/nvstatus.h \
+ ../common/sdk/nvidia/inc/nvstatuscodes.h \
+ arch/nvalloc/common/inc/flcnifcmn.h arch/nvalloc/common/inc/flcnretval.h \
+ ../common/nvlink/interface/nvlink_errors.h \
+ ../common/nvswitch/kernel/inc/inforom/inforom_nvswitch.h \
+ ../common/nvswitch/common/inc/smbpbi_shared_nvswitch.h \
+ ../common/nvswitch/kernel/inc/spi_nvswitch.h \
+ ../common/nvswitch/kernel/inc/smbpbi_nvswitch.h \
+ ../common/nvswitch/common/inc/soe/soeifsmbpbi.h \
+ arch/nvalloc/common/inc/oob/smbpbi.h \
+ arch/nvalloc/common/inc/oob/smbpbi_impl.h \
+ arch/nvalloc/common/inc/oob/smbpbi_priv.h \
+ ../common/nvswitch/kernel/inc/fsprpc_nvswitch.h \
+ arch/nvalloc/common/inc/fsp/fsp_emem_channels.h \
+ arch/nvalloc/common/inc/fsp/nvdm_payload_cmd_response.h \
+ arch/nvalloc/common/inc/fsp/fsp_nvdm_format.h \
+ arch/nvalloc/common/inc/fsp/fsp_mctp_format.h \
+ arch/nvalloc/common/inc/fsp/fsp_tnvl_rpc.h \
+ ../common/nvswitch/common/inc/soe/cci/cpld_machx03.h \
+ ../common/nvswitch/kernel/inc/intr_nvswitch.h \
+ ../common/nvswitch/kernel/inc/lr10/lr10.h \
+ ../common/nvswitch/kernel/inc/pmgr_nvswitch.h \
+ ../common/nvswitch/kernel/inc/rom_nvswitch.h \
+ ../common/nvswitch/kernel/inc/error_nvswitch.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvs_master.h \
+ ../common/nvswitch/kernel/inc/lr10/minion_lr10.h \
+ ../common/nvswitch/kernel/inc/lr10/lr10.h \
+ ../common/nvswitch/kernel/inc/regkey_nvswitch.h \
+ ../common/nvswitch/kernel/inc/soe/soe_nvswitch.h \
+ ../common/nvswitch/kernel/inc/inforom/inforom_nvswitch.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvs.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_timer.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvlsaw_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_pri_ringmaster.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_pri_ringstation_sys.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_pri_ringstation_prt.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nv_xve.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_npg_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nport_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_route_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_ingress_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_sourcetrack_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_egress_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_tstate_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nxbar_tc_global_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nxbar_tile_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvlipt_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvltlc_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvlipt_lnk_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_minion_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvldl_ip.h \
+ ../common/inc/swref/published/nvswitch/lr10/dev_nvlctrl_ip.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/nvswitch/kernel/inc/common_nvswitch.h:
+../common/nvlink/interface/nvlink.h:
+../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
+../common/nvlink/interface/nvlink_common.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/inc/nvCpuUuid.h:
+../common/nvlink/interface/nvlink_errors.h:
+../common/nvlink/interface/nvlink_lib_ctrl.h:
+../common/inc/nv_list.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/nvswitch/interface/export_nvswitch.h:
+../common/sdk/nvidia/inc/nv_stdarg.h:
+../common/nvlink/interface/nvlink_common.h:
+../common/nvswitch/interface/ioctl_common_nvswitch.h:
+../common/nvswitch/kernel/inc/error_nvswitch.h:
+../common/nvswitch/interface/ctrl_dev_nvswitch.h:
+../common/sdk/nvidia/inc/nvfixedtypes.h:
+../common/nvswitch/kernel/inc/io_nvswitch.h:
+../common/nvswitch/kernel/inc/rom_nvswitch.h:
+../common/nvswitch/kernel/inc/pmgr_nvswitch.h:
+../common/nvswitch/kernel/inc/haldef_nvswitch.h:
+arch/nvalloc/common/inc/inforom/ifrstruct.h:
+arch/nvalloc/common/inc/inforom/types.h:
+arch/nvalloc/common/inc/inforom/ifrnvl.h:
+arch/nvalloc/common/inc/inforom/ifrecc.h:
+arch/nvalloc/common/inc/inforom/ifrdem.h:
+arch/nvalloc/common/inc/inforom/omsdef.h:
+../common/inc/nvctassert.h:
+../common/nvswitch/kernel/inc/flcn/flcnable_nvswitch.h:
+../common/nvswitch/kernel/inc/flcn/haldefs_flcnable_nvswitch.h:
+../common/sdk/nvidia/inc/nvstatus.h:
+../common/sdk/nvidia/inc/nvstatuscodes.h:
+arch/nvalloc/common/inc/flcnifcmn.h:
+arch/nvalloc/common/inc/flcnretval.h:
+../common/nvlink/interface/nvlink_errors.h:
+../common/nvswitch/kernel/inc/inforom/inforom_nvswitch.h:
+../common/nvswitch/common/inc/smbpbi_shared_nvswitch.h:
+../common/nvswitch/kernel/inc/spi_nvswitch.h:
+../common/nvswitch/kernel/inc/smbpbi_nvswitch.h:
+../common/nvswitch/common/inc/soe/soeifsmbpbi.h:
+arch/nvalloc/common/inc/oob/smbpbi.h:
+arch/nvalloc/common/inc/oob/smbpbi_impl.h:
+arch/nvalloc/common/inc/oob/smbpbi_priv.h:
+../common/nvswitch/kernel/inc/fsprpc_nvswitch.h:
+arch/nvalloc/common/inc/fsp/fsp_emem_channels.h:
+arch/nvalloc/common/inc/fsp/nvdm_payload_cmd_response.h:
+arch/nvalloc/common/inc/fsp/fsp_nvdm_format.h:
+arch/nvalloc/common/inc/fsp/fsp_mctp_format.h:
+arch/nvalloc/common/inc/fsp/fsp_tnvl_rpc.h:
+../common/nvswitch/common/inc/soe/cci/cpld_machx03.h:
+../common/nvswitch/kernel/inc/intr_nvswitch.h:
+../common/nvswitch/kernel/inc/lr10/lr10.h:
+../common/nvswitch/kernel/inc/pmgr_nvswitch.h:
+../common/nvswitch/kernel/inc/rom_nvswitch.h:
+../common/nvswitch/kernel/inc/error_nvswitch.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvs_master.h:
+../common/nvswitch/kernel/inc/lr10/minion_lr10.h:
+../common/nvswitch/kernel/inc/lr10/lr10.h:
+../common/nvswitch/kernel/inc/regkey_nvswitch.h:
+../common/nvswitch/kernel/inc/soe/soe_nvswitch.h:
+../common/nvswitch/kernel/inc/inforom/inforom_nvswitch.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvs.h:
+../common/inc/swref/published/nvswitch/lr10/dev_timer.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvlsaw_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_pri_ringmaster.h:
+../common/inc/swref/published/nvswitch/lr10/dev_pri_ringstation_sys.h:
+../common/inc/swref/published/nvswitch/lr10/dev_pri_ringstation_prt.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nv_xve.h:
+../common/inc/swref/published/nvswitch/lr10/dev_npg_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nport_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_route_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_ingress_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_sourcetrack_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_egress_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_tstate_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nxbar_tc_global_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nxbar_tile_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvlipt_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvltlc_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvlipt_lnk_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_minion_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvldl_ip.h:
+../common/inc/swref/published/nvswitch/lr10/dev_nvlctrl_ip.h:

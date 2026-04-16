@@ -1,0 +1,82 @@
+_out/Linux_x86_64/nvhdmipkt.o: \
+ ../common/sdk/nvidia/inc/cpuopsys.h ../common/sdk/nvidia/inc/nvlimits.h \
+ ../common/modeset/hdmipacket/nvhdmipkt_common.h \
+ ../common/modeset/hdmipacket/nvhdmipkt.h \
+ ../common/sdk/nvidia/inc/nvmisc.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/modeset/hdmipacket/nvhdmi_frlInterface.h \
+ ../common/inc/nvHdmiFrlCommon.h \
+ ../common/modeset/hdmipacket/../timing/nvtiming.h \
+ ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/modeset/hdmipacket/nvhdmipkt_class.h \
+ ../common/modeset/hdmipacket/nvhdmipkt_internal.h \
+ ../common/modeset/hdmipacket/../timing/nvt_dsc_pps.h \
+ ../common/modeset/hdmipacket/../timing/nvtiming.h \
+ ../common/sdk/nvidia/inc/class/cl9170.h \
+ ../common/sdk/nvidia/inc/class/cl917d.h \
+ ../common/sdk/nvidia/inc/class/cl9270.h \
+ ../common/sdk/nvidia/inc/class/cl927d.h \
+ ../common/sdk/nvidia/inc/class/cl9470.h \
+ ../common/sdk/nvidia/inc/class/cl947d.h \
+ ../common/sdk/nvidia/inc/class/cl9570.h \
+ ../common/sdk/nvidia/inc/class/cl957d.h \
+ ../common/sdk/nvidia/inc/class/clc370.h \
+ ../common/sdk/nvidia/inc/class/clc370_notification.h \
+ ../common/sdk/nvidia/inc/class/cl5070.h \
+ ../common/sdk/nvidia/inc/class/cl5070_notification.h \
+ ../common/sdk/nvidia/inc/class/clc37d.h \
+ ../common/sdk/nvidia/inc/class/clc570.h \
+ ../common/sdk/nvidia/inc/class/clc57d.h \
+ ../common/sdk/nvidia/inc/class/clc670.h \
+ ../common/sdk/nvidia/inc/class/clc67d.h \
+ ../common/sdk/nvidia/inc/class/clc770.h \
+ ../common/sdk/nvidia/inc/class/clc870.h \
+ ../common/sdk/nvidia/inc/class/clc87d.h \
+ ../common/sdk/nvidia/inc/class/clc970.h \
+ ../common/sdk/nvidia/inc/class/clc97d.h \
+ ../common/sdk/nvidia/inc/class/clca70.h \
+ ../common/sdk/nvidia/inc/class/clca7d.h \
+ ../common/sdk/nvidia/inc/class/clcb70.h \
+ ../common/sdk/nvidia/inc/class/clcb7d.h ../common/inc/hdmi_spec.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/sdk/nvidia/inc/nvlimits.h:
+../common/modeset/hdmipacket/nvhdmipkt_common.h:
+../common/modeset/hdmipacket/nvhdmipkt.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/modeset/hdmipacket/nvhdmi_frlInterface.h:
+../common/inc/nvHdmiFrlCommon.h:
+../common/modeset/hdmipacket/../timing/nvtiming.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/modeset/hdmipacket/nvhdmipkt_class.h:
+../common/modeset/hdmipacket/nvhdmipkt_internal.h:
+../common/modeset/hdmipacket/../timing/nvt_dsc_pps.h:
+../common/modeset/hdmipacket/../timing/nvtiming.h:
+../common/sdk/nvidia/inc/class/cl9170.h:
+../common/sdk/nvidia/inc/class/cl917d.h:
+../common/sdk/nvidia/inc/class/cl9270.h:
+../common/sdk/nvidia/inc/class/cl927d.h:
+../common/sdk/nvidia/inc/class/cl9470.h:
+../common/sdk/nvidia/inc/class/cl947d.h:
+../common/sdk/nvidia/inc/class/cl9570.h:
+../common/sdk/nvidia/inc/class/cl957d.h:
+../common/sdk/nvidia/inc/class/clc370.h:
+../common/sdk/nvidia/inc/class/clc370_notification.h:
+../common/sdk/nvidia/inc/class/cl5070.h:
+../common/sdk/nvidia/inc/class/cl5070_notification.h:
+../common/sdk/nvidia/inc/class/clc37d.h:
+../common/sdk/nvidia/inc/class/clc570.h:
+../common/sdk/nvidia/inc/class/clc57d.h:
+../common/sdk/nvidia/inc/class/clc670.h:
+../common/sdk/nvidia/inc/class/clc67d.h:
+../common/sdk/nvidia/inc/class/clc770.h:
+../common/sdk/nvidia/inc/class/clc870.h:
+../common/sdk/nvidia/inc/class/clc87d.h:
+../common/sdk/nvidia/inc/class/clc970.h:
+../common/sdk/nvidia/inc/class/clc97d.h:
+../common/sdk/nvidia/inc/class/clca70.h:
+../common/sdk/nvidia/inc/class/clca7d.h:
+../common/sdk/nvidia/inc/class/clcb70.h:
+../common/sdk/nvidia/inc/class/clcb7d.h:
+../common/inc/hdmi_spec.h:

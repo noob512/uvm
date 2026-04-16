@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_GPL_set_memory_decrypted 1

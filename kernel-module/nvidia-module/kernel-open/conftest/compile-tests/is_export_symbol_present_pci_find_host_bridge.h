@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_PRESENT_pci_find_host_bridge 1

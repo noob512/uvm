@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_PRESENT_migrate_vma_setup 1

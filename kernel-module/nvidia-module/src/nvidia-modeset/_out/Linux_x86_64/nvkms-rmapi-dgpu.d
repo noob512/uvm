@@ -1,0 +1,52 @@
+_out/Linux_x86_64/nvkms-rmapi-dgpu.o: \
+ ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../nvidia/arch/nvalloc/unix/include/nv-kernel-rmapi-ops.h \
+ ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/sdk/nvidia/inc/nvos.h ../common/sdk/nvidia/inc/nvstatus.h \
+ ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/sdk/nvidia/inc/nvstatuscodes.h \
+ ../common/sdk/nvidia/inc/nvgputypes.h \
+ ../common/sdk/nvidia/inc/rs_access.h ../common/sdk/nvidia/inc/nvmisc.h \
+ ../common/sdk/nvidia/inc/nvcfg_sdk.h \
+ ../common/sdk/nvidia/inc/alloc/alloc_channel.h \
+ ../common/sdk/nvidia/inc/nvlimits.h ../common/sdk/nvidia/inc/nvcfg_sdk.h \
+ ../common/sdk/nvidia/inc/class/cl9010.h \
+ ../common/sdk/nvidia/inc/class/cl9010_callback.h \
+ os-interface/include/nvidia-modeset-os-interface.h \
+ os-interface/include/nvkms.h kapi/interface/nvkms-kapi.h \
+ ../common/inc/nv_mig_types.h \
+ ../nvidia/arch/nvalloc/unix/include/nv-gpu-info.h \
+ ../common/unix/common/inc/nv_dpy_id.h ../common/sdk/nvidia/inc/nvmisc.h \
+ ../common/unix/common/inc/nv_common_utils.h interface/nvkms-api-types.h \
+ interface/nvkms-format.h ../common/sdk/nvidia/inc/nv_stdarg.h \
+ include/nvkms-rmapi.h ../common/unix/common/inc/nv_assert.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+../nvidia/arch/nvalloc/unix/include/nv-kernel-rmapi-ops.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/sdk/nvidia/inc/nvos.h:
+../common/sdk/nvidia/inc/nvstatus.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/nvstatuscodes.h:
+../common/sdk/nvidia/inc/nvgputypes.h:
+../common/sdk/nvidia/inc/rs_access.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvcfg_sdk.h:
+../common/sdk/nvidia/inc/alloc/alloc_channel.h:
+../common/sdk/nvidia/inc/nvlimits.h:
+../common/sdk/nvidia/inc/nvcfg_sdk.h:
+../common/sdk/nvidia/inc/class/cl9010.h:
+../common/sdk/nvidia/inc/class/cl9010_callback.h:
+os-interface/include/nvidia-modeset-os-interface.h:
+os-interface/include/nvkms.h:
+kapi/interface/nvkms-kapi.h:
+../common/inc/nv_mig_types.h:
+../nvidia/arch/nvalloc/unix/include/nv-gpu-info.h:
+../common/unix/common/inc/nv_dpy_id.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/unix/common/inc/nv_common_utils.h:
+interface/nvkms-api-types.h:
+interface/nvkms-format.h:
+../common/sdk/nvidia/inc/nv_stdarg.h:
+include/nvkms-rmapi.h:
+../common/unix/common/inc/nv_assert.h:

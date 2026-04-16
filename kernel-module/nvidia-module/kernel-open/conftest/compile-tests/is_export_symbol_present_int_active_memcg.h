@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_PRESENT_int_active_memcg 1

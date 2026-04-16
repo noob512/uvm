@@ -1,0 +1,1 @@
+#define NV_VFIO_PCI_CORE_PRESENT

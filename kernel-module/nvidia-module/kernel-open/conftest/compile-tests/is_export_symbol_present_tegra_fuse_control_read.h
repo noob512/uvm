@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_PRESENT_tegra_fuse_control_read 0

@@ -1,0 +1,22 @@
+_out/Linux_x86_64/nvkms-pow.o: \
+ ../common/sdk/nvidia/inc/cpuopsys.h include/nvkms-softfloat.h \
+ ../common/softfloat/nvidia/nv-softfloat.h \
+ ../common/softfloat/source/include/softfloat.h \
+ ../common/softfloat/source/include/softfloat_types.h \
+ ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/softfloat/nvidia/platform.h interface/nvkms-api-types.h \
+ ../common/sdk/nvidia/inc/nvmisc.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/sdk/nvidia/inc/nvlimits.h ../common/unix/common/inc/nv-float.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+include/nvkms-softfloat.h:
+../common/softfloat/nvidia/nv-softfloat.h:
+../common/softfloat/source/include/softfloat.h:
+../common/softfloat/source/include/softfloat_types.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/softfloat/nvidia/platform.h:
+interface/nvkms-api-types.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/nvlimits.h:
+../common/unix/common/inc/nv-float.h:

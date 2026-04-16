@@ -1,0 +1,3 @@
+_out/Linux_x86_64/g_kern_hwpm_power_nvoc.o: \
+ generated/g_kern_hwpm_power_nvoc.c ../common/sdk/nvidia/inc/cpuopsys.h
+../common/sdk/nvidia/inc/cpuopsys.h:

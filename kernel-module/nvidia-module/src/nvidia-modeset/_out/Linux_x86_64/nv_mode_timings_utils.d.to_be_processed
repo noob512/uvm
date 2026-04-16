@@ -1,0 +1,13 @@
+_out/Linux_x86_64/nv_mode_timings_utils.o: \
+ ../common/unix/common/utils/nv_mode_timings_utils.c \
+ ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/unix/common/utils/interface/nv_mode_timings_utils.h \
+ ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/unix/common/inc/nv_mode_timings.h \
+ ../common/modeset/timing/nvtiming.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/unix/common/utils/interface/nv_mode_timings_utils.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/unix/common/inc/nv_mode_timings.h:
+../common/modeset/timing/nvtiming.h:

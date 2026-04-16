@@ -1,0 +1,1 @@
+#define NV_DRM_FORMAT_INFO_HAS_IS_YUV

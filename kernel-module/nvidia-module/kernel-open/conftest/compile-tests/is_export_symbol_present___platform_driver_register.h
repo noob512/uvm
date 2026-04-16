@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_PRESENT___platform_driver_register 1

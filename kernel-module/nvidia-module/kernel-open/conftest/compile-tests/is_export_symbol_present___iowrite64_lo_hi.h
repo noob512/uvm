@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_PRESENT___iowrite64_lo_hi 0

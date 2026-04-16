@@ -1,0 +1,25 @@
+_out/Linux_x86_64/gcc_helper.o: arch/nvalloc/unix/src/gcc_helper.c \
+ ../common/sdk/nvidia/inc/cpuopsys.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/sdk/nvidia/inc/cpuopsys.h \
+ arch/nvalloc/unix/include/os-interface.h \
+ ../common/sdk/nvidia/inc/nvstatus.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/sdk/nvidia/inc/nvstatuscodes.h \
+ ../common/sdk/nvidia/inc/nv_stdarg.h \
+ ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
+ inc/kernel/os/nv_memory_type.h inc/kernel/os/nv_memory_area.h \
+ arch/nvalloc/unix/include/nv-caps.h ../common/sdk/nvidia/inc/rs_access.h \
+ ../common/sdk/nvidia/inc/nvmisc.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+arch/nvalloc/unix/include/os-interface.h:
+../common/sdk/nvidia/inc/nvstatus.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/nvstatuscodes.h:
+../common/sdk/nvidia/inc/nv_stdarg.h:
+../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
+inc/kernel/os/nv_memory_type.h:
+inc/kernel/os/nv_memory_area.h:
+arch/nvalloc/unix/include/nv-caps.h:
+../common/sdk/nvidia/inc/rs_access.h:
+../common/sdk/nvidia/inc/nvmisc.h:

@@ -1,0 +1,1 @@
+#define NV_PCIE_RESET_FLR_PRESENT

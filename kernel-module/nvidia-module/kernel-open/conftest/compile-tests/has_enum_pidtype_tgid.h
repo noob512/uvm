@@ -1,0 +1,1 @@
+#define NV_HAS_ENUM_PIDTYPE_TGID

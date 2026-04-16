@@ -1,0 +1,237 @@
+_out/Linux_x86_64/mem_fabric_import_ref.o: \
+ \
+ ../common/sdk/nvidia/inc/cpuopsys.h inc/kernel/core/core.h \
+ inc/kernel/core/prelude.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/sdk/nvidia/inc/cpuopsys.h \
+ arch/nvalloc/common/inc/nvrangetypes.h \
+ ../common/sdk/nvidia/inc/nvstatus.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/sdk/nvidia/inc/nvstatuscodes.h \
+ ../common/sdk/nvidia/inc/nvmisc.h ../common/sdk/nvidia/inc/nvlimits.h \
+ ../common/sdk/nvidia/inc/nvos.h ../common/sdk/nvidia/inc/nvstatus.h \
+ ../common/sdk/nvidia/inc/nvgputypes.h \
+ ../common/sdk/nvidia/inc/rs_access.h ../common/sdk/nvidia/inc/nvmisc.h \
+ ../common/sdk/nvidia/inc/nvcfg_sdk.h \
+ ../common/sdk/nvidia/inc/alloc/alloc_channel.h \
+ ../common/sdk/nvidia/inc/nvcfg_sdk.h \
+ ../common/sdk/nvidia/inc/class/cl9010.h \
+ ../common/sdk/nvidia/inc/class/cl9010_callback.h \
+ ../common/inc/nvctassert.h inc/libraries/nvport/nvport.h \
+ inc/libraries/nvport/core.h inc/libraries/nvport/atomic.h \
+ inc/libraries/nvport/inline/atomic_gcc.h inc/libraries/nvport/debug.h \
+ inc/libraries/nvport/inline/debug_unix_kernel_os.h \
+ ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
+ inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
+ inc/libraries/nvport/inline/util_gcc_clang.h \
+ inc/libraries/nvport/inline/util_valist.h inc/libraries/nvport/memory.h \
+ inc/libraries/nvport/inline/memory_tracking.h \
+ inc/libraries/nvport/sync.h inc/libraries/nvport/inline/sync_tracking.h \
+ inc/libraries/nvport/safe.h inc/libraries/nvport/inline/safe_generic.h \
+ inc/libraries/nvport/thread.h inc/libraries/nvport/crypto.h \
+ inc/libraries/nvport/string.h inc/libraries/nvport/cpu.h \
+ inc/libraries/nvoc/object.h inc/libraries/nvoc/prelude.h \
+ inc/libraries/utils/nvmacro.h generated/g_object_nvoc.h \
+ inc/libraries/nvoc/runtime.h inc/libraries/nvoc/rtti.h \
+ inc/kernel/core/printf.h inc/libraries/utils/nvprintf.h \
+ inc/libraries/utils/nvprintf_level.h inc/libraries/nvlog/nvlog_printf.h \
+ inc/libraries/nvlog/internal/nvlog_printf_internal.h \
+ inc/libraries/nvlog/nvlog.h ../common/inc/nvlog_defs.h \
+ generated/rmconfig.h inc/kernel/diagnostics/xid_context.h \
+ inc/kernel/core/strict.h inc/libraries/utils/nvassert.h \
+ inc/libraries/utils/nvmacro.h generated/g_rmconfig_private.h \
+ generated/g_nvh_state.h generated/g_odb.h generated/g_hal.h \
+ ../common/sdk/nvidia/inc/rmcd.h ../common/sdk/nvidia/inc/nvcd.h \
+ inc/kernel/os/os.h generated/g_os_nvoc.h \
+ inc/libraries/containers/btree.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073dfp.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073common.h \
+ ../common/sdk/nvidia/inc/nvsecurityinfo.h interface/nvacpitypes.h \
+ ../common/sdk/nvidia/inc/nvimpshared.h ../common/sdk/nvidia/inc/nvi2c.h \
+ inc/kernel/os/nv_memory_type.h inc/kernel/os/nv_memory_area.h \
+ inc/kernel/os/capability.h arch/nvalloc/unix/include/os_custom.h \
+ arch/nvalloc/unix/include/os-interface.h \
+ ../common/sdk/nvidia/inc/nv_stdarg.h arch/nvalloc/unix/include/nv-caps.h \
+ inc/kernel/rmapi/client.h generated/g_client_nvoc.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000proc.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h \
+ inc/libraries/resserv/resserv.h generated/g_resserv_nvoc.h \
+ inc/libraries/containers/list.h inc/libraries/containers/type_safety.h \
+ inc/libraries/containers/map.h inc/libraries/containers/multimap.h \
+ inc/libraries/resserv/rs_client.h generated/g_rs_client_nvoc.h \
+ inc/libraries/resserv/rs_resource.h generated/g_rs_resource_nvoc.h \
+ inc/libraries/resserv/rs_access_map.h \
+ inc/libraries/resserv/rs_access_rights.h inc/libraries/utils/nvrange.h \
+ inc/kernel/rmapi/resource.h generated/g_resource_nvoc.h \
+ inc/kernel/rmapi/control.h inc/kernel/rmapi/param_copy.h \
+ inc/kernel/rmapi/event.h generated/g_event_nvoc.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h \
+ ../common/sdk/nvidia/inc/class/cl0000.h \
+ ../common/sdk/nvidia/inc/class/cl0000_notification.h \
+ inc/libraries/resserv/rs_server.h generated/g_rs_server_nvoc.h \
+ inc/kernel/gpu/gpu_engine_type.h ../common/sdk/nvidia/inc/class/cl2080.h \
+ ../common/sdk/nvidia/inc/class/cl2080_notification.h \
+ inc/libraries/utils/nvbitvector.h inc/kernel/gpu/mem_mgr/mem_desc.h \
+ generated/g_mem_desc_nvoc.h inc/libraries/poolalloc.h \
+ inc/libraries/nvport/nvport.h inc/libraries/containers/list.h \
+ inc/kernel/mem_mgr/mem_fabric_import_ref.h \
+ generated/g_mem_fabric_import_ref_nvoc.h \
+ inc/kernel/mem_mgr/mem_fabric_import_v2.h \
+ generated/g_mem_fabric_import_v2_nvoc.h inc/kernel/mem_mgr/mem.h \
+ generated/g_mem_nvoc.h inc/kernel/rmapi/rmapi.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0041.h ../common/inc/nvCpuUuid.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl00f9.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl00f8.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl90f1.h \
+ ../common/sdk/nvidia/inc/mmu_fmt_types.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl00fb.h \
+ inc/kernel/gpu/mem_mgr/virt_mem_allocator_common.h \
+ ../common/sdk/nvidia/inc/nvgputypes.h \
+ inc/kernel/gpu/mem_mgr/rm_page_size.h \
+ ../common/sdk/nvidia/inc/class/cl00fb.h \
+ ../common/sdk/nvidia/inc/class/cl00e0.h \
+ ../common/sdk/nvidia/inc/class/cl0080.h \
+ ../common/sdk/nvidia/inc/class/cl0080_notification.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+inc/kernel/core/core.h:
+inc/kernel/core/prelude.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+arch/nvalloc/common/inc/nvrangetypes.h:
+../common/sdk/nvidia/inc/nvstatus.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/nvstatuscodes.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvlimits.h:
+../common/sdk/nvidia/inc/nvos.h:
+../common/sdk/nvidia/inc/nvstatus.h:
+../common/sdk/nvidia/inc/nvgputypes.h:
+../common/sdk/nvidia/inc/rs_access.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvcfg_sdk.h:
+../common/sdk/nvidia/inc/alloc/alloc_channel.h:
+../common/sdk/nvidia/inc/nvcfg_sdk.h:
+../common/sdk/nvidia/inc/class/cl9010.h:
+../common/sdk/nvidia/inc/class/cl9010_callback.h:
+../common/inc/nvctassert.h:
+inc/libraries/nvport/nvport.h:
+inc/libraries/nvport/core.h:
+inc/libraries/nvport/atomic.h:
+inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/debug.h:
+inc/libraries/nvport/inline/debug_unix_kernel_os.h:
+../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
+inc/libraries/nvport/util.h:
+inc/libraries/nvport/inline/util_generic.h:
+inc/libraries/nvport/inline/util_gcc_clang.h:
+inc/libraries/nvport/inline/util_valist.h:
+inc/libraries/nvport/memory.h:
+inc/libraries/nvport/inline/memory_tracking.h:
+inc/libraries/nvport/sync.h:
+inc/libraries/nvport/inline/sync_tracking.h:
+inc/libraries/nvport/safe.h:
+inc/libraries/nvport/inline/safe_generic.h:
+inc/libraries/nvport/thread.h:
+inc/libraries/nvport/crypto.h:
+inc/libraries/nvport/string.h:
+inc/libraries/nvport/cpu.h:
+inc/libraries/nvoc/object.h:
+inc/libraries/nvoc/prelude.h:
+inc/libraries/utils/nvmacro.h:
+generated/g_object_nvoc.h:
+inc/libraries/nvoc/runtime.h:
+inc/libraries/nvoc/rtti.h:
+inc/kernel/core/printf.h:
+inc/libraries/utils/nvprintf.h:
+inc/libraries/utils/nvprintf_level.h:
+inc/libraries/nvlog/nvlog_printf.h:
+inc/libraries/nvlog/internal/nvlog_printf_internal.h:
+inc/libraries/nvlog/nvlog.h:
+../common/inc/nvlog_defs.h:
+generated/rmconfig.h:
+inc/kernel/diagnostics/xid_context.h:
+inc/kernel/core/strict.h:
+inc/libraries/utils/nvassert.h:
+inc/libraries/utils/nvmacro.h:
+generated/g_rmconfig_private.h:
+generated/g_nvh_state.h:
+generated/g_odb.h:
+generated/g_hal.h:
+../common/sdk/nvidia/inc/rmcd.h:
+../common/sdk/nvidia/inc/nvcd.h:
+inc/kernel/os/os.h:
+generated/g_os_nvoc.h:
+inc/libraries/containers/btree.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073dfp.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h:
+../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073common.h:
+../common/sdk/nvidia/inc/nvsecurityinfo.h:
+interface/nvacpitypes.h:
+../common/sdk/nvidia/inc/nvimpshared.h:
+../common/sdk/nvidia/inc/nvi2c.h:
+inc/kernel/os/nv_memory_type.h:
+inc/kernel/os/nv_memory_area.h:
+inc/kernel/os/capability.h:
+arch/nvalloc/unix/include/os_custom.h:
+arch/nvalloc/unix/include/os-interface.h:
+../common/sdk/nvidia/inc/nv_stdarg.h:
+arch/nvalloc/unix/include/nv-caps.h:
+inc/kernel/rmapi/client.h:
+generated/g_client_nvoc.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000proc.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h:
+inc/libraries/resserv/resserv.h:
+generated/g_resserv_nvoc.h:
+inc/libraries/containers/list.h:
+inc/libraries/containers/type_safety.h:
+inc/libraries/containers/map.h:
+inc/libraries/containers/multimap.h:
+inc/libraries/resserv/rs_client.h:
+generated/g_rs_client_nvoc.h:
+inc/libraries/resserv/rs_resource.h:
+generated/g_rs_resource_nvoc.h:
+inc/libraries/resserv/rs_access_map.h:
+inc/libraries/resserv/rs_access_rights.h:
+inc/libraries/utils/nvrange.h:
+inc/kernel/rmapi/resource.h:
+generated/g_resource_nvoc.h:
+inc/kernel/rmapi/control.h:
+inc/kernel/rmapi/param_copy.h:
+inc/kernel/rmapi/event.h:
+generated/g_event_nvoc.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h:
+../common/sdk/nvidia/inc/class/cl0000.h:
+../common/sdk/nvidia/inc/class/cl0000_notification.h:
+inc/libraries/resserv/rs_server.h:
+generated/g_rs_server_nvoc.h:
+inc/kernel/gpu/gpu_engine_type.h:
+../common/sdk/nvidia/inc/class/cl2080.h:
+../common/sdk/nvidia/inc/class/cl2080_notification.h:
+inc/libraries/utils/nvbitvector.h:
+inc/kernel/gpu/mem_mgr/mem_desc.h:
+generated/g_mem_desc_nvoc.h:
+inc/libraries/poolalloc.h:
+inc/libraries/nvport/nvport.h:
+inc/libraries/containers/list.h:
+inc/kernel/mem_mgr/mem_fabric_import_ref.h:
+generated/g_mem_fabric_import_ref_nvoc.h:
+inc/kernel/mem_mgr/mem_fabric_import_v2.h:
+generated/g_mem_fabric_import_v2_nvoc.h:
+inc/kernel/mem_mgr/mem.h:
+generated/g_mem_nvoc.h:
+inc/kernel/rmapi/rmapi.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0041.h:
+../common/inc/nvCpuUuid.h:
+../common/sdk/nvidia/inc/ctrl/ctrl00f9.h:
+../common/sdk/nvidia/inc/ctrl/ctrl00f8.h:
+../common/sdk/nvidia/inc/ctrl/ctrl90f1.h:
+../common/sdk/nvidia/inc/mmu_fmt_types.h:
+../common/sdk/nvidia/inc/ctrl/ctrl00fb.h:
+inc/kernel/gpu/mem_mgr/virt_mem_allocator_common.h:
+../common/sdk/nvidia/inc/nvgputypes.h:
+inc/kernel/gpu/mem_mgr/rm_page_size.h:
+../common/sdk/nvidia/inc/class/cl00fb.h:
+../common/sdk/nvidia/inc/class/cl00e0.h:
+../common/sdk/nvidia/inc/class/cl0080.h:
+../common/sdk/nvidia/inc/class/cl0080_notification.h:

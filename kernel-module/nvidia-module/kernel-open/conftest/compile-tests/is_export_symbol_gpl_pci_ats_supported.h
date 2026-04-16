@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_GPL_pci_ats_supported 1

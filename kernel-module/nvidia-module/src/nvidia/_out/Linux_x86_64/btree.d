@@ -1,0 +1,57 @@
+_out/Linux_x86_64/btree.o: \
+ ../common/sdk/nvidia/inc/cpuopsys.h inc/libraries/utils/nvprintf.h \
+ inc/libraries/utils/nvprintf_level.h inc/libraries/nvport/nvport.h \
+ ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/sdk/nvidia/inc/nvstatus.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/debug.h \
+ inc/libraries/nvport/inline/debug_unix_kernel_os.h \
+ ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
+ inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
+ inc/libraries/nvport/inline/util_gcc_clang.h \
+ inc/libraries/nvport/inline/util_valist.h inc/libraries/nvport/memory.h \
+ inc/libraries/nvport/inline/memory_tracking.h \
+ ../common/sdk/nvidia/inc/nvmisc.h inc/libraries/nvport/sync.h \
+ inc/libraries/nvport/inline/sync_tracking.h inc/libraries/nvport/safe.h \
+ inc/libraries/nvport/inline/safe_generic.h inc/libraries/nvport/thread.h \
+ inc/libraries/nvport/crypto.h inc/libraries/nvport/string.h \
+ inc/libraries/nvport/cpu.h inc/libraries/nvlog/nvlog_printf.h \
+ inc/libraries/nvlog/internal/nvlog_printf_internal.h \
+ inc/libraries/utils/nvassert.h inc/libraries/utils/nvmacro.h \
+ inc/libraries/containers/btree.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+inc/libraries/utils/nvprintf.h:
+inc/libraries/utils/nvprintf_level.h:
+inc/libraries/nvport/nvport.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/sdk/nvidia/inc/nvstatus.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/nvstatuscodes.h:
+inc/libraries/nvport/core.h:
+inc/libraries/nvport/atomic.h:
+inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/debug.h:
+inc/libraries/nvport/inline/debug_unix_kernel_os.h:
+../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
+inc/libraries/nvport/util.h:
+inc/libraries/nvport/inline/util_generic.h:
+inc/libraries/nvport/inline/util_gcc_clang.h:
+inc/libraries/nvport/inline/util_valist.h:
+inc/libraries/nvport/memory.h:
+inc/libraries/nvport/inline/memory_tracking.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+inc/libraries/nvport/sync.h:
+inc/libraries/nvport/inline/sync_tracking.h:
+inc/libraries/nvport/safe.h:
+inc/libraries/nvport/inline/safe_generic.h:
+inc/libraries/nvport/thread.h:
+inc/libraries/nvport/crypto.h:
+inc/libraries/nvport/string.h:
+inc/libraries/nvport/cpu.h:
+inc/libraries/nvlog/nvlog_printf.h:
+inc/libraries/nvlog/internal/nvlog_printf_internal.h:
+inc/libraries/utils/nvassert.h:
+inc/libraries/utils/nvmacro.h:
+inc/libraries/containers/btree.h:

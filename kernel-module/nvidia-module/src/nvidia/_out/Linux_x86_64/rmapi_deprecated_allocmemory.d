@@ -1,0 +1,63 @@
+_out/Linux_x86_64/rmapi_deprecated_allocmemory.o: \
+ \
+ ../common/sdk/nvidia/inc/cpuopsys.h \
+ interface/deprecated/rmapi_deprecated.h \
+ ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
+ ../common/sdk/nvidia/inc/nvstatus.h ../common/sdk/nvidia/inc/nvtypes.h \
+ ../common/sdk/nvidia/inc/nvstatuscodes.h \
+ ../common/sdk/nvidia/inc/nvmisc.h ../common/sdk/nvidia/inc/nvos.h \
+ ../common/sdk/nvidia/inc/nvstatus.h \
+ ../common/sdk/nvidia/inc/nvgputypes.h \
+ ../common/sdk/nvidia/inc/rs_access.h ../common/sdk/nvidia/inc/nvmisc.h \
+ ../common/sdk/nvidia/inc/nvcfg_sdk.h \
+ ../common/sdk/nvidia/inc/alloc/alloc_channel.h \
+ ../common/sdk/nvidia/inc/nvlimits.h ../common/sdk/nvidia/inc/nvcfg_sdk.h \
+ ../common/sdk/nvidia/inc/class/cl9010.h \
+ ../common/sdk/nvidia/inc/class/cl9010_callback.h \
+ ../common/sdk/nvidia/inc/nvsecurityinfo.h \
+ ../common/sdk/nvidia/inc/class/cl003e.h \
+ ../common/sdk/nvidia/inc/class/cl0071.h \
+ ../common/sdk/nvidia/inc/class/cl0070.h \
+ ../common/sdk/nvidia/inc/class/cl003f.h \
+ ../common/sdk/nvidia/inc/class/cl0040.h \
+ ../common/sdk/nvidia/inc/class/cl00c2.h \
+ ../common/sdk/nvidia/inc/class/cl84a0.h \
+ ../common/sdk/nvidia/inc/class/cl84a0_deprecated.h \
+ ../common/sdk/nvidia/inc/class/cl0076.h \
+ ../common/sdk/nvidia/inc/class/cl00f3.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h
+../common/sdk/nvidia/inc/cpuopsys.h:
+interface/deprecated/rmapi_deprecated.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/cpuopsys.h:
+../common/sdk/nvidia/inc/nvstatus.h:
+../common/sdk/nvidia/inc/nvtypes.h:
+../common/sdk/nvidia/inc/nvstatuscodes.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvos.h:
+../common/sdk/nvidia/inc/nvstatus.h:
+../common/sdk/nvidia/inc/nvgputypes.h:
+../common/sdk/nvidia/inc/rs_access.h:
+../common/sdk/nvidia/inc/nvmisc.h:
+../common/sdk/nvidia/inc/nvcfg_sdk.h:
+../common/sdk/nvidia/inc/alloc/alloc_channel.h:
+../common/sdk/nvidia/inc/nvlimits.h:
+../common/sdk/nvidia/inc/nvcfg_sdk.h:
+../common/sdk/nvidia/inc/class/cl9010.h:
+../common/sdk/nvidia/inc/class/cl9010_callback.h:
+../common/sdk/nvidia/inc/nvsecurityinfo.h:
+../common/sdk/nvidia/inc/class/cl003e.h:
+../common/sdk/nvidia/inc/class/cl0071.h:
+../common/sdk/nvidia/inc/class/cl0070.h:
+../common/sdk/nvidia/inc/class/cl003f.h:
+../common/sdk/nvidia/inc/class/cl0040.h:
+../common/sdk/nvidia/inc/class/cl00c2.h:
+../common/sdk/nvidia/inc/class/cl84a0.h:
+../common/sdk/nvidia/inc/class/cl84a0_deprecated.h:
+../common/sdk/nvidia/inc/class/cl0076.h:
+../common/sdk/nvidia/inc/class/cl00f3.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h:
+../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:

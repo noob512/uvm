@@ -1,0 +1,1 @@
+#define NV_MMGRAB_PRESENT

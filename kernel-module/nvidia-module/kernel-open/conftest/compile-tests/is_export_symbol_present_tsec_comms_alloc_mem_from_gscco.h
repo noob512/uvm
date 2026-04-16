@@ -1,0 +1,1 @@
+#define NV_IS_EXPORT_SYMBOL_PRESENT_tsec_comms_alloc_mem_from_gscco 0

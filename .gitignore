@@ -1,0 +1,54 @@
+/workloads/vllm/.venv/
+
+# Never commit compiled artifacts from workloads/vllm/vllm
+/workloads/vllm/vllm/build/
+/workloads/vllm/vllm/dist/
+/workloads/vllm/vllm/out/
+/workloads/vllm/vllm/cmake-build-*/
+/workloads/vllm/vllm/**/*.so
+/workloads/vllm/vllm/**/*.o
+/workloads/vllm/vllm/**/*.obj
+
+# Global: never commit local virtual environments
+.venv/
+venv/
+
+# Global: build output directories
+build/
+dist/
+out/
+.output/
+cmake-build-*/
+CMakeFiles/
+.tmp_versions/
+
+# Global: compiler/linker/module artifacts
+*.o
+*.obj
+*.a
+*.la
+*.lo
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exp
+*.pyd
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+
+# Global: profiling and debug artifacts
+*.dSYM/
+*.gcda
+*.gcno
+*.prof
+*.profraw
+*.profdata
+
+# Large local datasets (do not commit)
+/workloads/vllm/datasets/
