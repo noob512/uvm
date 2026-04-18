@@ -176,7 +176,7 @@ def main():
     # choices 限定了只能输入预设的两种模式
     parser.add_argument("--mode", default="cpu_offload", choices=list(MODE_CONFIGS.keys()),
                         help="Server mode")
-    parser.add_argument("--prompts", type=int, default=100, help="Number of prompts")
+    parser.add_argument("--prompts", type=int, default=50, help="Number of prompts")
     # 如果不指定 output，结果会直接打印在终端上
     parser.add_argument("--output", "-o", help="Output JSON path (default: stdout)")
     parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")

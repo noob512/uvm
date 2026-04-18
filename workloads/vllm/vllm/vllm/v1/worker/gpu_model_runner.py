@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -599,6 +600,8 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        self._logged_weight_ptrs: set[int] = set()
+        self._logged_kv_ptrs: set[int] = set()
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -3366,160 +3369,446 @@ class GPUModelRunner(
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
-    def load_model(self, eep_scale_up: bool = False) -> None:
+    @staticmethod
+    def _env_flag_enabled(env_name: str, default: bool = False) -> bool:
+        env_value = os.environ.get(env_name)
+        if env_value is None:
+            return default
+        return env_value.lower() in ("1", "true", "yes", "on")
+
+    def _is_uvm_address_logging_enabled(self) -> bool:
+        # Default to enabled when UVM allocator mode is enabled.
+        default_enabled = self._env_flag_enabled("VLLM_USE_UVM", default=False)
+        return self._env_flag_enabled(
+            "VLLM_UVM_ADDRESS_LOG_ENABLE", default=default_enabled
+        )
+
+    def _uvm_address_log_file(self) -> str:
+        return os.environ.get(
+            "VLLM_UVM_ADDRESS_LOG_FILE", "vllm_uvm_address_regions.log"
+        )
+
+    def _append_uvm_address_log(
+        self, phase: str, rows: list[tuple[str, str, int, int, int]]
+    ) -> None:
         """
+        将统一虚拟内存 (UVM) 的地址记录追加写入到指定的日志文件中。
+        
         Args:
-            eep_scale_up: the model loading is for elastic EP scale up.
+            phase: 字符串，表示当前记录所处的阶段（例如 "load_model", "prefill" 等）。
+            rows: 包含具体地址信息的列表。每个元素是一个包含 5 个元素的元组：
+                  (类型 kind, 名称 name, 起始地址 start, 结束地址 end, 字节大小 size_bytes)
         """
-        logger.info_once(
-            "Starting to load model %s...",
-            self.model_config.model,
-            scope="global",
-        )
-        global_expert_loads, old_global_expert_indices_per_model, rank_mapping = (
-            EplbState.get_eep_state(self.parallel_config)
-            if eep_scale_up
-            else (None, None, None)
-        )
+        # 前置检查：如果传入的记录列表为空，或者系统配置中未开启 UVM 地址记录功能，
+        # 则直接返回，不执行任何写入操作，以避免不必要的性能开销。
+        if not rows or not self._is_uvm_address_logging_enabled():
+            return
 
-        if self.parallel_config.enable_eplb:
-            self.eplb_state = EplbState(self.parallel_config, self.device)
-            eplb_models = 0
-        with DeviceMemoryProfiler() as m:
-            time_before_load = time.perf_counter()
-            model_loader = get_model_loader(self.load_config)
-            self.model = model_loader.load_model(
-                vllm_config=self.vllm_config, model_config=self.model_config
-            )
-            if self.lora_config:
-                self.model = self.load_lora_model(
-                    self.model, self.vllm_config, self.device
+        # 按照内存起始地址 (即元组中的索引 2 'start') 对所有记录进行升序排序。
+        # 排序后的日志能直观反映内存块在物理/虚拟空间中的排列情况，便于分析内存碎片化。
+        rows.sort(key=lambda item: item[2])
+        
+        # 获取用于存储日志的目标文件路径
+        log_path = self._uvm_address_log_file()
+        # 获取当前时间，并格式化为标准的时间字符串，用于日志时间戳
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        try:
+            # 以追加模式 ("a") 打开日志文件。使用 utf-8 编码防止特殊字符乱码。
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                # 写入区块头部信息，包含时间戳、执行阶段、当前进程 ID (pid) 以及模型名称。
+                # 这有助于在多进程（如张量并行）或多次运行的环境中区分日志来源。
+                log_file.write(
+                    f"[{timestamp}] phase={phase} pid={os.getpid()} "
+                    f"model={self.model_config.model}\n"
                 )
-            if hasattr(self, "drafter"):
-                logger.info_once("Loading drafter model...")
-                self.drafter.load_model(self.model)
-                if (
-                    hasattr(self.drafter, "model")
-                    and is_mixture_of_experts(self.drafter.model)
-                    and self.parallel_config.enable_eplb
-                ):
-                    spec_config = self.vllm_config.speculative_config
-                    assert spec_config is not None
-                    assert spec_config.draft_model_config is not None
-                    logger.info_once(
-                        "EPLB is enabled for drafter model %s.",
-                        spec_config.draft_model_config.model,
+                
+                # 写入类似 CSV 格式的列名表头
+                log_file.write(
+                    "kind,name,start,end,size_bytes,size_mb\n"
+                )
+                
+                # 遍历排序好的地址记录
+                for kind, name, start, end, size_bytes in rows:
+                    # 将地址信息格式化为十六进制 (0x{start:x} 和 0x{end:x})，这是内存地址的标准表示法。
+                    # 同时将字节大小转换为 MB (保留三位小数) 方便人类阅读，并写入文件。
+                    log_file.write(
+                        f"{kind},{name},0x{start:x},0x{end:x},"
+                        f"{size_bytes},{size_bytes / (1024 * 1024):.3f}\n"
                     )
+                    
+                # 在当前 phase 的记录块末尾写入一个空行，使其与下一次写入的日志块在视觉上分隔开
+                log_file.write("\n")
+                
+        # 捕获由于权限不足、磁盘空间满或路径不存在等导致的系统级 I/O 异常
+        except OSError as exc:
+            # 仅记录警告日志而不是抛出异常导致程序崩溃，因为日志记录失败不应影响主推理流程的执行
+            logger.warning("Failed to write UVM address log %s: %s", log_path, exc)
 
-                    global_expert_load = (
-                        global_expert_loads[eplb_models]
-                        if global_expert_loads
-                        else None
-                    )
-                    old_global_expert_indices = (
-                        old_global_expert_indices_per_model[eplb_models]
-                        if old_global_expert_indices_per_model
-                        else None
-                    )
-                    if self.eplb_state is None:
-                        self.eplb_state = EplbState(self.parallel_config, self.device)
-                    self.eplb_state.add_model(
-                        self.drafter.model,
-                        spec_config.draft_model_config,
-                        global_expert_load,
-                        old_global_expert_indices,
-                        rank_mapping,
-                    )
-                    eplb_models += 1
+    def _collect_weight_address_rows(self) -> list[tuple[str, str, int, int, int]]:
+        """
+        收集当前模型中所有权重和缓冲区的底层显存地址信息。
+        
+        Returns:
+            返回一个列表，包含多个元组。每个元组的格式为：
+            (数据类型, 张量名称, 起始内存地址, 结束内存地址, 字节大小)
+        """
+        # 初始化用于存储结果的列表
+        rows: list[tuple[str, str, int, int, int]] = []
 
-            if self.use_aux_hidden_state_outputs:
-                if not supports_eagle3(self.get_model()):
-                    raise RuntimeError(
-                        "Model does not support EAGLE3 interface but "
-                        "aux_hidden_state_outputs was requested"
-                    )
+        # 定义一个内部辅助函数，用于处理和记录单个张量 (Tensor) 的信息
+        def record_tensor(kind: str, name: str, tensor: torch.Tensor) -> None:
+            # 过滤检查 1：如果张量不在 GPU (CUDA) 上，则忽略。
+            # 这里只关心显存的占用情况，驻留在 CPU 的权重不需要记录。
+            if not tensor.is_cuda:
+                return
+                
+            # 获取张量底层数据在显存中的起始指针地址
+            ptr = tensor.data_ptr()
+            
+            # 过滤检查 2：
+            # ptr == 0: 表示该张量尚未分配实际的物理内存。
+            # ptr in self._logged_weight_ptrs: 使用一个集合来进行去重操作。
+            # 在某些模型架构中（如权重绑定 weight tying），多个参数名称可能指向同一块物理内存。
+            # 确保同一块内存地址只被记录一次，避免重复统计。
+            if ptr == 0 or ptr in self._logged_weight_ptrs:
+                return
+                
+            # 计算该张量占用的总字节数 = 元素总数 (numel) * 单个元素的字节数 (element_size)
+            size_bytes = tensor.numel() * tensor.element_size()
+            
+            # 过滤检查 3：忽略大小为 0 的空张量
+            if size_bytes <= 0:
+                return
+                
+            # 将该指针地址加入已记录集合，防止后续出现指向同地址的张量被重复记录
+            self._logged_weight_ptrs.add(ptr)
+            
+            # 将收集到的信息打包为元组并添加到列表中。
+            # 结束地址计算方式为：起始地址 + 总字节数 - 1
+            rows.append((kind, name, ptr, ptr + size_bytes - 1, size_bytes))
 
-                # Try to get auxiliary layers from speculative config,
-                # otherwise use model's default layers
-                aux_layers = self._get_eagle3_aux_layers_from_config()
-                if aux_layers:
-                    logger.info(
-                        "Using auxiliary layers from speculative config: %s",
-                        aux_layers,
+        # 获取底层的 PyTorch 模型实例
+        model = self.get_model()
+        
+        # 遍历模型中所有注册的参数 (Parameters)
+        # recurse=True 表示会递归遍历所有子模块 (Sub-modules)
+        # Parameters 通常是模型中需要计算梯度、参与训练的权重 (如 Linear 层的 weight 和 bias)
+        for name, param in model.named_parameters(recurse=True):
+            if param is not None:
+                record_tensor("weight:param", name, param)
+                
+        # 遍历模型中所有注册的缓冲区 (Buffers)
+        # Buffers 通常是模型状态的一部分，但在训练过程中不需要计算梯度的张量
+        # (例如 BatchNorm 中的 running_mean/running_var，或者大模型中预先计算好的位置编码如 RoPE 缓存)
+        for name, buffer in model.named_buffers(recurse=True):
+            record_tensor("weight:buffer", name, buffer)
+
+        # 返回收集到的所有内存块地址信息
+        return rows
+
+    def _collect_kv_cache_address_rows(
+        self, kv_caches: dict[str, Any]
+    ) -> list[tuple[str, str, int, int, int]]:
+        """
+        收集当前模型所有 KV Cache (键值缓存) 相关的底层显存地址信息。
+        KV Cache 用于在自回归解码阶段保存之前 token 的计算状态，避免重复计算。
+        
+        Args:
+            kv_caches: 一个字典，通常键 (key) 是层名称 (layer_name)，
+                       值 (value) 是对应的 KV 缓存张量或张量列表。
+                       
+        Returns:
+            返回一个列表，包含多个元组。每个元组的格式为：
+            (数据类型, 缓存层名称/标识, 起始内存地址, 结束内存地址, 字节大小)
+        """
+        # 初始化用于存储结果的列表
+        rows: list[tuple[str, str, int, int, int]] = []
+
+        # 定义内部辅助函数，用于处理和记录单个 KV Cache 张量的信息
+        def record_tensor(kind: str, name: str, tensor: torch.Tensor) -> None:
+            # 过滤检查 1：确保存储在 GPU (CUDA) 上。如果是 offload 到 CPU 的缓存则暂不记录。
+            if not tensor.is_cuda:
+                return
+                
+            # 获取张量底层数据在显存中的起始指针地址
+            ptr = tensor.data_ptr()
+            
+            # 过滤检查 2：
+            # ptr == 0: 忽略未实际分配内存的空指针。
+            # ptr in self._logged_kv_ptrs: 通过集合去重，确保同一块物理显存不被重复记录。
+            # 针对如 PagedAttention 等机制，不同的逻辑块可能映射或复用同一块物理内存。
+            if ptr == 0 or ptr in self._logged_kv_ptrs:
+                return
+                
+            # 计算该缓存张量当前占据的总字节数
+            size_bytes = tensor.numel() * tensor.element_size()
+            
+            # 过滤检查 3：忽略大小为 0 的张量
+            if size_bytes <= 0:
+                return
+                
+            # 将该指针地址加入 KV Cache 专用的已记录集合
+            self._logged_kv_ptrs.add(ptr)
+            
+            # 打包地址和大小信息存入列表
+            rows.append((kind, name, ptr, ptr + size_bytes - 1, size_bytes))
+
+        # 遍历传入的 kv_caches 字典
+        for layer_name, cache_tensor in kv_caches.items():
+            # 情况 A: 如果该层对应的缓存是一个单一的 PyTorch 张量
+            if isinstance(cache_tensor, torch.Tensor):
+                record_tensor("kv_cache", layer_name, cache_tensor)
+                
+            # 情况 B: 如果该层的缓存是一个张量列表
+            # （例如某些框架会将 Key 和 Value 分开存储为两个张量，即 [K_cache, V_cache]）
+            elif isinstance(cache_tensor, list):
+                for idx, tensor in enumerate(cache_tensor):
+                    if isinstance(tensor, torch.Tensor):
+                        # 在记录名称上附加索引 [idx]，以区分列表中的不同张量
+                        record_tensor("kv_cache", f"{layer_name}[{idx}]", tensor)
+
+        # 检查并记录跨层共享的 KV Cache (Cross-layer KV Cache)
+        # 这种设计常见于如 DeepSeek (MLA 架构) 或某些极致优化过的模型中，
+        # 它们会将 KV 缓存压缩或合并，跨越多个 Transformer 层共享，以极大节省显存。
+        if isinstance(self.cross_layers_kv_cache, torch.Tensor):
+            record_tensor(
+                "kv_cache:cross_layers", "cross_layers_kv_cache", self.cross_layers_kv_cache
+            )
+
+        # 返回收集到的所有 KV Cache 内存块地址信息
+        return rows
+    def _log_model_weight_addresses(self, phase: str) -> None:
+        """
+        记录模型权重的底层内存/显存地址信息。
+        这通常用于调试、排查内存泄漏，或者分析模型权重在统一虚拟内存 (UVM) 中的分布情况。
+        
+        Args:
+            phase: 字符串，表示当前系统所处的执行阶段（例如："load_model" 模型加载阶段、"warmup" 预热阶段等）。
+        """
+        # 调用辅助方法，遍历模型的所有层，收集各个权重张量 (tensors) 的底层指针地址或页表信息，
+        # 并将其整理为可记录的行结构 (rows)。
+        rows = self._collect_weight_address_rows()
+        
+        # 将收集到的权重地址行追加写入到 UVM (统一虚拟内存) 地址专属的日志或记录表中，
+        # 同时打上当前所属的 phase (阶段) 标签，方便后续按时间线进行内存变化追踪。
+        self._append_uvm_address_log(phase, rows)
+
+    def _log_kv_cache_addresses(self, kv_caches: dict[str, Any], phase: str) -> None:
+        """
+        记录 KV Cache (键值缓存) 的底层内存/显存地址信息。
+        KV Cache 是大语言模型推理时保存历史上下文注意力状态的核心数据结构，其内存通常是动态分配和分页的 (如 PagedAttention)。
+        
+        Args:
+            kv_caches: 一个字典，包含了当前分配给模型的 KV Cache 对象（通常按层 (layer) 作为 key 进行映射）。
+            phase: 字符串，表示当前的生成阶段（例如："prefill" 预填充阶段，"decode" 逐字解码阶段等）。
+        """
+        # 调用辅助方法，解析传入的 kv_caches 字典，
+        # 提取其中各个 KV Cache 物理块 (blocks) 或张量底层的内存地址，整理成数据行。
+        rows = self._collect_kv_cache_address_rows(kv_caches)
+        
+        # 将这些 KV Cache 的地址信息追加写入到 UVM 日志中，打上当前的 phase 标签。
+        # 这一步对于监控长文本生成时显存池的碎片化 (fragmentation) 或页面换入换出 (swapping) 非常关键。
+        self._append_uvm_address_log(phase, rows)
+
+    def load_model(self, eep_scale_up: bool = False) -> None:
+            """
+            Args:
+                eep_scale_up: 布尔值，指示此次模型加载是否是为了弹性专家并行 (Elastic Expert Parallelism, EEP) 扩容。
+            """
+            # 记录全局日志，提示开始加载特定的模型
+            logger.info_once(
+                "Starting to load model %s...",
+                self.model_config.model,
+                scope="global",
+            )
+            
+            # 如果是 EEP 扩容操作，则从 EplbState 获取当前的全局专家负载状态、旧的全局专家索引以及 rank 映射。
+            # 否则，初始化为 None。这对于在运行时动态调整专家模型的分布非常重要。
+            global_expert_loads, old_global_expert_indices_per_model, rank_mapping = (
+                EplbState.get_eep_state(self.parallel_config)
+                if eep_scale_up
+                else (None, None, None)
+            )
+
+            # 检查是否启用了专家并行负载均衡 (Expert Parallelism Load Balancing, EPLB)
+            if self.parallel_config.enable_eplb:
+                self.eplb_state = EplbState(self.parallel_config, self.device)
+                eplb_models = 0 # 追踪应用了 EPLB 的模型数量（主模型 + 潜在的草稿模型）
+                
+            # 使用设备内存分析器作为上下文管理器，以精准统计加载模型所消耗的显存
+            with DeviceMemoryProfiler() as m:
+                time_before_load = time.perf_counter() # 记录加载开始时间
+                
+                # 获取当前配置对应的模型加载器
+                model_loader = get_model_loader(self.load_config)
+                
+                # 实际执行主模型的权重加载
+                self.model = model_loader.load_model(
+                    vllm_config=self.vllm_config, model_config=self.model_config
+                )
+                
+                # 如果配置了 LoRA (Low-Rank Adaptation)，则将 LoRA 权重加载/合并到基础模型中
+                if self.lora_config:
+                    self.model = self.load_lora_model(
+                        self.model, self.vllm_config, self.device
+                    )
+                    
+                # 检查系统是否配置了用于投机解码 (Speculative Decoding) 的草稿模型 (drafter)
+                if hasattr(self, "drafter"):
+                    logger.info_once("Loading drafter model...")
+                    self.drafter.load_model(self.model) # 加载草稿模型
+                    
+                    # 如果草稿模型是混合专家 (MoE) 架构，并且系统启用了 EPLB
+                    if (
+                        hasattr(self.drafter, "model")
+                        and is_mixture_of_experts(self.drafter.model)
+                        and self.parallel_config.enable_eplb
+                    ):
+                        # 获取投机解码的配置，验证草稿模型的配置有效性
+                        spec_config = self.vllm_config.speculative_config
+                        assert spec_config is not None
+                        assert spec_config.draft_model_config is not None
+                        logger.info_once(
+                            "EPLB is enabled for drafter model %s.",
+                            spec_config.draft_model_config.model,
+                        )
+
+                        # 为草稿模型提取对应的专家负载和旧索引信息
+                        global_expert_load = (
+                            global_expert_loads[eplb_models]
+                            if global_expert_loads
+                            else None
+                        )
+                        old_global_expert_indices = (
+                            old_global_expert_indices_per_model[eplb_models]
+                            if old_global_expert_indices_per_model
+                            else None
+                        )
+                        
+                        # 确保 EPLB 状态已初始化，并将草稿模型及其配置注册到 EPLB 状态管理中
+                        if self.eplb_state is None:
+                            self.eplb_state = EplbState(self.parallel_config, self.device)
+                        self.eplb_state.add_model(
+                            self.drafter.model,
+                            spec_config.draft_model_config,
+                            global_expert_load,
+                            old_global_expert_indices,
+                            rank_mapping,
+                        )
+                        eplb_models += 1 # 增加注册的 EPLB 模型计数
+
+                # 处理 EAGLE3 接口所需的辅助隐藏状态输出
+                # EAGLE 是一种高效的投机解码/自回归生成加速技术，通常依赖特定的隐藏层状态
+                if self.use_aux_hidden_state_outputs:
+                    if not supports_eagle3(self.get_model()):
+                        raise RuntimeError(
+                            "Model does not support EAGLE3 interface but "
+                            "aux_hidden_state_outputs was requested"
+                        )
+
+                    # 尝试从投机解码配置中获取需要提取隐藏状态的辅助层索引
+                    # 否则使用模型默认定义的层
+                    aux_layers = self._get_eagle3_aux_layers_from_config()
+                    if aux_layers:
+                        logger.info(
+                            "Using auxiliary layers from speculative config: %s",
+                            aux_layers,
+                        )
+                    else:
+                        aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
+
+                    # 将获取到的辅助层配置应用到主模型
+                    self.model.set_aux_hidden_state_layers(aux_layers)
+                    
+                time_after_load = time.perf_counter() # 记录加载结束时间
+                
+            # 记录模型加载消耗的总显存和总耗时
+            self.model_memory_usage = m.consumed_memory
+            logger.info_once(
+                "Model loading took %.4f GiB memory and %.6f seconds",
+                self.model_memory_usage / GiB_bytes,
+                time_after_load - time_before_load,
+                scope="local",
+            )
+            
+            # 为分布式训练/推理准备通信缓冲区（例如为张量并行分配 All-Reduce 缓冲区）
+            prepare_communication_buffer_for_model(self.model)
+            # 如果存在草稿模型，同样为其准备通信缓冲区
+            if (drafter := getattr(self, "drafter", None)) and (
+                drafter_model := getattr(drafter, "model", None)
+            ):
+                prepare_communication_buffer_for_model(drafter_model)
+                
+            # 配置多模态剪枝 (Multimodal Pruning) 支持
+            mm_config = self.model_config.multimodal_config
+            self.is_multimodal_pruning_enabled = (
+                supports_multimodal_pruning(self.get_model())
+                and mm_config is not None
+                and mm_config.is_multimodal_pruning_enabled()
+            )
+
+            # 针对主模型：如果是 MoE 架构且启用了 EPLB，则为其配置负载均衡
+            if is_mixture_of_experts(self.model) and self.parallel_config.enable_eplb:
+                logger.info_once("EPLB is enabled for model %s.", self.model_config.model)
+                global_expert_load = (
+                    global_expert_loads[eplb_models] if global_expert_loads else None
+                )
+                old_global_expert_indices = (
+                    old_global_expert_indices_per_model[eplb_models]
+                    if old_global_expert_indices_per_model
+                    else None
+                )
+                assert self.eplb_state is not None
+                # 将主模型注册到 EPLB 管理器中
+                self.eplb_state.add_model(
+                    self.model,
+                    self.model_config,
+                    global_expert_load,
+                    old_global_expert_indices,
+                    rank_mapping,
+                )
+                # 如果 EPLB 支持异步模式，则开启异步通信/更新循环
+                if self.eplb_state.is_async:
+                    self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
+
+            # 记录模型权重的内存地址（通常用于调试或低级别内存管理验证）
+            self._log_model_weight_addresses("load_model")
+
+            # 处理模型图编译加速
+            # 1. 尝试使用原生的 PyTorch 图编译 (torch.compile)
+            if (
+                self.vllm_config.compilation_config.mode
+                == CompilationMode.STOCK_TORCH_COMPILE
+                and supports_dynamo()
+            ):
+                backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)
+                compilation_counter.stock_torch_compile_count += 1
+                # 开启 fullgraph 进行最大化优化编译
+                self.model.compile(fullgraph=True, backend=backend)
+                return
+                
+            # 注意：对于其他编译模式，CUDA Graph 的行为由 vllm 的 Wrapper 和 Dispatcher 控制
+
+            # 2. 根据编译配置，使用 CUDAGraphWrapper 或 UBatchWrapper 包装模型以提升推理性能
+            cudagraph_mode = self.compilation_config.cudagraph_mode
+            assert cudagraph_mode is not None
+            
+            # 如果启用了完整的 CUDA Graph 并且未启用 DBO (Dynamic Batch Optimization/动态批次优化)
+            if cudagraph_mode.has_full_cudagraphs() and not self.parallel_config.enable_dbo:
+                self.model = CUDAGraphWrapper(
+                    self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+                )
+            # 如果启用了 DBO，则使用 UBatchWrapper（用于处理 micro-batches）包装模型
+            elif self.parallel_config.enable_dbo:
+                if cudagraph_mode.has_full_cudagraphs():
+                    self.model = UBatchWrapper(
+                        self.model, self.vllm_config, CUDAGraphMode.FULL, self.device
                     )
                 else:
-                    aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
-
-                self.model.set_aux_hidden_state_layers(aux_layers)
-            time_after_load = time.perf_counter()
-        self.model_memory_usage = m.consumed_memory
-        logger.info_once(
-            "Model loading took %.4f GiB memory and %.6f seconds",
-            self.model_memory_usage / GiB_bytes,
-            time_after_load - time_before_load,
-            scope="local",
-        )
-        prepare_communication_buffer_for_model(self.model)
-        if (drafter := getattr(self, "drafter", None)) and (
-            drafter_model := getattr(drafter, "model", None)
-        ):
-            prepare_communication_buffer_for_model(drafter_model)
-        mm_config = self.model_config.multimodal_config
-        self.is_multimodal_pruning_enabled = (
-            supports_multimodal_pruning(self.get_model())
-            and mm_config is not None
-            and mm_config.is_multimodal_pruning_enabled()
-        )
-
-        if is_mixture_of_experts(self.model) and self.parallel_config.enable_eplb:
-            logger.info_once("EPLB is enabled for model %s.", self.model_config.model)
-            global_expert_load = (
-                global_expert_loads[eplb_models] if global_expert_loads else None
-            )
-            old_global_expert_indices = (
-                old_global_expert_indices_per_model[eplb_models]
-                if old_global_expert_indices_per_model
-                else None
-            )
-            assert self.eplb_state is not None
-            self.eplb_state.add_model(
-                self.model,
-                self.model_config,
-                global_expert_load,
-                old_global_expert_indices,
-                rank_mapping,
-            )
-            if self.eplb_state.is_async:
-                self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
-
-        if (
-            self.vllm_config.compilation_config.mode
-            == CompilationMode.STOCK_TORCH_COMPILE
-            and supports_dynamo()
-        ):
-            backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)
-            compilation_counter.stock_torch_compile_count += 1
-            self.model.compile(fullgraph=True, backend=backend)
-            return
-        # for other compilation modes, cudagraph behavior is controlled by
-        # CudagraphWraper and CudagraphDispatcher of vllm.
-
-        # wrap the model with full cudagraph wrapper if needed.
-        cudagraph_mode = self.compilation_config.cudagraph_mode
-        assert cudagraph_mode is not None
-        if cudagraph_mode.has_full_cudagraphs() and not self.parallel_config.enable_dbo:
-            self.model = CUDAGraphWrapper(
-                self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
-            )
-        elif self.parallel_config.enable_dbo:
-            if cudagraph_mode.has_full_cudagraphs():
-                self.model = UBatchWrapper(
-                    self.model, self.vllm_config, CUDAGraphMode.FULL, self.device
-                )
-            else:
-                self.model = UBatchWrapper(
-                    self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
-                )
+                    self.model = UBatchWrapper(
+                        self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
+                    )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -3552,6 +3841,7 @@ class GPUModelRunner(
         model_loader = get_model_loader(self.load_config)
         logger.info("Reloading weights inplace...")
         model_loader.load_weights(self.get_model(), model_config=self.model_config)
+        self._log_model_weight_addresses("reload_weights")
 
     def save_tensorized_model(
         self,
@@ -5113,6 +5403,7 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        self._log_kv_cache_addresses(kv_caches, "initialize_kv_cache")
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

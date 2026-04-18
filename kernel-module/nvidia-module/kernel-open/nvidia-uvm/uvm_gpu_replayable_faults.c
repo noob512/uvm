@@ -22,6 +22,7 @@
 *******************************************************************************/
 
 #include "linux/sort.h"
+#include "linux/kernel.h"
 #include "nv_uvm_interface.h"
 #include "uvm_common.h"
 #include "uvm_linux.h"
@@ -114,6 +115,109 @@ module_param(uvm_perf_fault_max_throttle_per_service, uint, S_IRUGO);
 
 static unsigned uvm_perf_fault_coalesce = 1;
 module_param(uvm_perf_fault_coalesce, uint, S_IRUGO);
+
+// Log replayable fault addresses as each HW fault entry is parsed.
+// 0 = disabled (default), 1 = enabled.
+static unsigned uvm_perf_fault_log_addresses;
+module_param(uvm_perf_fault_log_addresses, uint, S_IRUGO);
+
+// Destination for replayable fault address logs:
+// 0 = kernel log (dmesg), 1 = ftrace buffer (trace_pipe).
+static unsigned uvm_perf_fault_log_destination;
+module_param(uvm_perf_fault_log_destination, uint, S_IRUGO);
+
+// Log replayable fault counters after each serviced batch.
+// 0 = disabled (default), 1 = enabled.
+static unsigned uvm_perf_fault_log_counters;
+module_param(uvm_perf_fault_log_counters, uint, S_IRUGO);
+
+/**
+ * 记录单次可重放缺页中断（Replayable Fault）的详细硬件条目信息。
+ * * @param parent_gpu        指向触发该中断的 GPU 实例的指针。
+ * @param fault_entry       指向包含中断硬件底层详细信息的结构体指针（包含中断类型、来源等）。
+ * @param fault_address_raw GPU 实际尝试访问并导致缺页的具体虚拟内存地址（未对齐的原始地址）。
+ */
+static void log_replayable_fault_entry(uvm_parent_gpu_t *parent_gpu,
+                                       const uvm_fault_buffer_entry_t *fault_entry,
+                                       NvU64 fault_address_raw)
+{
+    // 根据模块参数或全局配置决定日志的输出目的地。
+    // 如果 uvm_perf_fault_log_destination == 1，使用内核的高性能追踪机制 (ftrace)。
+    if (uvm_perf_fault_log_destination == 1) {
+        // trace_printk 会将日志写入内核的 ring buffer，开销极小，适合高频中断场景。
+        trace_printk("Replayable fault GPU %s: raw=0x%llx page=0x%llx type=%s access=%s utlb=%u gpc=%u client=%u ve=%u\n",
+                     uvm_parent_gpu_name(parent_gpu),                  // GPU 名称 (如 GPU-0)
+                     fault_address_raw,                                // 导致中断的精确原始地址
+                     fault_entry->fault_address,                       // 对齐到页边界的中断地址
+                     uvm_fault_type_string(fault_entry->fault_type),   // 中断类型 (如 PDE 缺失, PTE 缺失等)
+                     uvm_fault_access_type_string(fault_entry->fault_access_type), // 访问类型 (如 Read, Write, Atomic)
+                     // 下面四个参数是 NVIDIA GPU 内部硬件单元的标识，用于精准定位是哪个硬件模块触发了缺页：
+                     fault_entry->fault_source.utlb_id,                // 微型 TLB (Translation Lookaside Buffer) ID
+                     fault_entry->fault_source.gpc_id,                 // 图形处理簇 (Graphics Processing Cluster) ID
+                     fault_entry->fault_source.client_id,              // 内存客户端 ID (如 L1 缓存, 纹理单元等)
+                     fault_entry->fault_source.ve_id);                 // 虚拟引擎 (Virtual Engine) ID
+    }
+    else {
+        // 否则，回退使用标准的内核日志打印机制 (最终通常会通过 printk 写入 dmesg / syslog)。
+        // 这种方式开销较大，在缺页频繁发生时可能会引发性能瓶颈或日志刷屏。
+        UVM_INFO_PRINT("Replayable fault GPU %s: raw=0x%llx page=0x%llx type=%s access=%s utlb=%u gpc=%u client=%u ve=%u\n",
+                       uvm_parent_gpu_name(parent_gpu),
+                       fault_address_raw,
+                       fault_entry->fault_address,
+                       uvm_fault_type_string(fault_entry->fault_type),
+                       uvm_fault_access_type_string(fault_entry->fault_access_type),
+                       fault_entry->fault_source.utlb_id,
+                       fault_entry->fault_source.gpc_id,
+                       fault_entry->fault_source.client_id,
+                       fault_entry->fault_source.ve_id);
+    }
+}
+
+/**
+ * 记录处理一批缺页中断后的统计计数器信息（主要用于监控去重效果）。
+ * * GPU 拥有成千上万个并发线程。如果它们同时访问同一个未映射的内存页，
+ * 会瞬间产生海量的、针对同一地址的缺页中断（称为 Fault Storm）。
+ * 驱动程序通常会按批次 (batch) 处理这些中断，并进行去重 (deduplication)，以节省 CPU 处理时间。
+ * * @param parent_gpu        指向当前 GPU 实例的指针。
+ * @param batch_faults      当前处理批次中，硬件报告的缺页中断总数。
+ * @param batch_duplicates  当前处理批次中，被识别为重复并过滤掉的中断数量。
+ */
+static void log_replayable_fault_counters(uvm_parent_gpu_t *parent_gpu,
+                                          NvU32 batch_faults,
+                                          NvU32 batch_duplicates)
+{
+    // 计算当前批次去重后的实际独立缺页数量。
+    // 使用三元运算符防止因硬件或计数逻辑异常导致下溢 (负数)。
+    NvU32 batch_after_dedup = batch_faults >= batch_duplicates ? batch_faults - batch_duplicates : 0;
+    
+    // 从 GPU 状态结构体中获取自驱动加载以来的全局历史统计数据。
+    NvU64 total_faults = parent_gpu->stats.num_replayable_faults;
+    NvU64 total_duplicates = parent_gpu->fault_buffer.replayable.stats.num_duplicate_faults;
+    // 计算历史累计去重后的独立缺页数量。
+    NvU64 total_after_dedup = total_faults >= total_duplicates ? total_faults - total_duplicates : 0;
+
+    // 与上面的函数类似，根据配置决定是将统计数据打入 ftrace 还是 dmesg。
+    if (uvm_perf_fault_log_destination == 1) {
+        trace_printk("Replayable fault stats GPU %s: batch_faults=%u batch_duplicates=%u batch_after_dedup=%u total_faults=%llu total_duplicates=%llu total_after_dedup=%llu\n",
+                     uvm_parent_gpu_name(parent_gpu),
+                     batch_faults,        // 本次批次总中断数
+                     batch_duplicates,    // 本次批次重复数
+                     batch_after_dedup,   // 本次批次去重后需要真实处理的有效数量
+                     (unsigned long long)total_faults,       // 历史累计总数
+                     (unsigned long long)total_duplicates,   // 历史累计重复数
+                     (unsigned long long)total_after_dedup); // 历史累计真实处理数
+    }
+    else {
+        UVM_INFO_PRINT("Replayable fault stats GPU %s: batch_faults=%u batch_duplicates=%u batch_after_dedup=%u total_faults=%llu total_duplicates=%llu total_after_dedup=%llu\n",
+                       uvm_parent_gpu_name(parent_gpu),
+                       batch_faults,
+                       batch_duplicates,
+                       batch_after_dedup,
+                       (unsigned long long)total_faults,
+                       (unsigned long long)total_duplicates,
+                       (unsigned long long)total_after_dedup);
+    }
+}
 
 // This function is used for both the initial fault buffer initialization and
 // the power management resume path.
@@ -917,6 +1021,7 @@ static NV_STATUS fetch_fault_buffer_entries(uvm_parent_gpu_t *parent_gpu,
     while ((get != put) &&
            (fetch_mode == FAULT_FETCH_MODE_ALL || fault_index < parent_gpu->fault_buffer.max_batch_size)) {
         bool is_same_instance_ptr = true;
+        NvU64 fault_address_raw;
         uvm_fault_buffer_entry_t *current_entry = &fault_cache[fault_index];
         uvm_fault_utlb_info_t *current_tlb;
 
@@ -943,10 +1048,15 @@ static NV_STATUS fetch_fault_buffer_entries(uvm_parent_gpu_t *parent_gpu,
         if (status != NV_OK)
             goto done;
 
+        fault_address_raw = current_entry->fault_address;
+
         // GPU 硬件是以 4KB 对齐报告错误地址的，
         // 但操作系统的 PAGE_SIZE 可能是 64KB (如某些 ARM/PowerPC 架构)，
         // 因此这里需要向下对齐到操作系统的页面边界。
         current_entry->fault_address = UVM_PAGE_ALIGN_DOWN(current_entry->fault_address);
+
+        if (uvm_perf_fault_log_addresses)
+            log_replayable_fault_entry(parent_gpu, current_entry, fault_address_raw);
 
         // 初始化/标记致命错误状态 (Fatal)
         current_entry->is_fatal = (current_entry->fault_type >= UVM_FAULT_TYPE_FATAL);
@@ -3123,6 +3233,12 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
         // 根据策略启用或禁用预取(prefetch)引起的缺页错误
         enable_disable_prefetch_faults(parent_gpu, batch_context);
+
+        if (uvm_perf_fault_log_counters) {
+            log_replayable_fault_counters(parent_gpu,
+                                          batch_context->num_cached_faults,
+                                          batch_context->num_duplicate_faults);
+        }
 
         // 如果在服务错误(分配内存/映射)时发生严重错误（如 OOM 内存耗尽 或 ECC 硬件错误）
         if (status != NV_OK) {
