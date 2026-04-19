@@ -320,6 +320,10 @@ struct uvm_fault_service_batch_context_struct
 
     NvU32 num_duplicate_faults;
 
+    NvU32 num_kv_faults;
+
+    NvU32 num_kv_duplicate_faults;
+
     NvU32 num_replays;
 
     uvm_ats_fault_context_t ats_context;
@@ -394,6 +398,10 @@ typedef struct
             NvU64 num_atomic_faults;
 
             NvU64 num_duplicate_faults;
+
+            NvU64 num_kv_faults;
+
+            NvU64 num_kv_duplicate_faults;
 
             atomic64_t num_pages_out;
 

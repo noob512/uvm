@@ -119,17 +119,52 @@ module_param(uvm_perf_fault_coalesce, uint, S_IRUGO);
 // Log replayable fault addresses as each HW fault entry is parsed.
 // 0 = disabled (default), 1 = enabled.
 static unsigned uvm_perf_fault_log_addresses;
-module_param(uvm_perf_fault_log_addresses, uint, S_IRUGO);
+module_param(uvm_perf_fault_log_addresses, uint, S_IRUGO | S_IWUSR);
 
 // Destination for replayable fault address logs:
 // 0 = kernel log (dmesg), 1 = ftrace buffer (trace_pipe).
 static unsigned uvm_perf_fault_log_destination;
-module_param(uvm_perf_fault_log_destination, uint, S_IRUGO);
+module_param(uvm_perf_fault_log_destination, uint, S_IRUGO | S_IWUSR);
 
 // Log replayable fault counters after each serviced batch.
 // 0 = disabled (default), 1 = enabled.
 static unsigned uvm_perf_fault_log_counters;
-module_param(uvm_perf_fault_log_counters, uint, S_IRUGO);
+module_param(uvm_perf_fault_log_counters, uint, S_IRUGO | S_IWUSR);
+
+// Enable KV cache address-range classification for replayable fault stats.
+// 0 = disabled (default), 1 = enabled.
+static unsigned uvm_perf_fault_kv_range_enable;
+module_param(uvm_perf_fault_kv_range_enable, uint, S_IRUGO | S_IWUSR);
+
+// Inclusive KV cache virtual address range used for replayable fault
+// classification. The values are expected to come from vLLM UVM address logs.
+static unsigned long long uvm_perf_fault_kv_start;
+module_param(uvm_perf_fault_kv_start, ullong, S_IRUGO | S_IWUSR);
+
+static unsigned long long uvm_perf_fault_kv_end;
+module_param(uvm_perf_fault_kv_end, ullong, S_IRUGO | S_IWUSR);
+
+bool uvm_perf_fault_address_is_in_kv_cache(NvU64 fault_address)
+{
+    NvU64 start = (NvU64)uvm_perf_fault_kv_start;
+    NvU64 end = (NvU64)uvm_perf_fault_kv_end;
+
+    if (!uvm_perf_fault_kv_range_enable)
+        return false;
+
+    if (start == 0 || end == 0 || end < start)
+        return false;
+
+    return fault_address >= start && fault_address <= end;
+}
+
+static NvU64 percent_x100_u64(NvU64 numerator, NvU64 denominator)
+{
+    if (denominator == 0)
+        return 0;
+
+    return (numerator * 10000ULL) / denominator;
+}
 
 /**
  * 记录单次可重放缺页中断（Replayable Fault）的详细硬件条目信息。
@@ -184,38 +219,71 @@ static void log_replayable_fault_entry(uvm_parent_gpu_t *parent_gpu,
  */
 static void log_replayable_fault_counters(uvm_parent_gpu_t *parent_gpu,
                                           NvU32 batch_faults,
-                                          NvU32 batch_duplicates)
+                                          NvU32 batch_duplicates,
+                                          NvU32 batch_kv_faults,
+                                          NvU32 batch_kv_duplicates)
 {
-    // 计算当前批次去重后的实际独立缺页数量。
-    // 使用三元运算符防止因硬件或计数逻辑异常导致下溢 (负数)。
     NvU32 batch_after_dedup = batch_faults >= batch_duplicates ? batch_faults - batch_duplicates : 0;
-    
-    // 从 GPU 状态结构体中获取自驱动加载以来的全局历史统计数据。
+    NvU32 batch_kv_after_dedup = batch_kv_faults >= batch_kv_duplicates ? batch_kv_faults - batch_kv_duplicates : 0;
+    NvU64 batch_kv_ratio_x100 = percent_x100_u64(batch_kv_faults, batch_faults);
+    NvU64 batch_kv_after_dedup_ratio_x100 = percent_x100_u64(batch_kv_after_dedup, batch_after_dedup);
+
     NvU64 total_faults = parent_gpu->stats.num_replayable_faults;
     NvU64 total_duplicates = parent_gpu->fault_buffer.replayable.stats.num_duplicate_faults;
-    // 计算历史累计去重后的独立缺页数量。
     NvU64 total_after_dedup = total_faults >= total_duplicates ? total_faults - total_duplicates : 0;
+    NvU64 total_kv_faults = parent_gpu->fault_buffer.replayable.stats.num_kv_faults;
+    NvU64 total_kv_duplicates = parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults;
+    NvU64 total_kv_after_dedup = total_kv_faults >= total_kv_duplicates ? total_kv_faults - total_kv_duplicates : 0;
+    NvU64 total_kv_ratio_x100 = percent_x100_u64(total_kv_faults, total_faults);
+    NvU64 total_kv_after_dedup_ratio_x100 = percent_x100_u64(total_kv_after_dedup, total_after_dedup);
 
-    // 与上面的函数类似，根据配置决定是将统计数据打入 ftrace 还是 dmesg。
     if (uvm_perf_fault_log_destination == 1) {
-        trace_printk("Replayable fault stats GPU %s: batch_faults=%u batch_duplicates=%u batch_after_dedup=%u total_faults=%llu total_duplicates=%llu total_after_dedup=%llu\n",
+        trace_printk("Replayable fault stats GPU %s: batch_faults=%u batch_duplicates=%u batch_after_dedup=%u batch_kv_faults=%u batch_kv_duplicates=%u batch_kv_after_dedup=%u batch_kv_ratio=%llu.%02llu%% batch_kv_after_dedup_ratio=%llu.%02llu%% total_faults=%llu total_duplicates=%llu total_after_dedup=%llu total_kv_faults=%llu total_kv_duplicates=%llu total_kv_after_dedup=%llu total_kv_ratio=%llu.%02llu%% total_kv_after_dedup_ratio=%llu.%02llu%%\n",
                      uvm_parent_gpu_name(parent_gpu),
-                     batch_faults,        // 本次批次总中断数
-                     batch_duplicates,    // 本次批次重复数
-                     batch_after_dedup,   // 本次批次去重后需要真实处理的有效数量
-                     (unsigned long long)total_faults,       // 历史累计总数
-                     (unsigned long long)total_duplicates,   // 历史累计重复数
-                     (unsigned long long)total_after_dedup); // 历史累计真实处理数
+                     batch_faults,
+                     batch_duplicates,
+                     batch_after_dedup,
+                     batch_kv_faults,
+                     batch_kv_duplicates,
+                     batch_kv_after_dedup,
+                     (unsigned long long)(batch_kv_ratio_x100 / 100ULL),
+                     (unsigned long long)(batch_kv_ratio_x100 % 100ULL),
+                     (unsigned long long)(batch_kv_after_dedup_ratio_x100 / 100ULL),
+                     (unsigned long long)(batch_kv_after_dedup_ratio_x100 % 100ULL),
+                     (unsigned long long)total_faults,
+                     (unsigned long long)total_duplicates,
+                     (unsigned long long)total_after_dedup,
+                     (unsigned long long)total_kv_faults,
+                     (unsigned long long)total_kv_duplicates,
+                     (unsigned long long)total_kv_after_dedup,
+                     (unsigned long long)(total_kv_ratio_x100 / 100ULL),
+                     (unsigned long long)(total_kv_ratio_x100 % 100ULL),
+                     (unsigned long long)(total_kv_after_dedup_ratio_x100 / 100ULL),
+                     (unsigned long long)(total_kv_after_dedup_ratio_x100 % 100ULL));
     }
     else {
-        UVM_INFO_PRINT("Replayable fault stats GPU %s: batch_faults=%u batch_duplicates=%u batch_after_dedup=%u total_faults=%llu total_duplicates=%llu total_after_dedup=%llu\n",
+        UVM_INFO_PRINT("Replayable fault stats GPU %s: batch_faults=%u batch_duplicates=%u batch_after_dedup=%u batch_kv_faults=%u batch_kv_duplicates=%u batch_kv_after_dedup=%u batch_kv_ratio=%llu.%02llu%% batch_kv_after_dedup_ratio=%llu.%02llu%% total_faults=%llu total_duplicates=%llu total_after_dedup=%llu total_kv_faults=%llu total_kv_duplicates=%llu total_kv_after_dedup=%llu total_kv_ratio=%llu.%02llu%% total_kv_after_dedup_ratio=%llu.%02llu%%\n",
                        uvm_parent_gpu_name(parent_gpu),
                        batch_faults,
                        batch_duplicates,
                        batch_after_dedup,
+                       batch_kv_faults,
+                       batch_kv_duplicates,
+                       batch_kv_after_dedup,
+                       (unsigned long long)(batch_kv_ratio_x100 / 100ULL),
+                       (unsigned long long)(batch_kv_ratio_x100 % 100ULL),
+                       (unsigned long long)(batch_kv_after_dedup_ratio_x100 / 100ULL),
+                       (unsigned long long)(batch_kv_after_dedup_ratio_x100 % 100ULL),
                        (unsigned long long)total_faults,
                        (unsigned long long)total_duplicates,
-                       (unsigned long long)total_after_dedup);
+                       (unsigned long long)total_after_dedup,
+                       (unsigned long long)total_kv_faults,
+                       (unsigned long long)total_kv_duplicates,
+                       (unsigned long long)total_kv_after_dedup,
+                       (unsigned long long)(total_kv_ratio_x100 / 100ULL),
+                       (unsigned long long)(total_kv_ratio_x100 % 100ULL),
+                       (unsigned long long)(total_kv_after_dedup_ratio_x100 / 100ULL),
+                       (unsigned long long)(total_kv_after_dedup_ratio_x100 % 100ULL));
     }
 }
 
@@ -3188,6 +3256,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
     // 主循环：持续处理缓冲区中的所有页错误
     while (1) {
+        NvU64 total_kv_faults_before = parent_gpu->fault_buffer.replayable.stats.num_kv_faults;
+        NvU64 total_kv_duplicates_before = parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults;
+
         // 退出条件 1：防止占用 CPU 太久。如果限流次数或处理批次达到上限，暂时退出，让出 CPU
         if (num_throttled >= uvm_perf_fault_max_throttle_per_service ||
             num_batches >= uvm_perf_fault_max_batches_per_service) {
@@ -3197,6 +3268,8 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         // 重置当前批次的统计信息
         batch_context->num_invalid_prefetch_faults = 0;
         batch_context->num_duplicate_faults        = 0; // 重复的页错误数（多个线程访问同一缺失页）
+        batch_context->num_kv_faults               = 0;
+        batch_context->num_kv_duplicate_faults     = 0;
         batch_context->num_replays                 = 0;
         batch_context->fatal_va_space              = NULL;
         batch_context->fatal_gpu                   = NULL;
@@ -3234,10 +3307,20 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         // 根据策略启用或禁用预取(prefetch)引起的缺页错误
         enable_disable_prefetch_faults(parent_gpu, batch_context);
 
+        batch_context->num_kv_faults = parent_gpu->fault_buffer.replayable.stats.num_kv_faults >= total_kv_faults_before ?
+                                       (NvU32)(parent_gpu->fault_buffer.replayable.stats.num_kv_faults - total_kv_faults_before) :
+                                       0;
+        batch_context->num_kv_duplicate_faults =
+            parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults >= total_kv_duplicates_before ?
+            (NvU32)(parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults - total_kv_duplicates_before) :
+            0;
+
         if (uvm_perf_fault_log_counters) {
             log_replayable_fault_counters(parent_gpu,
                                           batch_context->num_cached_faults,
-                                          batch_context->num_duplicate_faults);
+                                          batch_context->num_duplicate_faults,
+                                          batch_context->num_kv_faults,
+                                          batch_context->num_kv_duplicate_faults);
         }
 
         // 如果在服务错误(分配内存/映射)时发生严重错误（如 OOM 内存耗尽 或 ECC 硬件错误）

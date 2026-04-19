@@ -26,6 +26,7 @@
 #include "uvm_channel.h"
 #include "uvm_global.h"
 #include "uvm_gpu.h"
+#include "uvm_gpu_replayable_faults.h"
 #include "uvm_gpu_semaphore.h"
 #include "uvm_hal.h"
 #include "uvm_procfs.h"
@@ -691,12 +692,31 @@ gpu_fault_stats_print_common(uvm_parent_gpu_t *parent_gpu, struct seq_file *s)
 {
     NvU64 num_pages_in;
     NvU64 num_pages_out;
+    NvU64 replayable_faults = parent_gpu->stats.num_replayable_faults;
+    NvU64 replayable_duplicates = parent_gpu->fault_buffer.replayable.stats.num_duplicate_faults;
+    NvU64 replayable_after_dedup = replayable_faults >= replayable_duplicates ?
+                                   replayable_faults - replayable_duplicates : 0;
+    NvU64 kv_faults = parent_gpu->fault_buffer.replayable.stats.num_kv_faults;
+    NvU64 kv_duplicates = parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults;
+    NvU64 kv_after_dedup = kv_faults >= kv_duplicates ? kv_faults - kv_duplicates : 0;
+    NvU64 kv_ratio_x100 = replayable_faults > 0 ? (kv_faults * 10000ULL) / replayable_faults : 0;
+    NvU64 kv_after_dedup_ratio_x100 = replayable_after_dedup > 0 ?
+                                      (kv_after_dedup * 10000ULL) / replayable_after_dedup : 0;
 
     UVM_ASSERT(uvm_procfs_is_debug_enabled());
 
-    UVM_SEQ_OR_DBG_PRINT(s, "replayable_faults      %llu\n", parent_gpu->stats.num_replayable_faults);
+    UVM_SEQ_OR_DBG_PRINT(s, "replayable_faults      %llu\n", replayable_faults);
     UVM_SEQ_OR_DBG_PRINT(s, "duplicates             %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_duplicate_faults);
+                         replayable_duplicates);
+    UVM_SEQ_OR_DBG_PRINT(s, "kv_faults              %llu\n", kv_faults);
+    UVM_SEQ_OR_DBG_PRINT(s, "kv_duplicates          %llu\n", kv_duplicates);
+    UVM_SEQ_OR_DBG_PRINT(s, "kv_after_dedup         %llu\n", kv_after_dedup);
+    UVM_SEQ_OR_DBG_PRINT(s, "kv_ratio               %llu.%02llu%%\n",
+                         kv_ratio_x100 / 100ULL,
+                         kv_ratio_x100 % 100ULL);
+    UVM_SEQ_OR_DBG_PRINT(s, "kv_after_dedup_ratio   %llu.%02llu%%\n",
+                         kv_after_dedup_ratio_x100 / 100ULL,
+                         kv_after_dedup_ratio_x100 % 100ULL);
     UVM_SEQ_OR_DBG_PRINT(s, "faults_by_access_type:\n");
     UVM_SEQ_OR_DBG_PRINT(s, "  prefetch             %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_prefetch_faults);
@@ -1811,6 +1831,8 @@ static void update_stats_parent_gpu_fault_instance(uvm_parent_gpu_t *parent_gpu,
                                                    const uvm_fault_buffer_entry_t *fault_entry,
                                                    bool is_duplicate)
 {
+    bool is_kv_fault = false;
+
     if (!fault_entry->is_replayable) {
         switch (fault_entry->fault_access_type)
         {
@@ -1857,8 +1879,15 @@ static void update_stats_parent_gpu_fault_instance(uvm_parent_gpu_t *parent_gpu,
         default:
             break;
     }
+
+    is_kv_fault = uvm_perf_fault_address_is_in_kv_cache(fault_entry->fault_address);
+    if (is_kv_fault)
+        ++parent_gpu->fault_buffer.replayable.stats.num_kv_faults;
+
     if (is_duplicate || fault_entry->filtered)
         ++parent_gpu->fault_buffer.replayable.stats.num_duplicate_faults;
+    if (is_kv_fault && (is_duplicate || fault_entry->filtered))
+        ++parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults;
 
     ++parent_gpu->stats.num_replayable_faults;
 }

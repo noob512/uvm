@@ -51,6 +51,7 @@ typedef enum
 } uvm_perf_fault_replay_policy_t;
 
 const char *uvm_perf_fault_replay_policy_string(uvm_perf_fault_replay_policy_t fault_replay);
+bool uvm_perf_fault_address_is_in_kv_cache(NvU64 fault_address);
 
 NV_STATUS uvm_parent_gpu_fault_buffer_init(uvm_parent_gpu_t *parent_gpu);
 void uvm_parent_gpu_fault_buffer_deinit(uvm_parent_gpu_t *parent_gpu);

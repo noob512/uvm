@@ -3511,72 +3511,119 @@ class GPUModelRunner(
         self, kv_caches: dict[str, Any]
     ) -> list[tuple[str, str, int, int, int]]:
         """
-        收集当前模型所有 KV Cache (键值缓存) 相关的底层显存地址信息。
-        KV Cache 用于在自回归解码阶段保存之前 token 的计算状态，避免重复计算。
+        收集当前模型所有 KV Cache (键值缓存) 相关的底层物理显存地址信息，并分析其内存连续性。
+        KV Cache 用于在自回归解码阶段保存历史 token 的计算状态，避免重复计算。
         
         Args:
-            kv_caches: 一个字典，通常键 (key) 是层名称 (layer_name)，
-                       值 (value) 是对应的 KV 缓存张量或张量列表。
+            kv_caches: 包含层级 KV 缓存的字典。键通常是层名称 (layer_name)，
+                       值是对应的 KV 缓存张量 (Tensor) 或张量列表 (List[Tensor])。
                        
         Returns:
-            返回一个列表，包含多个元组。每个元组的格式为：
-            (数据类型, 缓存层名称/标识, 起始内存地址, 结束内存地址, 字节大小)
+            返回一个列表，包含多个描述内存块的元组。每个元组的格式为：
+            (数据类型/标签, 缓存层名称/标识, 起始内存地址, 结束内存地址, 字节大小)
         """
-        # 初始化用于存储结果的列表
+        # rows 用于按行记录每一块被识别到的 KV Cache 的物理内存分布信息
         rows: list[tuple[str, str, int, int, int]] = []
 
-        # 定义内部辅助函数，用于处理和记录单个 KV Cache 张量的信息
+        # ==========================================
+        # 内部辅助函数：处理并记录单个张量的地址信息
+        # ==========================================
         def record_tensor(kind: str, name: str, tensor: torch.Tensor) -> None:
-            # 过滤检查 1：确保存储在 GPU (CUDA) 上。如果是 offload 到 CPU 的缓存则暂不记录。
+            # 过滤 1: 仅追踪驻留在 GPU (CUDA) 上的显存。如果被 Offload 到 CPU，则跳过记录
             if not tensor.is_cuda:
                 return
                 
-            # 获取张量底层数据在显存中的起始指针地址
+            # 获取张量底层数据在物理显存中的首字节指针地址
             ptr = tensor.data_ptr()
             
-            # 过滤检查 2：
-            # ptr == 0: 忽略未实际分配内存的空指针。
-            # ptr in self._logged_kv_ptrs: 通过集合去重，确保同一块物理显存不被重复记录。
-            # 针对如 PagedAttention 等机制，不同的逻辑块可能映射或复用同一块物理内存。
+            # 过滤 2: 
+            # - ptr == 0: 忽略未分配内存的空张量/空指针
+            # - self._logged_kv_ptrs: 显存去重。针对 PagedAttention 等机制，
+            #   不同逻辑块可能指向同一块物理内存，防止重复统计。
             if ptr == 0 or ptr in self._logged_kv_ptrs:
                 return
                 
-            # 计算该缓存张量当前占据的总字节数
+            # 计算该缓存张量当前占据的实际物理字节数 (元素总数 * 单个元素的字节数)
             size_bytes = tensor.numel() * tensor.element_size()
             
-            # 过滤检查 3：忽略大小为 0 的张量
+            # 过滤 3: 忽略实际大小为 0 的异常张量
             if size_bytes <= 0:
                 return
                 
-            # 将该指针地址加入 KV Cache 专用的已记录集合
+            # 注册该指针地址，标记为“已处理”
             self._logged_kv_ptrs.add(ptr)
             
-            # 打包地址和大小信息存入列表
+            # 将该内存块的信息 (类型, 名称, 起始地址, 结束地址, 总字节) 存入结果集
+            # 结束地址 = 起始地址 + 大小 - 1
             rows.append((kind, name, ptr, ptr + size_bytes - 1, size_bytes))
 
-        # 遍历传入的 kv_caches 字典
+        # ==========================================
+        # 第一阶段：遍历并提取基础层级 KV Cache 内存块
+        # ==========================================
         for layer_name, cache_tensor in kv_caches.items():
-            # 情况 A: 如果该层对应的缓存是一个单一的 PyTorch 张量
+            # 情况 A: 某些框架将 K 和 V 拼接为一个整张量 (例如形状为 [2, ...])
             if isinstance(cache_tensor, torch.Tensor):
                 record_tensor("kv_cache", layer_name, cache_tensor)
                 
-            # 情况 B: 如果该层的缓存是一个张量列表
-            # （例如某些框架会将 Key 和 Value 分开存储为两个张量，即 [K_cache, V_cache]）
+            # 情况 B: 某些框架将 Key 和 Value 分开，存为列表如 [K_tensor, V_tensor]
             elif isinstance(cache_tensor, list):
                 for idx, tensor in enumerate(cache_tensor):
                     if isinstance(tensor, torch.Tensor):
-                        # 在记录名称上附加索引 [idx]，以区分列表中的不同张量
+                        # 在层名称后附加索引 (如 layer_0[0], layer_0[1]) 用于区分 K 和 V
                         record_tensor("kv_cache", f"{layer_name}[{idx}]", tensor)
 
-        # 检查并记录跨层共享的 KV Cache (Cross-layer KV Cache)
-        # 这种设计常见于如 DeepSeek (MLA 架构) 或某些极致优化过的模型中，
-        # 它们会将 KV 缓存压缩或合并，跨越多个 Transformer 层共享，以极大节省显存。
-        if isinstance(self.cross_layers_kv_cache, torch.Tensor):
+        # ==========================================
+        # 第二阶段：处理跨层共享 KV Cache (针对特殊架构)
+        # ==========================================
+        # 例如 DeepSeek 的 MLA 架构会将 KV 状态高度压缩，甚至跨层复用以减少显存开销
+        if isinstance(getattr(self, "cross_layers_kv_cache", None), torch.Tensor):
             record_tensor(
                 "kv_cache:cross_layers", "cross_layers_kv_cache", self.cross_layers_kv_cache
             )
 
-        # 返回收集到的所有 KV Cache 内存块地址信息
+        # ==========================================
+        # 第三阶段：内存连续性分析与整体跨度统计
+        # ==========================================
+        # 筛选出所有属于常规 KV Cache 的行（排除 cross_layers 等特殊项，避免干扰分析）
+        kv_rows = [row for row in rows if row[0].startswith("kv_cache")]
+        
+        if kv_rows:
+            # 按照起始物理地址 (下标 2) 从小到大对内存块进行排序
+            kv_rows.sort(key=lambda item: item[2])
+            
+            # 获取整个模型常规 KV Cache 在显存分布中的下界和上界
+            kv_start = kv_rows[0][2]     # 第一块内存的首地址
+            kv_end = kv_rows[-1][3]      # 最后一块内存的末地址
+            
+            # 连续性检查变量初始化
+            merged_end = kv_rows[0][3]   # 追踪当前已扫描区块能连贯到的最远地址
+            is_contiguous = True         # 假设内存是完全连续的（无碎片、无 Gap）
+
+            # 从第二个内存块开始遍历检查
+            for _, _, start, end, _ in kv_rows[1:]:
+                # 检查断层：如果下一个块的起点 > 当前已记录末尾 + 1
+                # 说明这两块内存中间夹杂了其他数据（如权重张量或 Activation），显存被碎片化了
+                if start > merged_end + 1:
+                    is_contiguous = False
+                    break  # 发现断层，直接结束连续性判断
+                    
+                # 如果没有断层，且当前块更往后延伸，则更新连贯的最远地址
+                if end > merged_end:
+                    merged_end = end
+
+            # 汇总一条全局记录，反映整个 KV Cache 的内存占用跨度
+            rows.append(
+                (
+                    # 根据连续性检测结果打上对应的 Tag
+                    # contiguous_range: 完美连续块；span_range: 有碎片的跨度范围
+                    "kv_cache:contiguous_range" if is_contiguous else "kv_cache:span_range",
+                    "all_layers",               # 作用域：所有层
+                    kv_start,                   # 整体起始地址
+                    kv_end,                     # 整体结束地址
+                    kv_end - kv_start + 1,      # 整体跨越的地址空间大小（包含碎片空间的跨度）
+                )
+            )
+
         return rows
     def _log_model_weight_addresses(self, phase: str) -> None:
         """
