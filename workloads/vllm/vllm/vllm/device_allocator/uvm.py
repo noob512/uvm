@@ -48,6 +48,7 @@ logger = init_logger(__name__)
 # Global state
 _uvm_enabled = False
 _uvm_lib: Optional[ctypes.CDLL] = None
+_uvm_phase_stack: list[str] = []
 
 
 def find_uvm_allocator_library() -> Optional[str]:
@@ -144,6 +145,12 @@ def load_uvm_library() -> ctypes.CDLL:
     lib.uvm_set_verbose.restype = None
     lib.uvm_set_verbose.argtypes = [ctypes.c_int]
 
+    lib.uvm_set_phase.restype = None
+    lib.uvm_set_phase.argtypes = [ctypes.c_char_p]
+
+    lib.uvm_mark_phase_event.restype = None
+    lib.uvm_mark_phase_event.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+
     return lib
 
 
@@ -198,18 +205,21 @@ def enable_uvm_allocator(
         torch.cuda.memory.change_current_allocator(allocator)
         _uvm_enabled = True
         logger.info("UVM allocator enabled successfully")
+        _set_uvm_phase("enabled")
+        mark_uvm_phase_event("allocator_enabled", "enabled")
 
         # Pre-initialize cuBLAS after UVM is enabled
         # This ensures cuBLAS workspace is allocated via UVM
         # and won't fail later due to native memory exhaustion
         try:
             logger.info("Pre-initializing cuBLAS with UVM...")
-            a = torch.randn(512, 512, device='cuda', dtype=torch.bfloat16)
-            b = torch.randn(512, 512, device='cuda', dtype=torch.bfloat16)
-            _ = torch.matmul(a, b)
-            torch.cuda.synchronize()
-            del a, b
-            torch.cuda.empty_cache()
+            with uvm_allocation_phase("uvm_enable:cublas_preinit"):
+                a = torch.randn(512, 512, device='cuda', dtype=torch.bfloat16)
+                b = torch.randn(512, 512, device='cuda', dtype=torch.bfloat16)
+                _ = torch.matmul(a, b)
+                torch.cuda.synchronize()
+                del a, b
+                torch.cuda.empty_cache()
             logger.info("cuBLAS pre-initialized successfully with UVM")
         except Exception as e:
             logger.warning("Failed to pre-initialize cuBLAS: %s", e)
@@ -224,6 +234,39 @@ def enable_uvm_allocator(
 def is_uvm_enabled() -> bool:
     """Check if UVM allocator is currently enabled."""
     return _uvm_enabled
+
+
+def _set_uvm_phase(phase: str) -> None:
+    if _uvm_lib is None:
+        return
+    _uvm_lib.uvm_set_phase(phase.encode("utf-8"))
+
+
+def mark_uvm_phase_event(event: str, phase: str | None = None) -> None:
+    if _uvm_lib is None:
+        return
+    event_bytes = event.encode("utf-8")
+    phase_bytes = phase.encode("utf-8") if phase is not None else None
+    _uvm_lib.uvm_mark_phase_event(event_bytes, phase_bytes)
+
+
+@contextmanager
+def uvm_allocation_phase(phase: str):
+    """Attach allocator traces to a high-level execution phase."""
+    if not _uvm_enabled or _uvm_lib is None:
+        yield
+        return
+
+    _uvm_phase_stack.append(phase)
+    mark_uvm_phase_event("enter", phase)
+    _set_uvm_phase(phase)
+    try:
+        yield
+    finally:
+        mark_uvm_phase_event("exit", phase)
+        _uvm_phase_stack.pop()
+        restored = _uvm_phase_stack[-1] if _uvm_phase_stack else "enabled"
+        _set_uvm_phase(restored)
 
 
 def get_uvm_stats() -> dict:

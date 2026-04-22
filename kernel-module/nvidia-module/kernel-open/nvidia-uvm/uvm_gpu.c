@@ -1827,43 +1827,72 @@ void uvm_parent_gpu_kref_put(uvm_parent_gpu_t *parent_gpu)
     nv_kref_put(&parent_gpu->gpu_kref, uvm_parent_gpu_destroy);
 }
 
+/**
+ * 更新物理显卡 (parent_gpu) 的单次缺页实例统计数据。
+ *
+ * @param parent_gpu    指向物理显卡的指针，所有逻辑分区的账最终都会记在这里。
+ * @param fault_entry   原始的硬件缺页底层条目信息（包含读/写类型、地址、是否可重放等）。
+ * @param is_duplicate  布尔值，表示该缺页是否在软件处理批次中被判定为重复项。
+ */
 static void update_stats_parent_gpu_fault_instance(uvm_parent_gpu_t *parent_gpu,
                                                    const uvm_fault_buffer_entry_t *fault_entry,
                                                    bool is_duplicate)
 {
     bool is_kv_fault = false;
 
+    // =========================================================
+    // 分支一：处理【不可重放中断】 (Non-Replayable Faults)
+    // =========================================================
+    // 什么是不可重放？
+    // 当非计算单元（比如 DMA 拷贝引擎、显示输出模块等）或者极其严重的底层硬件错误触发缺页时，
+    // 硬件无法像普通计算线程那样“暂停并等数据搬过来再继续”，这种中断就是致命的或不可重放的。
     if (!fault_entry->is_replayable) {
+        // 根据内存访问的类型分类记账
         switch (fault_entry->fault_access_type)
         {
             case UVM_FAULT_ACCESS_TYPE_READ:
-                ++parent_gpu->fault_buffer.non_replayable.stats.num_read_faults;
+                ++parent_gpu->fault_buffer.non_replayable.stats.num_read_faults; // 读失败
                 break;
             case UVM_FAULT_ACCESS_TYPE_WRITE:
-                ++parent_gpu->fault_buffer.non_replayable.stats.num_write_faults;
+                ++parent_gpu->fault_buffer.non_replayable.stats.num_write_faults; // 写失败
                 break;
             case UVM_FAULT_ACCESS_TYPE_ATOMIC_WEAK:
             case UVM_FAULT_ACCESS_TYPE_ATOMIC_STRONG:
-                ++parent_gpu->fault_buffer.non_replayable.stats.num_atomic_faults;
+                ++parent_gpu->fault_buffer.non_replayable.stats.num_atomic_faults; // 原子操作失败
                 break;
             default:
+                // 如果出现其他类型，说明硬件上报了非法状态，在 Debug 模式下直接内核断言报错。
                 UVM_ASSERT_MSG(false, "Invalid access type for non-replayable faults\n");
                 break;
         }
 
+        // 不可重放中断甚至可能发生在直接操作物理地址的时候（绕过虚拟内存页表）。
+        // 如果是物理地址缺页（如错误的 DMA 物理内存寻址），单独记一笔。
         if (!fault_entry->is_virtual)
             ++parent_gpu->fault_buffer.non_replayable.stats.num_physical_faults;
 
+        // 累加不可重放中断的总数，然后直接返回，不再执行后续的可重放逻辑。
         ++parent_gpu->stats.num_non_replayable_faults;
 
         return;
     }
 
+    // =========================================================
+    // 分支二：处理【可重放中断】 (Replayable Faults)
+    // =========================================================
+    // 什么是可重放？
+    // 这是现代 GPU 异构计算的基石。当流多处理器（SM）中的 CUDA 线程访问未分配的显存时，
+    // 硬件会把这个线程挂起（Stall），触发缺页中断。等 UVM 驱动把内存从 CPU 内存搬过来并建好页表后，
+    // 硬件会“重新执行（Replay）”这条读写指令。程序对此毫无察觉，只是觉得这行代码跑得比较慢。
+
+    // 可重放中断必然是在访问虚拟地址空间时发生的，这是硬件设计的铁律。
     UVM_ASSERT(fault_entry->is_virtual);
 
+    // 同样，按照访存类型进行分类记账
     switch (fault_entry->fault_access_type)
     {
         case UVM_FAULT_ACCESS_TYPE_PREFETCH:
+            // 预取（Prefetch）触发的缺页。这通常是驱动主动尝试提前搬运数据。
             ++parent_gpu->fault_buffer.replayable.stats.num_prefetch_faults;
             break;
         case UVM_FAULT_ACCESS_TYPE_READ:
@@ -1880,39 +1909,82 @@ static void update_stats_parent_gpu_fault_instance(uvm_parent_gpu_t *parent_gpu,
             break;
     }
 
+    // ---------------------------------------------------------
+    // 特殊区域追踪：KV Cache
+    // ---------------------------------------------------------
+    // 这里判断引发缺页的地址是否属于特定的 KV 缓存区 (Key-Value Cache)。
+    // 这通常用于针对特定的工作负载（如大语言模型推理中的 KV Cache，或驱动内建的特定映射区域）
+    // 进行专门的性能剖析。
     is_kv_fault = uvm_perf_fault_address_is_in_kv_cache(fault_entry->fault_address);
     if (is_kv_fault)
         ++parent_gpu->fault_buffer.replayable.stats.num_kv_faults;
 
+    // ---------------------------------------------------------
+    // 重复性判断与归档
+    // ---------------------------------------------------------
+    // 如果软件判定这是一个重复项（is_duplicate == true），
+    // 或者该条目由于某些原因在底层被标记为已过滤（filtered），就将其计入“无用功/重复”账单。
     if (is_duplicate || fault_entry->filtered)
         ++parent_gpu->fault_buffer.replayable.stats.num_duplicate_faults;
+        
+    // KV Cache 区域的重复缺页单独记账。
     if (is_kv_fault && (is_duplicate || fault_entry->filtered))
         ++parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults;
 
+    // 累加可重放中断的总计数。
     ++parent_gpu->stats.num_replayable_faults;
 }
-
+/**
+ * 缺页事件统计回调函数 (Callback)。
+ * * 当系统中发生 GPU 缺页并通过 uvm_perf_event_notify 广播时，这个函数会被触发调用。
+ * 它的任务是解析广播传来的数据，并更新目标 GPU 的底层统计计数器。
+ *
+ * @param event_id   接收到的事件类型 ID。
+ * @param event_data 指向事件详细数据的指针（也就是之前打包好的缺页上下文包裹）。
+ */
 static void update_stats_fault_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data)
 {
     uvm_parent_gpu_t *parent_gpu;
     const uvm_fault_buffer_entry_t *fault_entry, *fault_instance;
 
+    // ---------------------------------------------------------
+    // 步骤一：事件类型断言与平台过滤
+    // ---------------------------------------------------------
+    // 作为监听者，确保自己没有“听错频道”。这个回调只处理缺页事件。
     UVM_ASSERT(event_id == UVM_PERF_EVENT_FAULT);
 
+    // 如果这个缺页是由 CPU 触发的（UVM 也管理 CPU 对显存的访问），直接忽略。
+    // 这个统计模块只关心 GPU 侧触发的缺页中断。
     if (UVM_ID_IS_CPU(event_data->fault.proc_id))
         return;
 
-    // The reported fault entry must be the "representative" fault entry
+    // ---------------------------------------------------------
+    // 步骤二：有效性校验
+    // ---------------------------------------------------------
+    // 驱动在软件层面上可能会对原始缺页条目进行过滤（比如滤掉完全无效的噪音）。
+    // 这里确保传过来的必须是“代表性”的条目（即真正需要被处理和统计的主干条目）。
     UVM_ASSERT(!event_data->fault.gpu.buffer_entry->filtered);
 
+    // ---------------------------------------------------------
+    // 步骤三：数据解包
+    // ---------------------------------------------------------
+    // 根据触发缺页的处理器 ID，反查出对应的父 GPU 实例对象。
     parent_gpu = uvm_gpu_get(event_data->fault.proc_id)->parent;
-
+    // 获取包裹中的核心硬件缺页条目数据。
     fault_entry = event_data->fault.gpu.buffer_entry;
 
-    // Update the stats using the representative fault entry and the rest of
-    // instances
+    // ---------------------------------------------------------
+    // 步骤四：执行统计记账
+    // ---------------------------------------------------------
+    // 1. 首先，对这个“代表性”条目本身进行统计记录。
+    // 将它的状态（是否是重复缺页）计入 parent_gpu 的统计账本中。
     update_stats_parent_gpu_fault_instance(parent_gpu, fault_entry, event_data->fault.gpu.is_duplicate);
 
+    // 2. 然后，处理“被合并”的兄弟条目。
+    // 之前提到过，硬件或底层软件会把多个访问相同地址的缺页请求合并。
+    // 在 UVM 的复杂场景下，这些被合并的请求不仅记录在 num_instances 里，
+    // 它们的原始详细信息可能还会被挂在一条链表（merged_instances_list）上。
+    // 遍历这条链表，把每一个合并进来的同类缺页请求，也都一并记入账本。
     list_for_each_entry(fault_instance, &fault_entry->merged_instances_list, merged_instances_list)
         update_stats_parent_gpu_fault_instance(parent_gpu, fault_instance, event_data->fault.gpu.is_duplicate);
 }

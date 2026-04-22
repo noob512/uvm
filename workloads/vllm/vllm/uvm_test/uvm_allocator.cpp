@@ -14,10 +14,14 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <atomic>
+#include <cstdint>
 #include <ctime>
 #include <chrono>
 #include <mutex>
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <unordered_map>
 
 extern "C" {
 
@@ -30,12 +34,24 @@ static std::atomic<size_t> num_frees{0};
 // Configuration
 static int enable_prefetch = 0;  // Whether to prefetch to device after allocation
 static int verbose_logging = 0;  // Whether to log allocations
+static size_t trace_min_bytes = 1 * 1024 * 1024;  // Trace allocations >= 1 MiB
 
 // Log file handling
 static FILE* log_file = nullptr;
 static std::mutex log_mutex;
 static std::chrono::steady_clock::time_point start_time;
 static bool log_initialized = false;
+static std::string current_phase = "unscoped";
+
+struct AllocationInfo {
+    size_t size;
+    int device;
+    size_t alloc_id;
+    std::string phase;
+    double alloc_elapsed_seconds;
+};
+
+static std::unordered_map<void*, AllocationInfo> active_allocations;
 
 /**
  * Get current timestamp string
@@ -59,6 +75,20 @@ static double get_elapsed_seconds() {
     return std::chrono::duration<double>(now - start_time).count();
 }
 
+static size_t read_trace_min_bytes_from_env() {
+    const char* raw = getenv("VLLM_UVM_TRACE_MIN_BYTES");
+    if (!raw || !*raw) {
+        return trace_min_bytes;
+    }
+
+    char* end_ptr = nullptr;
+    unsigned long long parsed = strtoull(raw, &end_ptr, 10);
+    if (end_ptr == raw || parsed == 0) {
+        return trace_min_bytes;
+    }
+    return static_cast<size_t>(parsed);
+}
+
 /**
  * Initialize log file (called once on first allocation)
  */
@@ -69,6 +99,7 @@ static void init_log_file() {
     if (log_initialized) return;  // Double-check after acquiring lock
 
     start_time = std::chrono::steady_clock::now();
+    trace_min_bytes = read_trace_min_bytes_from_env();
 
     // Check environment variable for log file path
     const char* log_path = getenv("VLLM_UVM_LOG_FILE");
@@ -82,6 +113,8 @@ static void init_log_file() {
         get_timestamp(timestamp, sizeof(timestamp));
         fprintf(log_file, "\n========================================\n");
         fprintf(log_file, "[%s] vLLM UVM Allocator Session Started\n", timestamp);
+        fprintf(log_file, "[%s] trace_min_bytes=%zu current_phase=%s\n",
+                timestamp, trace_min_bytes, current_phase.c_str());
         fprintf(log_file, "========================================\n");
         fflush(log_file);
     } else {
@@ -127,6 +160,99 @@ static void log_free(size_t size, size_t free_num, size_t current_total, int dev
     fflush(log_file);
 }
 
+static void log_phase_event(const char* event, const char* phase) {
+    if (!log_file) return;
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    double elapsed = get_elapsed_seconds();
+    const char* safe_phase = (phase && phase[0] != '\0') ? phase : "unscoped";
+    const char* safe_event = (event && event[0] != '\0') ? event : "marker";
+
+    fprintf(log_file, "[%s] [+%.3fs] TRACE_PHASE event=%s phase=%s\n",
+            timestamp, elapsed, safe_event, safe_phase);
+    fflush(log_file);
+}
+
+static void trace_allocation_event(void* ptr,
+                                   size_t size,
+                                   size_t alloc_num,
+                                   size_t current_total,
+                                   size_t peak,
+                                   int device,
+                                   const std::string& phase) {
+    if (!log_file) return;
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    double elapsed = get_elapsed_seconds();
+    uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t end = start + size - 1;
+
+    fprintf(
+        log_file,
+        "[%s] [+%.3fs] TRACE_ALLOC alloc_id=%zu ptr=0x%llx end=0x%llx "
+        "size_bytes=%zu size_mb=%.6f device=%d phase=%s total_bytes=%zu peak_bytes=%zu\n",
+        timestamp,
+        elapsed,
+        alloc_num,
+        static_cast<unsigned long long>(start),
+        static_cast<unsigned long long>(end),
+        size,
+        size / 1e6,
+        device,
+        phase.c_str(),
+        current_total,
+        peak
+    );
+    fflush(log_file);
+}
+
+static void trace_free_event(void* ptr,
+                             size_t size,
+                             size_t free_num,
+                             size_t current_total,
+                             int device,
+                             const AllocationInfo* info,
+                             const std::string& current_phase_snapshot) {
+    if (!log_file) return;
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    double elapsed = get_elapsed_seconds();
+    uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t end = start + size - 1;
+    double lifetime_seconds =
+        info ? (elapsed - info->alloc_elapsed_seconds) : -1.0;
+
+    fprintf(
+        log_file,
+        "[%s] [+%.3fs] TRACE_FREE free_id=%zu ptr=0x%llx end=0x%llx "
+        "size_bytes=%zu size_mb=%.6f device=%d phase=%s alloc_id=%zu "
+        "alloc_phase=%s lifetime_s=%.6f total_bytes=%zu\n",
+        timestamp,
+        elapsed,
+        free_num,
+        static_cast<unsigned long long>(start),
+        static_cast<unsigned long long>(end),
+        size,
+        size / 1e6,
+        device,
+        current_phase_snapshot.c_str(),
+        info ? info->alloc_id : 0,
+        info ? info->phase.c_str() : "unknown",
+        lifetime_seconds,
+        current_total
+    );
+    fflush(log_file);
+}
+
 /**
  * Allocate CUDA managed (UVM) memory
  *
@@ -168,9 +294,37 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
+    std::string phase_snapshot;
+    double alloc_elapsed = get_elapsed_seconds();
+    {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        phase_snapshot = current_phase.empty() ? "unscoped" : current_phase;
+        if (size >= trace_min_bytes) {
+            active_allocations[ptr] = AllocationInfo{
+                static_cast<size_t>(size),
+                device,
+                alloc_count,
+                phase_snapshot,
+                alloc_elapsed,
+            };
+        }
+    }
+
     // Log large allocations (> 100MB) to file
     if (size > 100 * 1024 * 1024) {
         log_allocation("ALLOC", size, alloc_count, current, peak_allocated.load(), device);
+    }
+
+    if (size >= trace_min_bytes) {
+        trace_allocation_event(
+            ptr,
+            static_cast<size_t>(size),
+            alloc_count,
+            current,
+            peak_allocated.load(),
+            device,
+            phase_snapshot
+        );
     }
 
     // Also log to stderr if verbose logging is enabled
@@ -208,12 +362,69 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
         // Update statistics
         size_t current = total_allocated.fetch_sub(size) - size;
         size_t free_count = num_frees.fetch_add(1) + 1;
+        AllocationInfo info{};
+        bool has_info = false;
+        std::string phase_snapshot;
+
+        {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            phase_snapshot = current_phase.empty() ? "unscoped" : current_phase;
+            auto it = active_allocations.find(ptr);
+            if (it != active_allocations.end()) {
+                info = it->second;
+                has_info = true;
+                active_allocations.erase(it);
+            }
+        }
 
         // Log large frees (> 100MB) to file
         if (size > 100 * 1024 * 1024) {
             log_free(size, free_count, current, device);
         }
+
+        if (static_cast<size_t>(size) >= trace_min_bytes || has_info) {
+            trace_free_event(
+                ptr,
+                static_cast<size_t>(size),
+                free_count,
+                current,
+                device,
+                has_info ? &info : nullptr,
+                phase_snapshot
+            );
+        }
     }
+}
+
+void uvm_set_phase(const char* phase) {
+    if (!log_initialized) {
+        init_log_file();
+    }
+
+    const char* safe_phase = (phase && phase[0] != '\0') ? phase : "unscoped";
+    {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        current_phase = safe_phase;
+    }
+    log_phase_event("set", safe_phase);
+}
+
+void uvm_mark_phase_event(const char* event, const char* phase) {
+    if (!log_initialized) {
+        init_log_file();
+    }
+
+    if (phase && phase[0] != '\0') {
+        log_phase_event(event, phase);
+        return;
+    }
+
+    std::string phase_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        phase_snapshot = current_phase.empty() ? "unscoped" : current_phase;
+    }
+    log_phase_event(event, phase_snapshot.c_str());
 }
 
 // =============================================================================

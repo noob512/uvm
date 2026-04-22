@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 
 import vllm.envs as envs
+from vllm.device_allocator.uvm import uvm_allocation_phase
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.platforms import current_platform
@@ -34,11 +35,13 @@ def kernel_warmup(worker: "Worker"):
     if do_deep_gemm_warmup:
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
-        deep_gemm_warmup(model, max_tokens)
+        with uvm_allocation_phase("kernel_warmup:deep_gemm"):
+            deep_gemm_warmup(model, max_tokens)
 
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if has_flashinfer() and current_platform.has_device_capability(90):
-        flashinfer_autotune(worker.model_runner)
+        with uvm_allocation_phase("kernel_warmup:flashinfer_autotune"):
+            flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
@@ -65,13 +68,14 @@ def kernel_warmup(worker: "Worker"):
         logger.info("Warming up FlashInfer attention.")
         # Warmup with mixed batch containing both prefill and decode tokens
         # This is to warm up both prefill and decode attention kernels
-        worker.model_runner._dummy_run(
-            num_tokens=16,
-            skip_eplb=True,
-            is_profile=True,
-            force_attention=True,
-            create_mixed_batch=True,
-        )
+        with uvm_allocation_phase("kernel_warmup:flashinfer_attention"):
+            worker.model_runner._dummy_run(
+                num_tokens=16,
+                skip_eplb=True,
+                is_profile=True,
+                force_attention=True,
+                create_mixed_batch=True,
+            )
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:

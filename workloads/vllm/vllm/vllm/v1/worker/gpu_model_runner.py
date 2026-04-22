@@ -44,10 +44,12 @@ from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
     get_tp_group,
+    get_world_group,
     graph_capture,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
+from vllm.device_allocator.uvm import uvm_allocation_phase
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -602,6 +604,7 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self._logged_weight_ptrs: set[int] = set()
         self._logged_kv_ptrs: set[int] = set()
+        self._uvm_address_log_prepared = False
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -3388,6 +3391,32 @@ class GPUModelRunner(
             "VLLM_UVM_ADDRESS_LOG_FILE", "vllm_uvm_address_regions.log"
         )
 
+    def _prepare_uvm_address_log(self) -> None:
+        if self._uvm_address_log_prepared or not self._is_uvm_address_logging_enabled():
+            return
+
+        log_path = self._uvm_address_log_file()
+
+        try:
+            if is_global_first_rank():
+                # 每次新的 vLLM 运行开始记录地址日志前，先清空旧文件内容。
+                with open(log_path, "w", encoding="utf-8"):
+                    pass
+        except OSError as exc:
+            logger.warning("Failed to reset UVM address log %s: %s", log_path, exc)
+        finally:
+            if torch.distributed.is_initialized():
+                try:
+                    get_world_group().barrier()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to synchronize UVM address log reset for %s: %s",
+                        log_path,
+                        exc,
+                    )
+
+        self._uvm_address_log_prepared = True
+
     def _append_uvm_address_log(
         self, phase: str, rows: list[tuple[str, str, int, int, int]]
     ) -> None:
@@ -3633,6 +3662,8 @@ class GPUModelRunner(
         Args:
             phase: 字符串，表示当前系统所处的执行阶段（例如："load_model" 模型加载阶段、"warmup" 预热阶段等）。
         """
+        self._prepare_uvm_address_log()
+
         # 调用辅助方法，遍历模型的所有层，收集各个权重张量 (tensors) 的底层指针地址或页表信息，
         # 并将其整理为可记录的行结构 (rows)。
         rows = self._collect_weight_address_rows()
@@ -3650,6 +3681,8 @@ class GPUModelRunner(
             kv_caches: 一个字典，包含了当前分配给模型的 KV Cache 对象（通常按层 (layer) 作为 key 进行映射）。
             phase: 字符串，表示当前的生成阶段（例如："prefill" 预填充阶段，"decode" 逐字解码阶段等）。
         """
+        self._prepare_uvm_address_log()
+
         # 调用辅助方法，解析传入的 kv_caches 字典，
         # 提取其中各个 KV Cache 物理块 (blocks) 或张量底层的内存地址，整理成数据行。
         rows = self._collect_kv_cache_address_rows(kv_caches)
@@ -3690,60 +3723,61 @@ class GPUModelRunner(
                 # 获取当前配置对应的模型加载器
                 model_loader = get_model_loader(self.load_config)
                 
-                # 实际执行主模型的权重加载
-                self.model = model_loader.load_model(
-                    vllm_config=self.vllm_config, model_config=self.model_config
-                )
-                
-                # 如果配置了 LoRA (Low-Rank Adaptation)，则将 LoRA 权重加载/合并到基础模型中
-                if self.lora_config:
-                    self.model = self.load_lora_model(
-                        self.model, self.vllm_config, self.device
+                with uvm_allocation_phase("load_model"):
+                    # 实际执行主模型的权重加载
+                    self.model = model_loader.load_model(
+                        vllm_config=self.vllm_config, model_config=self.model_config
                     )
                     
-                # 检查系统是否配置了用于投机解码 (Speculative Decoding) 的草稿模型 (drafter)
-                if hasattr(self, "drafter"):
-                    logger.info_once("Loading drafter model...")
-                    self.drafter.load_model(self.model) # 加载草稿模型
-                    
-                    # 如果草稿模型是混合专家 (MoE) 架构，并且系统启用了 EPLB
-                    if (
-                        hasattr(self.drafter, "model")
-                        and is_mixture_of_experts(self.drafter.model)
-                        and self.parallel_config.enable_eplb
-                    ):
-                        # 获取投机解码的配置，验证草稿模型的配置有效性
-                        spec_config = self.vllm_config.speculative_config
-                        assert spec_config is not None
-                        assert spec_config.draft_model_config is not None
-                        logger.info_once(
-                            "EPLB is enabled for drafter model %s.",
-                            spec_config.draft_model_config.model,
-                        )
-
-                        # 为草稿模型提取对应的专家负载和旧索引信息
-                        global_expert_load = (
-                            global_expert_loads[eplb_models]
-                            if global_expert_loads
-                            else None
-                        )
-                        old_global_expert_indices = (
-                            old_global_expert_indices_per_model[eplb_models]
-                            if old_global_expert_indices_per_model
-                            else None
+                    # 如果配置了 LoRA (Low-Rank Adaptation)，则将 LoRA 权重加载/合并到基础模型中
+                    if self.lora_config:
+                        self.model = self.load_lora_model(
+                            self.model, self.vllm_config, self.device
                         )
                         
-                        # 确保 EPLB 状态已初始化，并将草稿模型及其配置注册到 EPLB 状态管理中
-                        if self.eplb_state is None:
-                            self.eplb_state = EplbState(self.parallel_config, self.device)
-                        self.eplb_state.add_model(
-                            self.drafter.model,
-                            spec_config.draft_model_config,
-                            global_expert_load,
-                            old_global_expert_indices,
-                            rank_mapping,
-                        )
-                        eplb_models += 1 # 增加注册的 EPLB 模型计数
+                    # 检查系统是否配置了用于投机解码 (Speculative Decoding) 的草稿模型 (drafter)
+                    if hasattr(self, "drafter"):
+                        logger.info_once("Loading drafter model...")
+                        self.drafter.load_model(self.model) # 加载草稿模型
+                        
+                        # 如果草稿模型是混合专家 (MoE) 架构，并且系统启用了 EPLB
+                        if (
+                            hasattr(self.drafter, "model")
+                            and is_mixture_of_experts(self.drafter.model)
+                            and self.parallel_config.enable_eplb
+                        ):
+                            # 获取投机解码的配置，验证草稿模型的配置有效性
+                            spec_config = self.vllm_config.speculative_config
+                            assert spec_config is not None
+                            assert spec_config.draft_model_config is not None
+                            logger.info_once(
+                                "EPLB is enabled for drafter model %s.",
+                                spec_config.draft_model_config.model,
+                            )
+
+                            # 为草稿模型提取对应的专家负载和旧索引信息
+                            global_expert_load = (
+                                global_expert_loads[eplb_models]
+                                if global_expert_loads
+                                else None
+                            )
+                            old_global_expert_indices = (
+                                old_global_expert_indices_per_model[eplb_models]
+                                if old_global_expert_indices_per_model
+                                else None
+                            )
+                            
+                            # 确保 EPLB 状态已初始化，并将草稿模型及其配置注册到 EPLB 状态管理中
+                            if self.eplb_state is None:
+                                self.eplb_state = EplbState(self.parallel_config, self.device)
+                            self.eplb_state.add_model(
+                                self.drafter.model,
+                                spec_config.draft_model_config,
+                                global_expert_load,
+                                old_global_expert_indices,
+                                rank_mapping,
+                            )
+                            eplb_models += 1 # 增加注册的 EPLB 模型计数
 
                 # 处理 EAGLE3 接口所需的辅助隐藏状态输出
                 # EAGLE 是一种高效的投机解码/自回归生成加速技术，通常依赖特定的隐藏层状态
@@ -4534,92 +4568,93 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
-        # Profile with multimodal encoder & encoder cache.
-        if self.supports_mm_inputs:
-            mm_config = self.model_config.multimodal_config
-            if mm_config is not None and mm_config.skip_mm_profiling:
-                logger.info(
-                    "Skipping memory profiling for multimodal encoder and "
-                    "encoder cache."
-                )
-            else:
-                mm_budget = self.mm_budget
-                assert mm_budget is not None
-
-                if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
-                    # NOTE: Currently model is profiled with a single non-text
-                    # modality with the max possible input tokens even when
-                    # it supports multiple.
-                    dummy_modality = mm_budget.get_modality_with_max_tokens()
-                    max_mm_items_per_batch = mm_budget.max_items_per_batch_by_modality[
-                        dummy_modality
-                    ]
-
+        with uvm_allocation_phase("profile_run"):
+            # Profile with multimodal encoder & encoder cache.
+            if self.supports_mm_inputs:
+                mm_config = self.model_config.multimodal_config
+                if mm_config is not None and mm_config.skip_mm_profiling:
                     logger.info(
-                        "Encoder cache will be initialized with a budget of "
-                        "%s tokens, and profiled with %s %s items of the "
-                        "maximum feature size.",
-                        encoder_budget,
-                        max_mm_items_per_batch,
-                        dummy_modality,
+                        "Skipping memory profiling for multimodal encoder and "
+                        "encoder cache."
                     )
+                else:
+                    mm_budget = self.mm_budget
+                    assert mm_budget is not None
 
-                    # Create dummy batch of multimodal inputs.
-                    batched_dummy_mm_inputs = self._get_mm_dummy_batch(
-                        dummy_modality,
-                        max_mm_items_per_batch,
-                    )
+                    if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
+                        # NOTE: Currently model is profiled with a single non-text
+                        # modality with the max possible input tokens even when
+                        # it supports multiple.
+                        dummy_modality = mm_budget.get_modality_with_max_tokens()
+                        max_mm_items_per_batch = mm_budget.max_items_per_batch_by_modality[
+                            dummy_modality
+                        ]
 
-                    # Run multimodal encoder.
-                    dummy_encoder_outputs = self.model.embed_multimodal(
-                        **batched_dummy_mm_inputs
-                    )
+                        logger.info(
+                            "Encoder cache will be initialized with a budget of "
+                            "%s tokens, and profiled with %s %s items of the "
+                            "maximum feature size.",
+                            encoder_budget,
+                            max_mm_items_per_batch,
+                            dummy_modality,
+                        )
 
-                    sanity_check_mm_encoder_outputs(
-                        dummy_encoder_outputs,
-                        expected_num_items=max_mm_items_per_batch,
-                    )
+                        # Create dummy batch of multimodal inputs.
+                        batched_dummy_mm_inputs = self._get_mm_dummy_batch(
+                            dummy_modality,
+                            max_mm_items_per_batch,
+                        )
 
-                    # NOTE: This happens when encoder cache needs to store
-                    # the embeddings that encoder outputs are scattered onto.
-                    # In this case we create dummy embeddings of size
-                    # (max_tokens_for_modality, hidden_size) and scatter
-                    # encoder output into it.
-                    encoder_output_shape = dummy_encoder_outputs[0].shape
-                    max_mm_tokens_per_item = mm_budget.max_tokens_by_modality[
-                        dummy_modality
-                    ]
-                    if encoder_output_shape[0] < max_mm_tokens_per_item:
-                        encoder_hidden_size = encoder_output_shape[-1]
-                        expanded_outputs = []
-                        for output in dummy_encoder_outputs:
-                            expanded = output.new_zeros(
-                                (max_mm_tokens_per_item, encoder_hidden_size)
-                            )
-                            num_tokens = output.shape[0]
-                            expanded[:num_tokens].copy_(output)
-                            expanded_outputs.append(expanded)
+                        # Run multimodal encoder.
+                        dummy_encoder_outputs = self.model.embed_multimodal(
+                            **batched_dummy_mm_inputs
+                        )
 
-                        dummy_encoder_outputs = expanded_outputs
+                        sanity_check_mm_encoder_outputs(
+                            dummy_encoder_outputs,
+                            expected_num_items=max_mm_items_per_batch,
+                        )
 
-                    # Cache the dummy encoder outputs.
-                    self.encoder_cache["tmp"] = dict(enumerate(dummy_encoder_outputs))
+                        # NOTE: This happens when encoder cache needs to store
+                        # the embeddings that encoder outputs are scattered onto.
+                        # In this case we create dummy embeddings of size
+                        # (max_tokens_for_modality, hidden_size) and scatter
+                        # encoder output into it.
+                        encoder_output_shape = dummy_encoder_outputs[0].shape
+                        max_mm_tokens_per_item = mm_budget.max_tokens_by_modality[
+                            dummy_modality
+                        ]
+                        if encoder_output_shape[0] < max_mm_tokens_per_item:
+                            encoder_hidden_size = encoder_output_shape[-1]
+                            expanded_outputs = []
+                            for output in dummy_encoder_outputs:
+                                expanded = output.new_zeros(
+                                    (max_mm_tokens_per_item, encoder_hidden_size)
+                                )
+                                num_tokens = output.shape[0]
+                                expanded[:num_tokens].copy_(output)
+                                expanded_outputs.append(expanded)
 
-        # Add `is_profile` here to pre-allocate communication buffers
-        hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
-        )
-        if get_pp_group().is_last_rank:
-            if self.is_pooling_model:
-                output = self._dummy_pooler_run(hidden_states)
+                            dummy_encoder_outputs = expanded_outputs
+
+                        # Cache the dummy encoder outputs.
+                        self.encoder_cache["tmp"] = dict(enumerate(dummy_encoder_outputs))
+
+            # Add `is_profile` here to pre-allocate communication buffers
+            hidden_states, last_hidden_states = self._dummy_run(
+                self.max_num_tokens, is_profile=True
+            )
+            if get_pp_group().is_last_rank:
+                if self.is_pooling_model:
+                    output = self._dummy_pooler_run(hidden_states)
+                else:
+                    output = self._dummy_sampler_run(last_hidden_states)
             else:
-                output = self._dummy_sampler_run(last_hidden_states)
-        else:
-            output = None
-        self._sync_device()
-        del hidden_states, output
-        self.encoder_cache.clear()
-        gc.collect()
+                output = None
+            self._sync_device()
+            del hidden_states, output
+            self.encoder_cache.clear()
+            gc.collect()
 
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
@@ -5488,57 +5523,58 @@ class GPUModelRunner(
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
-        kv_cache_config = deepcopy(kv_cache_config)
-        self.kv_cache_config = kv_cache_config
-        self.may_add_encoder_only_layers_to_kv_cache_config()
-        self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
-        self.initialize_attn_backend(kv_cache_config)
-        # The kernel block size for all KV cache groups. For example, if
-        # kv_cache_manager uses block_size 256 for a given group, but the attention
-        # backends for that group only supports block_size 64, we will return
-        # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
-        # tokens each.
-        kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
+        with uvm_allocation_phase("initialize_kv_cache"):
+            kv_cache_config = deepcopy(kv_cache_config)
+            self.kv_cache_config = kv_cache_config
+            self.may_add_encoder_only_layers_to_kv_cache_config()
+            self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+            self.initialize_attn_backend(kv_cache_config)
+            # The kernel block size for all KV cache groups. For example, if
+            # kv_cache_manager uses block_size 256 for a given group, but the attention
+            # backends for that group only supports block_size 64, we will return
+            # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
+            # tokens each.
+            kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
 
-        # create metadata builders
-        self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+            # create metadata builders
+            self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
 
-        # Reinitialize need to after initialize_attn_backend
-        self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        kv_caches = self.initialize_kv_cache_tensors(
-            kv_cache_config, kernel_block_sizes
-        )
+            # Reinitialize need to after initialize_attn_backend
+            self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+            kv_caches = self.initialize_kv_cache_tensors(
+                kv_cache_config, kernel_block_sizes
+            )
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
-            # validate all draft model layers belong to the same kv cache
-            # group
-            self.drafter.validate_same_kv_cache_group(kv_cache_config)
+            if self.speculative_config and self.speculative_config.use_eagle():
+                assert isinstance(self.drafter, EagleProposer)
+                # validate all draft model layers belong to the same kv cache
+                # group
+                self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
-        if has_kv_transfer_group():
-            kv_transfer_group = get_kv_transfer_group()
-            if self.cross_layers_kv_cache is not None:
-                assert self.cross_layers_attn_backend is not None
-                kv_transfer_group.register_cross_layers_kv_cache(
-                    self.cross_layers_kv_cache, self.cross_layers_attn_backend
-                )
-            else:
-                kv_transfer_group.register_kv_caches(kv_caches)
-            kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+            if has_kv_transfer_group():
+                kv_transfer_group = get_kv_transfer_group()
+                if self.cross_layers_kv_cache is not None:
+                    assert self.cross_layers_attn_backend is not None
+                    kv_transfer_group.register_cross_layers_kv_cache(
+                        self.cross_layers_kv_cache, self.cross_layers_attn_backend
+                    )
+                else:
+                    kv_transfer_group.register_kv_caches(kv_caches)
+                kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
-        if self.dcp_world_size > 1:
-            layer_type = cast(type[Any], AttentionLayerBase)
-            layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
-            for layer in layers.values():
-                layer_impl = getattr(layer, "impl", None)
-                if layer_impl is None:
-                    continue
-                assert layer_impl.need_to_return_lse_for_decode, (
-                    "DCP requires attention impls to return"
-                    " the softmax lse for decode, but the impl "
-                    f"{layer_impl.__class__.__name__} "
-                    "does not return the softmax lse for decode."
-                )
+            if self.dcp_world_size > 1:
+                layer_type = cast(type[Any], AttentionLayerBase)
+                layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
+                for layer in layers.values():
+                    layer_impl = getattr(layer, "impl", None)
+                    if layer_impl is None:
+                        continue
+                    assert layer_impl.need_to_return_lse_for_decode, (
+                        "DCP requires attention impls to return"
+                        " the softmax lse for decode, but the impl "
+                        f"{layer_impl.__class__.__name__} "
+                        "does not return the softmax lse for decode."
+                    )
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

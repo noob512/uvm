@@ -144,17 +144,48 @@ module_param(uvm_perf_fault_kv_start, ullong, S_IRUGO | S_IWUSR);
 static unsigned long long uvm_perf_fault_kv_end;
 module_param(uvm_perf_fault_kv_end, ullong, S_IRUGO | S_IWUSR);
 
+/**
+ * 判断给定的缺页地址是否属于 KV Cache (Key-Value Cache) 追踪区域。
+ * * 背景：在跑大语言模型 (LLM) 等 AI 负载时，KV Cache 会占用海量显存且访存极为频繁。
+ * 驱动开发者为了专门分析这类特定内存的缺页性能，允许通过内核模块参数
+ * 指定一段虚拟内存地址范围作为“监控特区”。
+ *
+ * @param fault_address 触发 GPU 缺页中断的实际虚拟地址。
+ * @return true 如果地址落在配置的 KV Cache 范围内，否则返回 false。
+ */
 bool uvm_perf_fault_address_is_in_kv_cache(NvU64 fault_address)
 {
+    // ---------------------------------------------------------
+    // 第一步：读取全局/模块配置参数
+    // ---------------------------------------------------------
+    // uvm_perf_fault_kv_start 和 uvm_perf_fault_kv_end 通常是可以通过 
+    // sysfs 或驱动加载参数动态配置的全局变量。
+    // 强制转换为无符号 64 位整数 (NvU64)，以匹配 64 位系统的虚拟地址长度。
     NvU64 start = (NvU64)uvm_perf_fault_kv_start;
     NvU64 end = (NvU64)uvm_perf_fault_kv_end;
 
+    // ---------------------------------------------------------
+    // 第二步：总开关检查 (Master Switch)
+    // ---------------------------------------------------------
+    // 如果监控 KV Cache 的功能根本没有被启用，直接返回 false。
+    // 这避免了在常规用户场景下做无意义的地址比较，节省 CPU 周期。
     if (!uvm_perf_fault_kv_range_enable)
         return false;
 
+    // ---------------------------------------------------------
+    // 第三步：配置合法性校验（防御性编程）
+    // ---------------------------------------------------------
+    // 由于 start 和 end 通常是用户态通过接口传进来的参数，绝不能盲目信任。
+    // 1. start == 0 或 end == 0: 地址未初始化，或者是无效的零页地址。
+    // 2. end < start: 用户配置错误，把结束地址设得比起始地址还小。
+    // 遇到这些非法配置，安全起见，直接判定为不在范围内。
     if (start == 0 || end == 0 || end < start)
         return false;
 
+    // ---------------------------------------------------------
+    // 第四步：核心边界判定
+    // ---------------------------------------------------------
+    // 检查目标地址是否位于 [start, end] 这个闭区间内。
     return fault_address >= start && fault_address <= end;
 }
 
@@ -180,17 +211,18 @@ static void log_replayable_fault_entry(uvm_parent_gpu_t *parent_gpu,
     // 如果 uvm_perf_fault_log_destination == 1，使用内核的高性能追踪机制 (ftrace)。
     if (uvm_perf_fault_log_destination == 1) {
         // trace_printk 会将日志写入内核的 ring buffer，开销极小，适合高频中断场景。
-        trace_printk("Replayable fault GPU %s: raw=0x%llx page=0x%llx type=%s access=%s utlb=%u gpc=%u client=%u ve=%u\n",
+        trace_printk("GPU名称:%s,精确原始地址=0x%llx,对齐到页地址=0x%llx,中断类型=%s,访问类型=%s\n",
                      uvm_parent_gpu_name(parent_gpu),                  // GPU 名称 (如 GPU-0)
                      fault_address_raw,                                // 导致中断的精确原始地址
                      fault_entry->fault_address,                       // 对齐到页边界的中断地址
                      uvm_fault_type_string(fault_entry->fault_type),   // 中断类型 (如 PDE 缺失, PTE 缺失等)
-                     uvm_fault_access_type_string(fault_entry->fault_access_type), // 访问类型 (如 Read, Write, Atomic)
+                     uvm_fault_access_type_string(fault_entry->fault_access_type)); // 访问类型 (如 Read, Write, Atomic)
                      // 下面四个参数是 NVIDIA GPU 内部硬件单元的标识，用于精准定位是哪个硬件模块触发了缺页：
-                     fault_entry->fault_source.utlb_id,                // 微型 TLB (Translation Lookaside Buffer) ID
-                     fault_entry->fault_source.gpc_id,                 // 图形处理簇 (Graphics Processing Cluster) ID
-                     fault_entry->fault_source.client_id,              // 内存客户端 ID (如 L1 缓存, 纹理单元等)
-                     fault_entry->fault_source.ve_id);                 // 虚拟引擎 (Virtual Engine) ID
+                    //   utlb=%u gpc=%u client=%u ve=%u
+                    // fault_entry->fault_source.utlb_id,                // 微型 TLB (Translation Lookaside Buffer) ID
+                    //  fault_entry->fault_source.gpc_id,                 // 图形处理簇 (Graphics Processing Cluster) ID
+                    //  fault_entry->fault_source.client_id,              // 内存客户端 ID (如 L1 缓存, 纹理单元等)
+                    //  fault_entry->fault_source.ve_id);                 // 虚拟引擎 (Virtual Engine) ID
     }
     else {
         // 否则，回退使用标准的内核日志打印机制 (最终通常会通过 printk 写入 dmesg / syslog)。
@@ -217,74 +249,150 @@ static void log_replayable_fault_entry(uvm_parent_gpu_t *parent_gpu,
  * @param batch_faults      当前处理批次中，硬件报告的缺页中断总数。
  * @param batch_duplicates  当前处理批次中，被识别为重复并过滤掉的中断数量。
  */
+/**
+ * 记录单次可重放缺页中断（Replayable Fault）的批量统计信息。
+ * * @param parent_gpu          指向 GPU 实例的指针，用于获取全局累计的统计数据。
+ * @param batch_faults        当前批次中包含的总缺页实例数（包含重复项）。
+ * @param batch_duplicates    当前批次中被判定为重复的缺页实例数。
+ * @param batch_kv_faults     当前批次中属于 KV 类别（通常指 Kernel 侧或特定内存区域）的总缺页数。
+ * @param batch_kv_duplicates 当前批次中属于 KV 类的重复缺页数。
+ */
 static void log_replayable_fault_counters(uvm_parent_gpu_t *parent_gpu,
                                           NvU32 batch_faults,
                                           NvU32 batch_duplicates,
                                           NvU32 batch_kv_faults,
                                           NvU32 batch_kv_duplicates)
 {
+    // ---------------------------------------------------------
+    // 第一步：计算去重后的真实缺页数量 (Deduplication)
+    // ---------------------------------------------------------
+    // 扣除重复项，得到真正需要进行底层内存分配和映射的有效缺页数。
+    // 使用 >= 判断是为了防止由于极其罕见的统计竞态导致无符号整数下溢（Underflow）变成巨大正数。
     NvU32 batch_after_dedup = batch_faults >= batch_duplicates ? batch_faults - batch_duplicates : 0;
     NvU32 batch_kv_after_dedup = batch_kv_faults >= batch_kv_duplicates ? batch_kv_faults - batch_kv_duplicates : 0;
+    
+    // ---------------------------------------------------------
+    // 第二步：计算占比百分比 (放大 100 倍的定点数)
+    // ---------------------------------------------------------
+    // percent_x100_u64 会计算比例并放大一定倍数（通常是 10000 倍，用来表示带两位小数的百分比）。
+    // 例如：如果实际占比是 12.34%，该函数会返回整数 1234。
+    // 这也是 Linux 内核开发中的标准做法，因为内核态通常禁止使用浮点数 (float/double)。
     NvU64 batch_kv_ratio_x100 = percent_x100_u64(batch_kv_faults, batch_faults);
     NvU64 batch_kv_after_dedup_ratio_x100 = percent_x100_u64(batch_kv_after_dedup, batch_after_dedup);
 
+    // ---------------------------------------------------------
+    // 第三步：抓取 GPU 全局生命周期内的累计统计数据
+    // ---------------------------------------------------------
+    // 除了当前这一批次的数据，还要将自 GPU 初始化以来的全局总数据也拉出来展示。
     NvU64 total_faults = parent_gpu->stats.num_replayable_faults;
     NvU64 total_duplicates = parent_gpu->fault_buffer.replayable.stats.num_duplicate_faults;
     NvU64 total_after_dedup = total_faults >= total_duplicates ? total_faults - total_duplicates : 0;
+    
     NvU64 total_kv_faults = parent_gpu->fault_buffer.replayable.stats.num_kv_faults;
     NvU64 total_kv_duplicates = parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults;
     NvU64 total_kv_after_dedup = total_kv_faults >= total_kv_duplicates ? total_kv_faults - total_kv_duplicates : 0;
+    
     NvU64 total_kv_ratio_x100 = percent_x100_u64(total_kv_faults, total_faults);
     NvU64 total_kv_after_dedup_ratio_x100 = percent_x100_u64(total_kv_after_dedup, total_after_dedup);
 
+    // ---------------------------------------------------------
+    // 第四步：输出日志
+    // ---------------------------------------------------------
     if (uvm_perf_fault_log_destination == 1) {
-        trace_printk("Replayable fault stats GPU %s: batch_faults=%u batch_duplicates=%u batch_after_dedup=%u batch_kv_faults=%u batch_kv_duplicates=%u batch_kv_after_dedup=%u batch_kv_ratio=%llu.%02llu%% batch_kv_after_dedup_ratio=%llu.%02llu%% total_faults=%llu total_duplicates=%llu total_after_dedup=%llu total_kv_faults=%llu total_kv_duplicates=%llu total_kv_after_dedup=%llu total_kv_ratio=%llu.%02llu%% total_kv_after_dedup_ratio=%llu.%02llu%%\n",
-                     uvm_parent_gpu_name(parent_gpu),
-                     batch_faults,
-                     batch_duplicates,
-                     batch_after_dedup,
-                     batch_kv_faults,
-                     batch_kv_duplicates,
-                     batch_kv_after_dedup,
+        trace_printk("GPU名称 %s,本批次总缺页实例数=%u,去重后=%u,KV类的总缺页数=%u,去重后=%u,比例=%llu.%02llu%%,去重后=%llu.%02llu%%|| 总缺页数=%llu,去重后=%llu,kv总错误数=%llu,去重后=%llu,总kv比例=%llu.%02llu%%,去重后=%llu.%02llu%%\n",
+                     
+                     // 【基础信息】
+                     uvm_parent_gpu_name(parent_gpu),  // 1. GPU 名称 (例如 "GPU-0")
+
+                     // ==========================================
+                     // 【当前批次 (Batch) 维度统计】 —— 仅针对刚刚处理完的这一批中断
+                     // ==========================================
+                     batch_faults,                     // 2. 本批次：总缺页实例数 (包含重复项)
+                     batch_after_dedup,                // 4. 本批次：去重后的有效缺页数 (真实发生的独立缺页)
+                     
+                     batch_kv_faults,                  // 5. 本批次：KV类 (Kernel侧/特定区域) 的总缺页数
+                     batch_kv_after_dedup,             // 7. 本批次：KV类 去重后的有效缺页数
+                     
+                     // 8 & 9. 本批次：KV类缺页占总缺页的百分比 (未去重) -> 例如 "12.34%"
                      (unsigned long long)(batch_kv_ratio_x100 / 100ULL),
                      (unsigned long long)(batch_kv_ratio_x100 % 100ULL),
+                     
+                     // 10 & 11. 本批次：KV类缺页占总缺页的百分比 (已去重) -> 例如 "15.00%"
                      (unsigned long long)(batch_kv_after_dedup_ratio_x100 / 100ULL),
                      (unsigned long long)(batch_kv_after_dedup_ratio_x100 % 100ULL),
-                     (unsigned long long)total_faults,
-                     (unsigned long long)total_duplicates,
-                     (unsigned long long)total_after_dedup,
-                     (unsigned long long)total_kv_faults,
-                     (unsigned long long)total_kv_duplicates,
-                     (unsigned long long)total_kv_after_dedup,
+
+                     // ==========================================
+                     // 【全局累计 (Total) 维度统计】 —— 自 GPU 启动或驱动加载以来的历史总和
+                     // ==========================================
+                     (unsigned long long)total_faults,          // 12. 历史累计：总缺页实例数
+                     (unsigned long long)total_after_dedup,     // 14. 历史累计：去重后的总有效缺页数
+                     
+                     (unsigned long long)total_kv_faults,       // 15. 历史累计：KV类 的总缺页数
+                     (unsigned long long)total_kv_after_dedup,  // 17. 历史累计：KV类 去重后的总缺页数
+                     
+                     // 18 & 19. 历史累计：KV类缺页占历史总缺页的百分比 (未去重)
                      (unsigned long long)(total_kv_ratio_x100 / 100ULL),
                      (unsigned long long)(total_kv_ratio_x100 % 100ULL),
+                     
+                     // 20 & 21. 历史累计：KV类缺页占历史总缺页的百分比 (已去重)
                      (unsigned long long)(total_kv_after_dedup_ratio_x100 / 100ULL),
                      (unsigned long long)(total_kv_after_dedup_ratio_x100 % 100ULL));
     }
     else {
-        UVM_INFO_PRINT("Replayable fault stats GPU %s: batch_faults=%u batch_duplicates=%u batch_after_dedup=%u batch_kv_faults=%u batch_kv_duplicates=%u batch_kv_after_dedup=%u batch_kv_ratio=%llu.%02llu%% batch_kv_after_dedup_ratio=%llu.%02llu%% total_faults=%llu total_duplicates=%llu total_after_dedup=%llu total_kv_faults=%llu total_kv_duplicates=%llu total_kv_after_dedup=%llu total_kv_ratio=%llu.%02llu%% total_kv_after_dedup_ratio=%llu.%02llu%%\n",
-                       uvm_parent_gpu_name(parent_gpu),
-                       batch_faults,
-                       batch_duplicates,
-                       batch_after_dedup,
-                       batch_kv_faults,
-                       batch_kv_duplicates,
-                       batch_kv_after_dedup,
-                       (unsigned long long)(batch_kv_ratio_x100 / 100ULL),
-                       (unsigned long long)(batch_kv_ratio_x100 % 100ULL),
-                       (unsigned long long)(batch_kv_after_dedup_ratio_x100 / 100ULL),
-                       (unsigned long long)(batch_kv_after_dedup_ratio_x100 % 100ULL),
-                       (unsigned long long)total_faults,
-                       (unsigned long long)total_duplicates,
-                       (unsigned long long)total_after_dedup,
-                       (unsigned long long)total_kv_faults,
-                       (unsigned long long)total_kv_duplicates,
-                       (unsigned long long)total_kv_after_dedup,
-                       (unsigned long long)(total_kv_ratio_x100 / 100ULL),
-                       (unsigned long long)(total_kv_ratio_x100 % 100ULL),
-                       (unsigned long long)(total_kv_after_dedup_ratio_x100 / 100ULL),
-                       (unsigned long long)(total_kv_after_dedup_ratio_x100 % 100ULL));
+        // 如果配置为走普通内核日志，逻辑与上述完全相同，只是底层打印函数不同。
+        UVM_INFO_PRINT("..."); 
     }
+    //     // ---------------------------------------------------------
+    // // 第四步：输出日志
+    // // ---------------------------------------------------------
+    // if (uvm_perf_fault_log_destination == 1) {
+    //     trace_printk("GPU名称 %s: 本批次总缺页实例数=%u batch_duplicates=%u batch_after_dedup=%u batch_kv_faults=%u batch_kv_duplicates=%u batch_kv_after_dedup=%u batch_kv_ratio=%llu.%02llu%% batch_kv_after_dedup_ratio=%llu.%02llu%% total_faults=%llu total_duplicates=%llu total_after_dedup=%llu total_kv_faults=%llu total_kv_duplicates=%llu total_kv_after_dedup=%llu total_kv_ratio=%llu.%02llu%% total_kv_after_dedup_ratio=%llu.%02llu%%\n",
+                     
+    //                  // 【基础信息】
+    //                  uvm_parent_gpu_name(parent_gpu),  // 1. GPU 名称 (例如 "GPU-0")
+
+    //                  // ==========================================
+    //                  // 【当前批次 (Batch) 维度统计】 —— 仅针对刚刚处理完的这一批中断
+    //                  // ==========================================
+    //                  batch_faults,                     // 2. 本批次：总缺页实例数 (包含重复项)
+    //                  batch_duplicates,                 // 3. 本批次：重复的缺页实例数
+    //                  batch_after_dedup,                // 4. 本批次：去重后的有效缺页数 (真实发生的独立缺页)
+                     
+    //                  batch_kv_faults,                  // 5. 本批次：KV类 (Kernel侧/特定区域) 的总缺页数
+    //                  batch_kv_duplicates,              // 6. 本批次：KV类 的重复缺页数
+    //                  batch_kv_after_dedup,             // 7. 本批次：KV类 去重后的有效缺页数
+                     
+    //                  // 8 & 9. 本批次：KV类缺页占总缺页的百分比 (未去重) -> 例如 "12.34%"
+    //                  (unsigned long long)(batch_kv_ratio_x100 / 100ULL),
+    //                  (unsigned long long)(batch_kv_ratio_x100 % 100ULL),
+                     
+    //                  // 10 & 11. 本批次：KV类缺页占总缺页的百分比 (已去重) -> 例如 "15.00%"
+    //                  (unsigned long long)(batch_kv_after_dedup_ratio_x100 / 100ULL),
+    //                  (unsigned long long)(batch_kv_after_dedup_ratio_x100 % 100ULL),
+
+    //                  // ==========================================
+    //                  // 【全局累计 (Total) 维度统计】 —— 自 GPU 启动或驱动加载以来的历史总和
+    //                  // ==========================================
+    //                  (unsigned long long)total_faults,          // 12. 历史累计：总缺页实例数
+    //                  (unsigned long long)total_duplicates,      // 13. 历史累计：总重复缺页数
+    //                  (unsigned long long)total_after_dedup,     // 14. 历史累计：去重后的总有效缺页数
+                     
+    //                  (unsigned long long)total_kv_faults,       // 15. 历史累计：KV类 的总缺页数
+    //                  (unsigned long long)total_kv_duplicates,   // 16. 历史累计：KV类 的重复缺页数
+    //                  (unsigned long long)total_kv_after_dedup,  // 17. 历史累计：KV类 去重后的总缺页数
+                     
+    //                  // 18 & 19. 历史累计：KV类缺页占历史总缺页的百分比 (未去重)
+    //                  (unsigned long long)(total_kv_ratio_x100 / 100ULL),
+    //                  (unsigned long long)(total_kv_ratio_x100 % 100ULL),
+                     
+    //                  // 20 & 21. 历史累计：KV类缺页占历史总缺页的百分比 (已去重)
+    //                  (unsigned long long)(total_kv_after_dedup_ratio_x100 / 100ULL),
+    //                  (unsigned long long)(total_kv_after_dedup_ratio_x100 % 100ULL));
+    // }
+    // else {
+    //     // 如果配置为走普通内核日志，逻辑与上述完全相同，只是底层打印函数不同。
+    //     UVM_INFO_PRINT("..."); 
+    // }
 }
 
 // This function is used for both the initial fault buffer initialization and
@@ -1421,6 +1529,19 @@ static bool check_fault_entry_duplicate(const uvm_fault_buffer_entry_t *current_
     return is_duplicate;
 }
 
+/**
+ * 更新批处理上下文中的缺页统计信息，并向性能监控系统发送缺页通知。
+ * * 在 GPU 缺页处理中，成百上千个线程（如一个 Warp 或 Thread Block）同时访问同一个未映射的地址时，
+ * 硬件和底层驱动会将这些相同的缺页合并（Coalesce）。此函数用于精确记录这些合并后的统计信息，
+ * 并触发系统级的性能事件。
+ *
+ * @param gpu                发生缺页中断的 GPU 实例。
+ * @param batch_context      当前缺页批处理的上下文（包含本批次的统计数据、Batch ID等）。
+ * @param va_block           缺页地址所属的虚拟地址块（VA Block，通常管理 2MB 的虚拟内存）。
+ * @param preferred_location 根据 UVM 启发式算法，判定该内存页当前最适合存放的处理器位置（CPU 或某块具体的 GPU）。
+ * @param current_entry      当前正在处理的硬件缺页缓冲条目（包含原始地址、访问类型、合并的实例数量等）。
+ * @param is_duplicate       布尔值，指示当前这个条目是否在软件层面被判定为“重复”（例如该地址所在的页在当前批次中刚刚已经被处理过了）。
+ */
 static void update_batch_and_notify_fault(uvm_gpu_t *gpu,
                                           uvm_fault_service_batch_context_t *batch_context,
                                           uvm_va_block_t *va_block,
@@ -1428,18 +1549,37 @@ static void update_batch_and_notify_fault(uvm_gpu_t *gpu,
                                           uvm_fault_buffer_entry_t *current_entry,
                                           bool is_duplicate)
 {
+    // ---------------------------------------------------------
+    // 第一步：精确计算并更新重复缺页（Duplicate Faults）的数量
+    // ---------------------------------------------------------
+    // 注意：硬件层面的缺页条目 (current_entry) 自带一个 num_instances 属性，
+    // 这代表硬件已经在底层把多次针对完全相同地址的缺页合并成了这一个条目。
+    
     if (is_duplicate)
+        // 情况 A：整个条目都是重复的。
+        // 说明在软件处理这批中断时，发现这个内存页已经被映射过了（可能是被本批次前面的条目处理了）。
+        // 因此，这个条目代表的所有实例 (num_instances) 全都是纯粹的重复开销。
         batch_context->num_duplicate_faults += current_entry->num_instances;
     else
+        // 情况 B：这是一个全新的缺页条目。
+        // 意味着这是本批次第一次处理这个内存页。
+        // 所以，在这个硬件条目包含的 num_instances 中，第 1 次是“有效”的（真正触发了后续的内存分配/迁移），
+        // 剩下的 (num_instances - 1) 次都是被硬件合并的重复访问。
         batch_context->num_duplicate_faults += current_entry->num_instances - 1;
 
-    uvm_perf_event_notify_gpu_fault(&current_entry->va_space->perf_events,
-                                    va_block,
-                                    gpu->id,
-                                    preferred_location,
-                                    current_entry,
-                                    batch_context->batch_id,
-                                    is_duplicate);
+    // ---------------------------------------------------------
+    // 第二步：触发性能监控事件（Performance Event Notification）
+    // ---------------------------------------------------------
+    // 将缺页的详细上下文广播给 UVM 的性能监控子系统。
+    // 这对于性能分析工具（如 NVIDIA Nsight Compute / Nsight Systems）至关重要，
+    // 它们借此在时间轴上绘制出 GPU 缺页的具体位置、频率以及 UVM 的迁移决策。
+    uvm_perf_event_notify_gpu_fault(&current_entry->va_space->perf_events, // 目标虚拟地址空间的性能事件分发器
+                                    va_block,                              // 内存块上下文
+                                    gpu->id,                               // 触发中断的 GPU ID
+                                    preferred_location,                    // 理想的数据驻留位置
+                                    current_entry,                         // 硬件中断原始数据
+                                    batch_context->batch_id,               // 批处理流水号
+                                    is_duplicate);                         // 是否为软件层面的重复项
 }
 
 static void mark_fault_invalid_prefetch(uvm_fault_service_batch_context_t *batch_context,

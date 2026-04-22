@@ -14,6 +14,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.device_allocator.uvm import uvm_allocation_phase
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -549,16 +550,23 @@ class Worker(WorkerBase):
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+            with uvm_allocation_phase(f"compile_warmup:size={size}"):
+                self.model_runner._dummy_run(
+                    size,
+                    skip_eplb=True,
+                    remove_lora=False,
+                )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        with uvm_allocation_phase("kernel_warmup"):
+            kernel_warmup(self)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            cuda_graph_memory_bytes = self.model_runner.capture_model()
+            with uvm_allocation_phase("capture_model"):
+                cuda_graph_memory_bytes = self.model_runner.capture_model()
 
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(
             self, "peak_activation_memory"
