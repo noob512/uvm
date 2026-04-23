@@ -13,7 +13,12 @@
 4. 如何使用脚本：
    - [analyze_uvm_fault_addresses.py](/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/analyze_uvm_fault_addresses.py)
    - [deep_dive_uvm_faults.py](/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/deep_dive_uvm_faults.py)
+   - [export_allocator_workspace_regions.py](/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/export_allocator_workspace_regions.py)
 5. 如何解读本次真实运行的分析结果。
+6. 如果要继续给热点 `unknown gap` 命名，请参考：
+   - [vllm_uvm_unknown_gap_resolution.md](/home/ubuntu/nvidia-uvm-gpu/docs/vllm_uvm_unknown_gap_resolution.md)
+7. 如果要避免跨运行 `gap#2` 地址漂移，并在同一 vLLM 进程内自动完成 `probe -> discover -> main`，请参考：
+   - [vllm_uvm_same_run_auto_gap_watch.md](/home/ubuntu/nvidia-uvm-gpu/docs/vllm_uvm_same_run_auto_gap_watch.md)
 
 本文档以当前仓库中的 UVM allocator、phase tracing、fault 分类脚本和 allocator correlation 能力为准。
 

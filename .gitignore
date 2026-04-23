@@ -49,6 +49,8 @@ modules.order
 *.prof
 *.profraw
 *.profdata
+*.log
 
 # Large local datasets (do not commit)
 /workloads/vllm/datasets/
+workloads/vllm/results/uvm_kv_bench_single_process.log
