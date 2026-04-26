@@ -45,8 +45,11 @@ UVM_GAP_WATCH_START="${VLLM_UVM_GAP_WATCH_START:-}"
 UVM_GAP_WATCH_END="${VLLM_UVM_GAP_WATCH_END:-}"
 UVM_GAP_WATCH_ALL_CLASSES="${VLLM_UVM_GAP_WATCH_ALL_CLASSES:-1}"
 UVM_GAP_WATCH_MIN_BYTES="${VLLM_UVM_GAP_WATCH_MIN_BYTES:-0}"
+UVM_GAP_WATCH_TARGET_CLASS="${VLLM_UVM_GAP_WATCH_TARGET_CLASS:-any}"
+UVM_GAP_WATCH_POLICY_ACTION="${VLLM_UVM_GAP_WATCH_POLICY_ACTION:-observe}"
 UVM_GAP_WATCH_CONTROL_FILE="${VLLM_UVM_GAP_WATCH_CONTROL_FILE:-}"
 UVM_GAP_WATCH_REFRESH_MS="${VLLM_UVM_GAP_WATCH_REFRESH_MS:-250}"
+GAP_WATCH_METRICS_SUMMARY_JSON=""
 
 AUTO_GAP_WATCH_ENABLE=0
 AUTO_GAP_WATCH_PROBE_PROMPTS=1
@@ -54,6 +57,8 @@ AUTO_GAP_WATCH_TARGET_GAP=2
 AUTO_GAP_WATCH_FALLBACK_TO_HOTTEST=1
 AUTO_GAP_WATCH_SUMMARY_JSON=""
 AUTO_GAP_WATCH_POST_MAIN_SUMMARY_JSON=""
+AUTO_GAP_WATCH_POLICY_ACTION_OVERRIDE=""
+AUTO_GAP_WATCH_TARGET_CLASS_OVERRIDE=""
 
 ENABLE_FAULT_ADDRESS_LOG=0
 KEEP_ON_EXIT=0
@@ -124,10 +129,16 @@ Options:
                              If 1, log all allocations overlapping the watch range; if 0, only unknown_managed (default: 1)
   --uvm-gap-watch-min-bytes <n>
                              Min allocation size for watch-range tracing (default: 0)
+  --uvm-gap-watch-target-class <name>
+                             Optional target class for watch policy: any|runtime_scratch|runtime_workspace|warmup_workspace|weight_persistent|kv_persistent
+  --uvm-gap-watch-policy-action <mode>
+                             Watch policy action: observe|prefetch|advise_prefetch (default: observe)
   --uvm-gap-watch-control-file <path>
                              Optional runtime-updatable control file for same-process gap watch
   --uvm-gap-watch-refresh-ms <n>
                              Control-file polling interval in allocator (default: 250)
+  --gap-watch-metrics-summary-json <path>
+                             Optional post-run JSON summary proving whether gap-watch policy hit and succeeded
   --auto-gap-watch-enable <0|1>
                              Same-process probe -> discover -> main workflow for dynamic gap watch (default: 0)
   --auto-gap-watch-probe-prompts <n>
@@ -140,6 +151,11 @@ Options:
                              Optional summary JSON emitted by the auto gap discovery step
   --auto-gap-watch-post-main-summary-json <path>
                              Optional summary JSON emitted after main phase for gap consistency comparison
+  --auto-gap-watch-policy-action-override <mode>
+                             Override discovered policy action for A/B runs:
+                             observe|prefetch|advise_prefetch
+  --auto-gap-watch-target-class-override <name>
+                             Override discovered target class for A/B runs
   --startup-timeout <sec>    Server/KV wait timeout (default: 600)
   --check-interval <sec>     Poll interval (default: 2)
   --with-address-log         Also enable per-fault address logs
@@ -276,6 +292,8 @@ start_server() {
                 VLLM_UVM_GAP_WATCH_END='$UVM_GAP_WATCH_END' \
                 VLLM_UVM_GAP_WATCH_ALL_CLASSES='$UVM_GAP_WATCH_ALL_CLASSES' \
                 VLLM_UVM_GAP_WATCH_MIN_BYTES='$UVM_GAP_WATCH_MIN_BYTES' \
+                VLLM_UVM_GAP_WATCH_TARGET_CLASS='$UVM_GAP_WATCH_TARGET_CLASS' \
+                VLLM_UVM_GAP_WATCH_POLICY_ACTION='$UVM_GAP_WATCH_POLICY_ACTION' \
                 VLLM_UVM_GAP_WATCH_CONTROL_FILE='$UVM_GAP_WATCH_CONTROL_FILE' \
                 VLLM_UVM_GAP_WATCH_REFRESH_MS='$UVM_GAP_WATCH_REFRESH_MS'"
 
@@ -630,14 +648,19 @@ parse_args() {
       --uvm-gap-watch-end) UVM_GAP_WATCH_END="$2"; shift 2 ;; # 被观察 gap 的结束地址
       --uvm-gap-watch-all-classes) UVM_GAP_WATCH_ALL_CLASSES="$2"; shift 2 ;; # gap watch 是否捕获所有类别
       --uvm-gap-watch-min-bytes) UVM_GAP_WATCH_MIN_BYTES="$2"; shift 2 ;; # gap watch 最小尺寸
+      --uvm-gap-watch-target-class) UVM_GAP_WATCH_TARGET_CLASS="$2"; shift 2 ;; # gap watch 目标类别
+      --uvm-gap-watch-policy-action) UVM_GAP_WATCH_POLICY_ACTION="$2"; shift 2 ;; # gap watch 命中后的策略动作
       --uvm-gap-watch-control-file) UVM_GAP_WATCH_CONTROL_FILE="$2"; shift 2 ;; # allocator 运行时热更新的控制文件
       --uvm-gap-watch-refresh-ms) UVM_GAP_WATCH_REFRESH_MS="$2"; shift 2 ;; # allocator 轮询控制文件的间隔
+      --gap-watch-metrics-summary-json) GAP_WATCH_METRICS_SUMMARY_JSON="$2"; shift 2 ;; # gap watch 命中/动作证明摘要
       --auto-gap-watch-enable) AUTO_GAP_WATCH_ENABLE="$2"; shift 2 ;; # 同进程 probe -> discover -> main 自动流程
       --auto-gap-watch-probe-prompts) AUTO_GAP_WATCH_PROBE_PROMPTS="$2"; shift 2 ;; # 自动流程 probe 阶段的 prompt 数
       --auto-gap-watch-target-gap) AUTO_GAP_WATCH_TARGET_GAP="$2"; shift 2 ;; # 自动流程优先关注的 gap index
       --auto-gap-watch-fallback-to-hottest) AUTO_GAP_WATCH_FALLBACK_TO_HOTTEST="$2"; shift 2 ;; # target gap 不热时是否回退到最热点
       --auto-gap-watch-summary-json) AUTO_GAP_WATCH_SUMMARY_JSON="$2"; shift 2 ;; # 自动流程 discovery 摘要输出
       --auto-gap-watch-post-main-summary-json) AUTO_GAP_WATCH_POST_MAIN_SUMMARY_JSON="$2"; shift 2 ;; # main 阶段结束后的 gap 摘要输出
+      --auto-gap-watch-policy-action-override) AUTO_GAP_WATCH_POLICY_ACTION_OVERRIDE="$2"; shift 2 ;; # 自动流程强制覆盖 gap-watch 动作，用于 observe/prefetch A/B
+      --auto-gap-watch-target-class-override) AUTO_GAP_WATCH_TARGET_CLASS_OVERRIDE="$2"; shift 2 ;; # 自动流程强制覆盖目标类别
       --startup-timeout) STARTUP_TIMEOUT="$2"; shift 2 ;;   # 设置等待服务器启动的超时时间
       --check-interval) CHECK_INTERVAL="$2"; shift 2 ;;     # 设置轮询检查的间隔时间
 
@@ -723,10 +746,14 @@ validate_inputs() {
     [[ "$UVM_GAP_WATCH_ALL_CLASSES" =~ ^[01]$ ]] || die "--uvm-gap-watch-all-classes must be 0 or 1"
     [[ "$UVM_GAP_WATCH_MIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-gap-watch-min-bytes must be a non-negative integer"
     [[ "$UVM_GAP_WATCH_REFRESH_MS" =~ ^[0-9]+$ ]] || die "--uvm-gap-watch-refresh-ms must be a non-negative integer"
+    [[ "$UVM_GAP_WATCH_POLICY_ACTION" =~ ^(observe|prefetch|advise_prefetch|managed_default|managed_prefetch_gpu|managed_advise_prefetch_gpu)$ ]] || die "--uvm-gap-watch-policy-action must be observe, prefetch, advise_prefetch, managed_default, managed_prefetch_gpu, or managed_advise_prefetch_gpu"
     [[ "$AUTO_GAP_WATCH_ENABLE" =~ ^[01]$ ]] || die "--auto-gap-watch-enable must be 0 or 1"
     [[ "$AUTO_GAP_WATCH_PROBE_PROMPTS" =~ ^[0-9]+$ ]] || die "--auto-gap-watch-probe-prompts must be a non-negative integer"
     [[ "$AUTO_GAP_WATCH_TARGET_GAP" =~ ^[0-9]+$ ]] || die "--auto-gap-watch-target-gap must be a non-negative integer"
     [[ "$AUTO_GAP_WATCH_FALLBACK_TO_HOTTEST" =~ ^[01]$ ]] || die "--auto-gap-watch-fallback-to-hottest must be 0 or 1"
+    if [ -n "$AUTO_GAP_WATCH_POLICY_ACTION_OVERRIDE" ]; then
+      [[ "$AUTO_GAP_WATCH_POLICY_ACTION_OVERRIDE" =~ ^(observe|prefetch|advise_prefetch)$ ]] || die "--auto-gap-watch-policy-action-override must be observe, prefetch, or advise_prefetch"
+    fi
     if [ -n "$UVM_GAP_WATCH_START" ]; then
       [[ "$UVM_GAP_WATCH_START" =~ ^0x[0-9a-fA-F]+$ ]] || die "--uvm-gap-watch-start must be a hex address"
     fi
@@ -785,6 +812,8 @@ write_gap_watch_control_file() {
   local end="$4"
   local all_classes="$5"
   local min_bytes="$6"
+  local target_class="$7"
+  local policy_action="$8"
 
   [ -n "$UVM_GAP_WATCH_CONTROL_FILE" ] || return 0
   mkdir -p "$(dirname "$UVM_GAP_WATCH_CONTROL_FILE")"
@@ -795,6 +824,8 @@ write_gap_watch_control_file() {
     echo "end=$end"
     echo "all_classes=$all_classes"
     echo "min_bytes=$min_bytes"
+    echo "target_class=$target_class"
+    echo "policy_action=$policy_action"
   } > "$UVM_GAP_WATCH_CONTROL_FILE"
 }
 
@@ -874,16 +905,27 @@ run_auto_gap_watch_discovery() {
   [ "$AUTO_GAP_WATCH_ENABLE" -eq 1 ] || return 0
   [ -n "$AUTO_GAP_WATCH_SUMMARY_JSON" ] || die "auto gap watch summary path is empty"
 
-  python3 "$SCRIPT_DIR/discover_gap_watch.py" \
-    --address-log "$ADDRESS_LOG" \
-    --fault-log "$RUN_ADDRESS_LOG" \
-    --control-file "$UVM_GAP_WATCH_CONTROL_FILE" \
-    --summary-json "$AUTO_GAP_WATCH_SUMMARY_JSON" \
-    --watch-name "$UVM_GAP_WATCH_NAME" \
-    --all-classes "$UVM_GAP_WATCH_ALL_CLASSES" \
-    --min-bytes "$UVM_GAP_WATCH_MIN_BYTES" \
-    --target-gap "$AUTO_GAP_WATCH_TARGET_GAP" \
+  local discover_cmd=(
+    python3 "$SCRIPT_DIR/discover_gap_watch.py"
+    --address-log "$ADDRESS_LOG"
+    --fault-log "$RUN_ADDRESS_LOG"
+    --allocator-log "$ALLOCATOR_TRACE_LOG"
+    --control-file "$UVM_GAP_WATCH_CONTROL_FILE"
+    --summary-json "$AUTO_GAP_WATCH_SUMMARY_JSON"
+    --watch-name "$UVM_GAP_WATCH_NAME"
+    --all-classes "$UVM_GAP_WATCH_ALL_CLASSES"
+    --min-bytes "$UVM_GAP_WATCH_MIN_BYTES"
+    --target-gap "$AUTO_GAP_WATCH_TARGET_GAP"
     --fallback-to-hottest "$AUTO_GAP_WATCH_FALLBACK_TO_HOTTEST"
+  )
+  if [ -n "$AUTO_GAP_WATCH_POLICY_ACTION_OVERRIDE" ]; then
+    discover_cmd+=(--policy-action-override "$AUTO_GAP_WATCH_POLICY_ACTION_OVERRIDE")
+  fi
+  if [ -n "$AUTO_GAP_WATCH_TARGET_CLASS_OVERRIDE" ]; then
+    discover_cmd+=(--target-class-override "$AUTO_GAP_WATCH_TARGET_CLASS_OVERRIDE")
+  fi
+
+  "${discover_cmd[@]}"
 
   echo "Auto gap-watch summary: $AUTO_GAP_WATCH_SUMMARY_JSON"
   python3 - <<'PY' "$AUTO_GAP_WATCH_SUMMARY_JSON"
@@ -900,6 +942,8 @@ print(
     f"end={selected.get('end_hex')}",
     f"faults={selected.get('faults')}",
     f"fallback_used={data.get('fallback_used')}",
+    f"effective_target_class={data.get('effective_target_class')}",
+    f"effective_policy_action={data.get('effective_policy_action')}",
   )
 PY
 }
@@ -921,6 +965,7 @@ print_post_main_gap_watch_discovery() {
   python3 "$SCRIPT_DIR/discover_gap_watch.py" \
     --address-log "$ADDRESS_LOG" \
     --fault-log "$RUN_ADDRESS_LOG" \
+    --allocator-log "$ALLOCATOR_TRACE_LOG" \
     --summary-json "$AUTO_GAP_WATCH_POST_MAIN_SUMMARY_JSON" \
     --watch-name "$UVM_GAP_WATCH_NAME" \
     --all-classes "$UVM_GAP_WATCH_ALL_CLASSES" \
@@ -1161,7 +1206,9 @@ main() {
       0x0 \
       0x0 \
       "$UVM_GAP_WATCH_ALL_CLASSES" \
-      "$UVM_GAP_WATCH_MIN_BYTES"
+      "$UVM_GAP_WATCH_MIN_BYTES" \
+      "$UVM_GAP_WATCH_TARGET_CLASS" \
+      "$UVM_GAP_WATCH_POLICY_ACTION"
     echo "Auto gap-watch control file initialized: $UVM_GAP_WATCH_CONTROL_FILE"
   fi
 
@@ -1210,6 +1257,12 @@ main() {
   print_delta_stats
   if [ -n "$ALLOCATOR_TRACE_LOG" ]; then
     echo "Allocator trace log: $ALLOCATOR_TRACE_LOG"
+  fi
+  if [ -n "$GAP_WATCH_METRICS_SUMMARY_JSON" ] && [ -n "$ALLOCATOR_TRACE_LOG" ]; then
+    python3 "$SCRIPT_DIR/summarize_gap_watch_metrics.py" \
+      --allocator-log "$ALLOCATOR_TRACE_LOG" \
+      --summary-json "$GAP_WATCH_METRICS_SUMMARY_JSON"
+    echo "Gap-watch metrics summary: $GAP_WATCH_METRICS_SUMMARY_JSON"
   fi
 }
 

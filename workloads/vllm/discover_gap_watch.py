@@ -26,6 +26,23 @@ from deep_dive_uvm_faults import build_concrete_regions, build_gaps
 
 
 ACCESS_TYPE_RE = re.compile(r"(?:access_type|访问类型)=(?P<value>[^,\s]+)")
+TRACE_POLICY_RE = re.compile(
+    r"TRACE_POLICY alloc_id=(?P<alloc_id>\d+) ptr=(?P<ptr>0x[0-9a-fA-F]+) "
+    r"end=(?P<end>0x[0-9a-fA-F]+) size_bytes=(?P<size_bytes>\d+) "
+    r"size_bucket=(?P<size_bucket>[^ ]+) device=(?P<device>-?\d+) "
+    r"phase=(?P<phase>\S+) predicted_class=(?P<predicted_class>[^ ]+) "
+    r"action=(?P<action>[^ ]+) policy_source=(?P<policy_source>[^ ]+) "
+    r"gap_watch_class_match=(?P<gap_watch_class_match>\d+) "
+    r"gap_overlap_bytes=(?P<gap_overlap_bytes>\d+) "
+    r"action_success=(?P<action_success>\d+) action_error=(?P<action_error>[^ ]+)"
+)
+TRACE_FREE_RE = re.compile(
+    r"TRACE_FREE free_id=(?P<free_id>\d+) ptr=(?P<ptr>0x[0-9a-fA-F]+) "
+    r"end=(?P<end>0x[0-9a-fA-F]+) size_bytes=(?P<size_bytes>\d+) "
+    r"size_mb=(?P<size_mb>[0-9.]+) device=(?P<device>-?\d+) "
+    r"phase=(?P<phase>\S+) alloc_id=(?P<alloc_id>\d+) "
+    r"alloc_phase=(?P<alloc_phase>\S+) lifetime_s=(?P<lifetime_s>-?[0-9.]+)"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +73,11 @@ def parse_args() -> argparse.Namespace:
         "--summary-json",
         default=None,
         help="Optional JSON summary file.",
+    )
+    parser.add_argument(
+        "--allocator-log",
+        default=None,
+        help="Optional allocator trace log used to classify the selected gap.",
     )
     parser.add_argument(
         "--target-gap",
@@ -104,6 +126,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Only analyze fault-log lines starting from this 1-based line number.",
+    )
+    parser.add_argument(
+        "--policy-action-override",
+        default=None,
+        choices=("observe", "prefetch", "advise_prefetch"),
+        help="Override the recommended policy action written to the control file.",
+    )
+    parser.add_argument(
+        "--target-class-override",
+        default=None,
+        help="Override the recommended target class written to the control file.",
     )
     return parser.parse_args()
 
@@ -192,6 +225,94 @@ def summarize_unknown_gaps(
     return per_gap, total_unknown_faults
 
 
+def classify_gap_kind_from_allocator(
+    allocator_log: Path,
+    gap_start: int,
+    gap_end: int,
+) -> dict[str, object]:
+    if not allocator_log.is_file():
+        return {
+            "allocator_log_found": False,
+            "dominant_phase": None,
+            "dominant_predicted_class": None,
+            "recommended_target_class": "any",
+            "recommended_policy_action": "prefetch",
+            "overlap_allocations": 0,
+        }
+
+    overlap_allocations = 0
+    phase_counts: Counter[str] = Counter()
+    class_counts: Counter[str] = Counter()
+    overlap_bytes_by_class: Counter[str] = Counter()
+    lifetime_by_alloc_id: dict[int, float] = {}
+    overlap_alloc_ids: set[int] = set()
+
+    with allocator_log.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            policy_match = TRACE_POLICY_RE.search(line)
+            if policy_match is not None:
+                start = int(policy_match.group("ptr"), 16)
+                end = int(policy_match.group("end"), 16)
+                overlap_start = max(gap_start, start)
+                overlap_end = min(gap_end, end)
+                if overlap_start > overlap_end:
+                    continue
+                overlap_bytes = overlap_end - overlap_start + 1
+                alloc_id = int(policy_match.group("alloc_id"))
+                predicted_class = policy_match.group("predicted_class")
+                phase = policy_match.group("phase")
+                overlap_allocations += 1
+                overlap_alloc_ids.add(alloc_id)
+                phase_counts[phase] += 1
+                class_counts[predicted_class] += 1
+                overlap_bytes_by_class[predicted_class] += overlap_bytes
+                continue
+
+            free_match = TRACE_FREE_RE.search(line)
+            if free_match is not None:
+                alloc_id = int(free_match.group("alloc_id"))
+                if alloc_id in overlap_alloc_ids:
+                    lifetime_s = float(free_match.group("lifetime_s"))
+                    if lifetime_s >= 0:
+                        lifetime_by_alloc_id[alloc_id] = lifetime_s
+
+    dominant_phase = phase_counts.most_common(1)[0][0] if phase_counts else None
+    dominant_predicted_class = (
+        overlap_bytes_by_class.most_common(1)[0][0]
+        if overlap_bytes_by_class
+        else (class_counts.most_common(1)[0][0] if class_counts else None)
+    )
+    recommended_target_class = dominant_predicted_class or "any"
+    recommended_policy_action = "prefetch"
+
+    median_lifetime_s = None
+    if lifetime_by_alloc_id:
+        ordered = sorted(lifetime_by_alloc_id.values())
+        median_lifetime_s = ordered[len(ordered) // 2]
+
+    if dominant_predicted_class in {"runtime_scratch", "runtime_workspace"}:
+        recommended_policy_action = (
+            "advise_prefetch"
+            if median_lifetime_s is not None and median_lifetime_s < 0.01
+            else "prefetch"
+        )
+    elif dominant_predicted_class == "warmup_workspace":
+        recommended_policy_action = "advise_prefetch"
+
+    return {
+        "allocator_log_found": True,
+        "dominant_phase": dominant_phase,
+        "dominant_predicted_class": dominant_predicted_class,
+        "recommended_target_class": recommended_target_class,
+        "recommended_policy_action": recommended_policy_action,
+        "overlap_allocations": overlap_allocations,
+        "phase_counts": dict(phase_counts),
+        "predicted_class_counts": dict(class_counts),
+        "predicted_class_overlap_bytes": dict(overlap_bytes_by_class),
+        "median_lifetime_s": median_lifetime_s,
+    }
+
+
 def write_control_file(
     path: Path,
     enabled: bool,
@@ -200,6 +321,8 @@ def write_control_file(
     end_hex: str,
     all_classes: int,
     min_bytes: int,
+    target_class: str,
+    policy_action: str,
 ) -> None:
     with path.open("w", encoding="utf-8") as handle:
         handle.write(f"enabled={1 if enabled else 0}\n")
@@ -208,6 +331,8 @@ def write_control_file(
         handle.write(f"end={end_hex}\n")
         handle.write(f"all_classes={all_classes}\n")
         handle.write(f"min_bytes={min_bytes}\n")
+        handle.write(f"target_class={target_class}\n")
+        handle.write(f"policy_action={policy_action}\n")
 
 
 def main() -> int:
@@ -215,6 +340,7 @@ def main() -> int:
     address_log = Path(args.address_log)
     fault_log = Path(args.fault_log)
     control_file = Path(args.control_file) if args.control_file else None
+    allocator_log = Path(args.allocator_log) if args.allocator_log else None
 
     if not address_log.is_file():
         raise SystemExit(f"address log not found: {address_log}")
@@ -254,6 +380,44 @@ def main() -> int:
                 f"target gap #{args.target_gap} has no unknown faults and fallback is disabled"
             )
 
+    selected_gap = dict(selected_gap)
+    selected_gap["fault_share_of_unknown"] = (
+        selected_gap["faults"] / total_unknown_faults if total_unknown_faults > 0 else 0.0
+    )
+    allocator_gap_kind = (
+        classify_gap_kind_from_allocator(
+            allocator_log,
+            int(selected_gap["start_hex"], 16),
+            int(selected_gap["end_hex"], 16),
+        )
+        if allocator_log is not None
+        else {
+            "allocator_log_found": False,
+            "dominant_phase": None,
+            "dominant_predicted_class": None,
+            "recommended_target_class": "any",
+            "recommended_policy_action": "prefetch",
+            "overlap_allocations": 0,
+        }
+    )
+
+    recommended_target_class = str(
+        allocator_gap_kind.get("recommended_target_class", "any")
+    )
+    recommended_policy_action = str(
+        allocator_gap_kind.get("recommended_policy_action", "prefetch")
+    )
+    effective_target_class = (
+        args.target_class_override
+        if args.target_class_override is not None
+        else recommended_target_class
+    )
+    effective_policy_action = (
+        args.policy_action_override
+        if args.policy_action_override is not None
+        else recommended_policy_action
+    )
+
     assert selected_gap is not None
     if not args.no_write_control:
         if control_file is None:
@@ -266,16 +430,14 @@ def main() -> int:
             selected_gap["end_hex"],
             args.all_classes,
             args.min_bytes,
+            effective_target_class,
+            effective_policy_action,
         )
-
-    selected_gap = dict(selected_gap)
-    selected_gap["fault_share_of_unknown"] = (
-        selected_gap["faults"] / total_unknown_faults if total_unknown_faults > 0 else 0.0
-    )
 
     summary = {
         "address_log": str(address_log),
         "fault_log": str(fault_log),
+        "allocator_log": str(allocator_log) if allocator_log is not None else None,
         "control_file": str(control_file) if control_file is not None else None,
         "control_written": not args.no_write_control,
         "selected_pid": selected_pid,
@@ -284,6 +446,11 @@ def main() -> int:
         "fallback_used": fallback_used,
         "total_unknown_faults": total_unknown_faults,
         "selected_gap": selected_gap,
+        "selected_gap_allocator_classification": allocator_gap_kind,
+        "effective_target_class": effective_target_class,
+        "effective_policy_action": effective_policy_action,
+        "target_class_overridden": args.target_class_override is not None,
+        "policy_action_overridden": args.policy_action_override is not None,
         "top_gaps_by_faults": sorted(
             (
                 {
@@ -316,6 +483,12 @@ def main() -> int:
     print(f"- faults={selected_gap['faults']}")
     print(f"- unique_pages={selected_gap['unique_pages']}")
     print(f"- fault_share_of_unknown={selected_gap['fault_share_of_unknown']:.4f}")
+    print(f"- dominant_predicted_class={allocator_gap_kind.get('dominant_predicted_class')}")
+    print(f"- dominant_phase={allocator_gap_kind.get('dominant_phase')}")
+    print(f"- recommended_target_class={recommended_target_class}")
+    print(f"- recommended_policy_action={recommended_policy_action}")
+    print(f"- effective_target_class={effective_target_class}")
+    print(f"- effective_policy_action={effective_policy_action}")
     print(f"- control_file={control_file if control_file is not None else 'none'}")
     print(f"- control_written={0 if args.no_write_control else 1}")
     return 0

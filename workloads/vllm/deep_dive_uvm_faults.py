@@ -46,7 +46,10 @@ TRACE_POLICY_RE = re.compile(
     r"end=(?P<end>0x[0-9a-fA-F]+) size_bytes=(?P<size_bytes>\d+) "
     r"size_bucket=(?P<size_bucket>[^ ]+) device=(?P<device>-?\d+) "
     r"phase=(?P<phase>\S+) predicted_class=(?P<predicted_class>[^ ]+) "
-    r"action=(?P<action>[^ ]+) action_success=(?P<action_success>\d+) "
+    r"action=(?P<action>[^ ]+) (?:policy_source=(?P<policy_source>[^ ]+) "
+    r"gap_watch_class_match=(?P<gap_watch_class_match>\d+) "
+    r"gap_overlap_bytes=(?P<gap_overlap_bytes>\d+) )?"
+    r"action_success=(?P<action_success>\d+) "
     r"action_error=(?P<action_error>[^ ]+)"
 )
 TRACE_PREFIX_RE = re.compile(

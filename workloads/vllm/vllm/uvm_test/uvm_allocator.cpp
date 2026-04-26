@@ -20,6 +20,7 @@
 #include <mutex>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <sys/stat.h>
 #include <string>
 #include <unordered_map>
@@ -49,6 +50,8 @@ static uintptr_t gap_watch_end = 0;
 static std::string gap_watch_name = "unnamed_gap";
 static int gap_watch_all_classes = 1;
 static size_t gap_watch_min_bytes = 0;
+static std::string gap_watch_target_class = "any";
+static std::string gap_watch_policy_action = "observe";
 static std::string gap_watch_control_file = "";
 static size_t gap_watch_refresh_ms = 250;
 static bool gap_watch_control_seen = false;
@@ -64,6 +67,15 @@ static std::chrono::steady_clock::time_point start_time;
 static bool log_initialized = false;
 static std::string current_phase = "unscoped";
 
+// Gap-watch policy metrics
+static std::atomic<size_t> gap_watch_overlap_allocs{0};
+static std::atomic<size_t> gap_watch_overlap_bytes_total{0};
+static std::atomic<size_t> gap_watch_target_class_match_allocs{0};
+static std::atomic<size_t> gap_watch_policy_applied_allocs{0};
+static std::atomic<size_t> gap_watch_policy_applied_overlap_bytes{0};
+static std::atomic<size_t> gap_watch_policy_success_allocs{0};
+static std::atomic<size_t> gap_watch_policy_failed_allocs{0};
+
 struct AllocationInfo {
     size_t size;
     int device;
@@ -72,12 +84,17 @@ struct AllocationInfo {
     double alloc_elapsed_seconds;
     std::string alloc_class_name;
     std::string policy_action_name;
+    std::string policy_source_name;
+    bool policy_action_success;
+    std::string policy_action_error;
     std::string size_bucket;
     bool unknown_detail_logged;
     bool gap_watch_logged;
     uintptr_t gap_overlap_start;
     uintptr_t gap_overlap_end;
     size_t gap_overlap_bytes;
+    std::string gap_watch_target_class_name;
+    std::string gap_watch_policy_action_name;
 };
 
 static std::unordered_map<void*, AllocationInfo> active_allocations;
@@ -130,6 +147,7 @@ enum class AllocationClass {
 enum class PolicyAction {
     ManagedDefault,//默认动作
     ManagedPrefetchGpu,//为阶段 1 预留,阶段 0 默认不会触发
+    ManagedAdvisePrefetchGpu,//gap watch 的更激进版本：advise + prefetch
 };
 
 /**
@@ -221,6 +239,18 @@ static std::string read_string_from_env(const char* name,
     return raw;
 }
 
+static std::string lower_copy(std::string value) {
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
+static bool string_equals_ignore_case(const std::string& left,
+                                      const std::string& right) {
+    return lower_copy(left) == lower_copy(right);
+}
+
 static bool phase_contains(const std::string& phase, const char* needle) {
     return phase.find(needle) != std::string::npos;
 }
@@ -258,6 +288,39 @@ static bool parse_bool_string(const std::string& value, bool* out) {
         return true;
     }
     return false;
+}
+
+static bool parse_policy_action_string(const std::string& value,
+                                       PolicyAction* out) {
+    if (!out) {
+        return false;
+    }
+    std::string lowered = lower_copy(value);
+    if (lowered == "observe" || lowered == "managed_default") {
+        *out = PolicyAction::ManagedDefault;
+        return true;
+    }
+    if (lowered == "prefetch" || lowered == "managed_prefetch_gpu") {
+        *out = PolicyAction::ManagedPrefetchGpu;
+        return true;
+    }
+    if (lowered == "advise_prefetch" ||
+        lowered == "managed_advise_prefetch_gpu") {
+        *out = PolicyAction::ManagedAdvisePrefetchGpu;
+        return true;
+    }
+    return false;
+}
+
+static bool gap_watch_target_class_matches(const char* alloc_class_name) {
+    if (!alloc_class_name || alloc_class_name[0] == '\0') {
+        return false;
+    }
+    if (gap_watch_target_class.empty() ||
+        string_equals_ignore_case(gap_watch_target_class, "any")) {
+        return true;
+    }
+    return string_equals_ignore_case(gap_watch_target_class, alloc_class_name);
 }
 
 static bool parse_size_string(const std::string& value, size_t* out) {
@@ -310,6 +373,8 @@ static const char* allocation_class_to_string(AllocationClass alloc_class) {
 
 static const char* policy_action_to_string(PolicyAction action) {
     switch (action) {
+        case PolicyAction::ManagedAdvisePrefetchGpu:
+            return "managed_advise_prefetch_gpu";
         case PolicyAction::ManagedPrefetchGpu:
             return "managed_prefetch_gpu";
         case PolicyAction::ManagedDefault:
@@ -343,6 +408,8 @@ struct GapWatchConfigSnapshot {
     std::string name;
     bool all_classes;
     size_t min_bytes;
+    std::string target_class;
+    std::string policy_action_name;
 };
 
 static GapWatchConfigSnapshot current_gap_watch_config_snapshot() {
@@ -353,6 +420,8 @@ static GapWatchConfigSnapshot current_gap_watch_config_snapshot() {
         gap_watch_name,
         gap_watch_all_classes != 0,
         gap_watch_min_bytes,
+        gap_watch_target_class,
+        gap_watch_policy_action,
     };
 }
 
@@ -363,7 +432,9 @@ static bool gap_watch_configs_equal(const GapWatchConfigSnapshot& left,
            left.end == right.end &&
            left.name == right.name &&
            left.all_classes == right.all_classes &&
-           left.min_bytes == right.min_bytes;
+           left.min_bytes == right.min_bytes &&
+           left.target_class == right.target_class &&
+           left.policy_action_name == right.policy_action_name;
 }
 
 static void trace_gap_watch_config_event_locked(const char* source,
@@ -388,7 +459,7 @@ static void trace_gap_watch_config_event_locked(const char* source,
         log_file,
         "[%s] [+%.3fs] TRACE_GAP_WATCH_CONFIG source=%s event=%s "
         "enabled=%d name=%s start=0x%llx end=0x%llx all_classes=%d "
-        "min_bytes=%zu reason=%s\n",
+        "min_bytes=%zu target_class=%s policy_action=%s reason=%s\n",
         timestamp,
         elapsed,
         safe_source,
@@ -399,6 +470,8 @@ static void trace_gap_watch_config_event_locked(const char* source,
         static_cast<unsigned long long>(config.end),
         config.all_classes ? 1 : 0,
         config.min_bytes,
+        config.target_class.c_str(),
+        config.policy_action_name.c_str(),
         safe_reason
     );
     fflush(log_file);
@@ -418,6 +491,10 @@ static void apply_gap_watch_config_locked(const GapWatchConfigSnapshot& config,
     gap_watch_name = config.name.empty() ? "unnamed_gap" : config.name;
     gap_watch_all_classes = config.all_classes ? 1 : 0;
     gap_watch_min_bytes = config.min_bytes;
+    gap_watch_target_class =
+        config.target_class.empty() ? "any" : config.target_class;
+    gap_watch_policy_action =
+        config.policy_action_name.empty() ? "observe" : config.policy_action_name;
 
     GapWatchConfigSnapshot updated = current_gap_watch_config_snapshot();
     trace_gap_watch_config_event_locked(source, "applied", updated, reason);
@@ -518,12 +595,16 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
     bool parsed_start = false;
     bool parsed_end = false;
     bool parsed_min_bytes = false;
+    bool parsed_target_class = false;
+    bool parsed_policy_action = false;
     bool enabled_value = false;
     bool all_classes_value = gap_watch_all_classes != 0;
     uintptr_t start_value = 0;
     uintptr_t end_value = 0;
     size_t min_bytes_value = gap_watch_min_bytes;
     std::string name_value = gap_watch_name;
+    std::string target_class_value = gap_watch_target_class;
+    std::string policy_action_value = gap_watch_policy_action;
     char buffer[1024];
 
     while (fgets(buffer, sizeof(buffer), control) != nullptr) {
@@ -553,6 +634,15 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
             parsed_end = parse_hex_string(value, &end_value);
         } else if (key == "min_bytes") {
             parsed_min_bytes = parse_size_string(value, &min_bytes_value);
+        } else if (key == "target_class") {
+            target_class_value = value;
+            parsed_target_class = true;
+        } else if (key == "policy_action") {
+            PolicyAction action{};
+            parsed_policy_action = parse_policy_action_string(value, &action);
+            if (parsed_policy_action) {
+                policy_action_value = policy_action_to_string(action);
+            }
         }
     }
     fclose(control);
@@ -570,6 +660,10 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
     next.all_classes = parsed_all_classes ? all_classes_value :
         (gap_watch_all_classes != 0);
     next.min_bytes = parsed_min_bytes ? min_bytes_value : gap_watch_min_bytes;
+    next.target_class = parsed_target_class ? target_class_value :
+        gap_watch_target_class;
+    next.policy_action_name = parsed_policy_action ? policy_action_value :
+        gap_watch_policy_action;
 
     if (!enabled_value) {
         next.enabled = false;
@@ -693,6 +787,47 @@ static PolicyAction choose_policy_action(AllocationClass alloc_class,
     return PolicyAction::ManagedDefault;
 }
 
+static PolicyAction choose_gap_watch_policy_action(AllocationClass alloc_class,
+                                                   size_t size,
+                                                   int device,
+                                                   size_t gap_overlap_bytes,
+                                                   bool* class_match_out,
+                                                   const char** source_out) {
+    if (class_match_out) {
+        *class_match_out = false;
+    }
+    if (source_out) {
+        *source_out = "base_policy";
+    }
+
+    if (!policy_enabled || device < 0 || gap_overlap_bytes == 0 || !gap_watch_enabled) {
+        return PolicyAction::ManagedDefault;
+    }
+
+    const char* alloc_class_name = allocation_class_to_string(alloc_class);
+    bool class_match = gap_watch_target_class_matches(alloc_class_name);
+    if (class_match_out) {
+        *class_match_out = class_match;
+    }
+    if (!class_match) {
+        return PolicyAction::ManagedDefault;
+    }
+
+    if (size < gap_watch_min_bytes) {
+        return PolicyAction::ManagedDefault;
+    }
+
+    PolicyAction action = PolicyAction::ManagedDefault;
+    if (!parse_policy_action_string(gap_watch_policy_action, &action)) {
+        return PolicyAction::ManagedDefault;
+    }
+
+    if (source_out) {
+        *source_out = "gap_watch_policy";
+    }
+    return action;
+}
+
 /**
  * Initialize log file (called once on first allocation)
  */
@@ -706,135 +841,152 @@ static void init_log_file() {
     // 这是为了避免在高性能路径中每次分配都要竞争锁。
     if (log_initialized) return;
 
-    // 2. 双重检查锁定模式 (Double-Checked Locking)
-    // 加锁防止多个 CPU 线程同时执行初始化逻辑。
-    std::lock_guard<std::mutex> lock(log_mutex);
-    
-    // 获取锁后再次检查，确保在等待锁期间没有其他线程完成初始化。
-    if (log_initialized) return;
+    {
+        // 2. 双重检查锁定模式 (Double-Checked Locking)
+        // 加锁防止多个 CPU 线程同时执行初始化逻辑。
+        std::lock_guard<std::mutex> lock(log_mutex);
 
-    // 3. 时间基准建立
-    // 记录程序启动/首次分配的时间点，后续日志中的 [+1.234s] 相对时间戳都以此为原点。
-    start_time = std::chrono::steady_clock::now();
+        // 获取锁后再次检查，确保在等待锁期间没有其他线程完成初始化。
+        if (log_initialized) return;
 
-    // 4. 从环境变量读取策略配置 (Control Panel)
-    // 这种设计允许研究员在不重新编译 C++ 代码的情况下，通过 Shell 直接调整 UVM 行为。
-    trace_min_bytes = read_trace_min_bytes_from_env();
-    
-    // 默认开启策略层
-    policy_enabled = read_bool_from_env("VLLM_UVM_POLICY_ENABLE", true) ? 1 : 0;
-    
-    // 读取策略模式（trace_only 代表演习模式，prefetch 代表实战模式）
-    policy_mode = read_string_from_env("VLLM_UVM_POLICY_MODE", "trace_only");
+        // 3. 时间基准建立
+        // 记录程序启动/首次分配的时间点，后续日志中的 [+1.234s] 相对时间戳都以此为原点。
+        start_time = std::chrono::steady_clock::now();
 
-    // 级联逻辑：如果模式被设为 prefetch 或 warmup_prefetch，
-    // 则自动强制开启 policy_warmup_prefetch_enabled 开关。
-    policy_warmup_prefetch_enabled = 
-        policy_mode == "prefetch" || 
-        policy_mode == "warmup_prefetch" || 
-        read_bool_from_env("VLLM_UVM_POLICY_WARMUP_PREFETCH", false);
+        // 4. 从环境变量读取策略配置 (Control Panel)
+        // 这种设计允许研究员在不重新编译 C++ 代码的情况下，通过 Shell 直接调整 UVM 行为。
+        trace_min_bytes = read_trace_min_bytes_from_env();
 
-    // 是否开启 Preferred Location (建议位置) 提示
-    policy_warmup_advise_gpu = 
-        read_bool_from_env("VLLM_UVM_POLICY_WARMUP_ADVISE_GPU", false) ? 1 : 0;
+        // 默认开启策略层
+        policy_enabled = read_bool_from_env("VLLM_UVM_POLICY_ENABLE", true) ? 1 : 0;
 
-    // 读取预取的尺寸下限阈值
-    policy_warmup_prefetch_min_bytes = read_size_from_env(
-        "VLLM_UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES",
-        policy_warmup_prefetch_min_bytes
-    );
-    unknown_detail_enabled =
-        read_bool_from_env("VLLM_UVM_UNKNOWN_DETAIL_ENABLE", false) ? 1 : 0;
-    unknown_detail_min_bytes = read_size_from_env(
-        "VLLM_UVM_UNKNOWN_DETAIL_MIN_BYTES",
-        unknown_detail_min_bytes
-    );
-    gap_watch_enabled =
-        read_bool_from_env("VLLM_UVM_GAP_WATCH_ENABLE", false) ? 1 : 0;
-    gap_watch_all_classes =
-        read_bool_from_env("VLLM_UVM_GAP_WATCH_ALL_CLASSES", true) ? 1 : 0;
-    gap_watch_min_bytes = read_size_from_env(
-        "VLLM_UVM_GAP_WATCH_MIN_BYTES",
-        gap_watch_min_bytes
-    );
-    gap_watch_name = read_string_from_env(
-        "VLLM_UVM_GAP_WATCH_NAME",
-        gap_watch_name.c_str()
-    );
-    gap_watch_control_file = read_string_from_env(
-        "VLLM_UVM_GAP_WATCH_CONTROL_FILE",
-        ""
-    );
-    gap_watch_refresh_ms = read_size_from_env(
-        "VLLM_UVM_GAP_WATCH_REFRESH_MS",
-        gap_watch_refresh_ms
-    );
-    uintptr_t parsed_gap_start = 0;
-    uintptr_t parsed_gap_end = 0;
-    if (read_hex_u64_from_env("VLLM_UVM_GAP_WATCH_START", &parsed_gap_start) &&
-        read_hex_u64_from_env("VLLM_UVM_GAP_WATCH_END", &parsed_gap_end) &&
-        parsed_gap_end >= parsed_gap_start) {
-        gap_watch_start = parsed_gap_start;
-        gap_watch_end = parsed_gap_end;
-        gap_watch_enabled = 1;
-    }
+        // 读取策略模式（trace_only 代表演习模式，prefetch 代表实战模式）
+        policy_mode = read_string_from_env("VLLM_UVM_POLICY_MODE", "trace_only");
 
-    // 5. 日志文件路径确定
-    // 默认文件名为 vllm_uvm_allocations.log，可通过 VLLM_UVM_LOG_FILE 修改。
-    const char* log_path = getenv("VLLM_UVM_LOG_FILE");
-    if (!log_path) {
-        log_path = "vllm_uvm_allocations.log";
-    }
+        // 级联逻辑：如果模式被设为 prefetch 或 warmup_prefetch，
+        // 则自动强制开启 policy_warmup_prefetch_enabled 开关。
+        policy_warmup_prefetch_enabled =
+            policy_mode == "prefetch" ||
+            policy_mode == "warmup_prefetch" ||
+            read_bool_from_env("VLLM_UVM_POLICY_WARMUP_PREFETCH", false);
 
-    // 6. 以追加模式 ("a") 打开文件
-    log_file = fopen(log_path, "a");
-    if (log_file) {
-        char timestamp[64];
-        get_timestamp(timestamp, sizeof(timestamp));
+        // 是否开启 Preferred Location (建议位置) 提示
+        policy_warmup_advise_gpu =
+            read_bool_from_env("VLLM_UVM_POLICY_WARMUP_ADVISE_GPU", false) ? 1 : 0;
 
-        // 7. 打印 Session 头部信息 (Session Header)
-        // 这一步在科研中极其重要，因为它记录了本次实验的所有超参数。
-        // 以后你回顾几个月前的日志时，一眼就能看出当时有没有开预取。
-        fprintf(log_file, "\n========================================\n");
-        fprintf(log_file, "[%s] vLLM UVM Allocator Session Started\n", timestamp);
-        fprintf(log_file, "[%s] trace_min_bytes=%zu current_phase=%s\n", 
-                timestamp, trace_min_bytes, current_phase.c_str());
-        fprintf(
-            log_file,
-            "[%s] policy_enabled=%d policy_mode=%s "
-            "policy_warmup_prefetch_enabled=%d "
-            "policy_warmup_prefetch_min_bytes=%zu "
-            "policy_warmup_advise_gpu=%d "
-            "unknown_detail_enabled=%d unknown_detail_min_bytes=%zu "
-            "gap_watch_enabled=%d gap_watch_name=%s "
-            "gap_watch_start=0x%llx gap_watch_end=0x%llx "
-            "gap_watch_all_classes=%d gap_watch_min_bytes=%zu "
-            "gap_watch_control_file=%s gap_watch_refresh_ms=%zu\n",
-            timestamp, policy_enabled, policy_mode.c_str(), 
-            policy_warmup_prefetch_enabled, policy_warmup_prefetch_min_bytes, 
-            policy_warmup_advise_gpu,
-            unknown_detail_enabled,
-            unknown_detail_min_bytes,
-            gap_watch_enabled,
-            gap_watch_name.c_str(),
-            static_cast<unsigned long long>(gap_watch_start),
-            static_cast<unsigned long long>(gap_watch_end),
-            gap_watch_all_classes,
-            gap_watch_min_bytes,
-            gap_watch_control_file.empty() ? "none" : gap_watch_control_file.c_str(),
+        // 读取预取的尺寸下限阈值
+        policy_warmup_prefetch_min_bytes = read_size_from_env(
+            "VLLM_UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES",
+            policy_warmup_prefetch_min_bytes
+        );
+        unknown_detail_enabled =
+            read_bool_from_env("VLLM_UVM_UNKNOWN_DETAIL_ENABLE", false) ? 1 : 0;
+        unknown_detail_min_bytes = read_size_from_env(
+            "VLLM_UVM_UNKNOWN_DETAIL_MIN_BYTES",
+            unknown_detail_min_bytes
+        );
+        gap_watch_enabled =
+            read_bool_from_env("VLLM_UVM_GAP_WATCH_ENABLE", false) ? 1 : 0;
+        gap_watch_all_classes =
+            read_bool_from_env("VLLM_UVM_GAP_WATCH_ALL_CLASSES", true) ? 1 : 0;
+        gap_watch_min_bytes = read_size_from_env(
+            "VLLM_UVM_GAP_WATCH_MIN_BYTES",
+            gap_watch_min_bytes
+        );
+        gap_watch_name = read_string_from_env(
+            "VLLM_UVM_GAP_WATCH_NAME",
+            gap_watch_name.c_str()
+        );
+        gap_watch_target_class = read_string_from_env(
+            "VLLM_UVM_GAP_WATCH_TARGET_CLASS",
+            gap_watch_target_class.c_str()
+        );
+        gap_watch_policy_action = read_string_from_env(
+            "VLLM_UVM_GAP_WATCH_POLICY_ACTION",
+            gap_watch_policy_action.c_str()
+        );
+        gap_watch_control_file = read_string_from_env(
+            "VLLM_UVM_GAP_WATCH_CONTROL_FILE",
+            ""
+        );
+        gap_watch_refresh_ms = read_size_from_env(
+            "VLLM_UVM_GAP_WATCH_REFRESH_MS",
             gap_watch_refresh_ms
         );
-        fprintf(log_file, "========================================\n");
-        
-        // 强制刷新缓冲区，确保头部信息立即落盘，防止程序崩溃导致日志丢失。
-        fflush(log_file);
-    } else {
-        // 如果日志打开失败（如目录无权限），降级到 stderr 报警，但不阻塞分配流程。
-        fprintf(stderr, "[vLLM UVM] Warning: Could not open log file: %s\n", log_path);
+        uintptr_t parsed_gap_start = 0;
+        uintptr_t parsed_gap_end = 0;
+        if (read_hex_u64_from_env("VLLM_UVM_GAP_WATCH_START", &parsed_gap_start) &&
+            read_hex_u64_from_env("VLLM_UVM_GAP_WATCH_END", &parsed_gap_end) &&
+            parsed_gap_end >= parsed_gap_start) {
+            gap_watch_start = parsed_gap_start;
+            gap_watch_end = parsed_gap_end;
+            gap_watch_enabled = 1;
+        }
+
+        // 5. 日志文件路径确定
+        // 默认文件名为 vllm_uvm_allocations.log，可通过 VLLM_UVM_LOG_FILE 修改。
+        const char* log_path = getenv("VLLM_UVM_LOG_FILE");
+        if (!log_path) {
+            log_path = "vllm_uvm_allocations.log";
+        }
+
+        // 6. 以追加模式 ("a") 打开文件
+        log_file = fopen(log_path, "a");
+        if (log_file) {
+            char timestamp[64];
+            get_timestamp(timestamp, sizeof(timestamp));
+
+            // 7. 打印 Session 头部信息 (Session Header)
+            // 这一步在科研中极其重要，因为它记录了本次实验的所有超参数。
+            // 以后你回顾几个月前的日志时，一眼就能看出当时有没有开预取。
+            fprintf(log_file, "\n========================================\n");
+            fprintf(log_file, "[%s] vLLM UVM Allocator Session Started\n", timestamp);
+            fprintf(log_file, "[%s] trace_min_bytes=%zu current_phase=%s\n",
+                    timestamp, trace_min_bytes, current_phase.c_str());
+            fprintf(
+                log_file,
+                "[%s] policy_enabled=%d policy_mode=%s "
+                "policy_warmup_prefetch_enabled=%d "
+                "policy_warmup_prefetch_min_bytes=%zu "
+                "policy_warmup_advise_gpu=%d "
+                "unknown_detail_enabled=%d unknown_detail_min_bytes=%zu "
+                "gap_watch_enabled=%d gap_watch_name=%s "
+                "gap_watch_start=0x%llx gap_watch_end=0x%llx "
+                "gap_watch_all_classes=%d gap_watch_min_bytes=%zu "
+                "gap_watch_target_class=%s gap_watch_policy_action=%s "
+                "gap_watch_control_file=%s gap_watch_refresh_ms=%zu\n",
+                timestamp, policy_enabled, policy_mode.c_str(),
+                policy_warmup_prefetch_enabled, policy_warmup_prefetch_min_bytes,
+                policy_warmup_advise_gpu,
+                unknown_detail_enabled,
+                unknown_detail_min_bytes,
+                gap_watch_enabled,
+                gap_watch_name.c_str(),
+                static_cast<unsigned long long>(gap_watch_start),
+                static_cast<unsigned long long>(gap_watch_end),
+                gap_watch_all_classes,
+                gap_watch_min_bytes,
+                gap_watch_target_class.c_str(),
+                gap_watch_policy_action.c_str(),
+                gap_watch_control_file.empty() ? "none" : gap_watch_control_file.c_str(),
+                gap_watch_refresh_ms
+            );
+            fprintf(log_file, "========================================\n");
+
+            // 强制刷新缓冲区，确保头部信息立即落盘，防止程序崩溃导致日志丢失。
+            fflush(log_file);
+        } else {
+            // 如果日志打开失败（如目录无权限），降级到 stderr 报警，但不阻塞分配流程。
+            fprintf(stderr, "[vLLM UVM] Warning: Could not open log file: %s\n", log_path);
+        }
+
+        // 8. 标记初始化完成
+        log_initialized = true;
     }
 
-    // 8. 标记初始化完成
-    log_initialized = true;
+    // 注意：这里必须在释放 log_mutex 后再去 refresh 控制文件。
+    // 否则 refresh_gap_watch_from_control_file_if_needed() 内部再次尝试获取
+    // log_mutex 时会发生自锁，导致服务卡在 "UVM allocator enabled successfully" 之后。
     refresh_gap_watch_from_control_file_if_needed(true);
 }
 
@@ -974,6 +1126,9 @@ static void trace_policy_event(void* ptr,
                                const std::string& phase,
                                AllocationClass alloc_class,
                                PolicyAction action,
+                               const char* policy_source,
+                               bool gap_watch_class_match,
+                               size_t gap_overlap_bytes,
                                const char* size_bucket,
                                bool action_success,
                                const char* action_error) {
@@ -992,7 +1147,9 @@ static void trace_policy_event(void* ptr,
         log_file,
         "[%s] [+%.3fs] TRACE_POLICY alloc_id=%zu ptr=0x%llx end=0x%llx "
         "size_bytes=%zu size_bucket=%s device=%d phase=%s "
-        "predicted_class=%s action=%s action_success=%d action_error=%s\n",
+        "predicted_class=%s action=%s policy_source=%s "
+        "gap_watch_class_match=%d gap_overlap_bytes=%zu "
+        "action_success=%d action_error=%s\n",
         timestamp,
         elapsed,
         alloc_num,
@@ -1004,6 +1161,9 @@ static void trace_policy_event(void* ptr,
         phase.c_str(),
         allocation_class_to_string(alloc_class),
         policy_action_to_string(action),
+        (policy_source && policy_source[0] != '\0') ? policy_source : "unknown",
+        gap_watch_class_match ? 1 : 0,
+        gap_overlap_bytes,
         action_success ? 1 : 0,
         safe_error
     );
@@ -1066,6 +1226,8 @@ static void trace_gap_watch_alloc_event(void* ptr,
                                         const std::string& phase,
                                         AllocationClass alloc_class,
                                         PolicyAction action,
+                                        const char* policy_source,
+                                        bool gap_watch_class_match,
                                         const char* size_bucket,
                                         cudaStream_t stream,
                                         uintptr_t overlap_start,
@@ -1093,7 +1255,8 @@ static void trace_gap_watch_alloc_event(void* ptr,
         log_file,
         "[%s] [+%.3fs] TRACE_GAP_WATCH_ALLOC alloc_id=%zu watch_name=%s "
         "ptr=0x%llx end=0x%llx size_bytes=%zu size_bucket=%s device=%d phase=%s "
-        "predicted_class=%s action=%s stream=0x%llx overlap_start=0x%llx "
+        "predicted_class=%s action=%s policy_source=%s "
+        "gap_watch_target_class=%s gap_watch_class_match=%d stream=0x%llx overlap_start=0x%llx "
         "overlap_end=0x%llx overlap_bytes=%zu overlap_ratio_of_watch=%.6f\n",
         timestamp,
         elapsed,
@@ -1107,6 +1270,9 @@ static void trace_gap_watch_alloc_event(void* ptr,
         phase.c_str(),
         allocation_class_to_string(alloc_class),
         policy_action_to_string(action),
+        (policy_source && policy_source[0] != '\0') ? policy_source : "unknown",
+        gap_watch_target_class.c_str(),
+        gap_watch_class_match ? 1 : 0,
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(stream)),
         static_cast<unsigned long long>(overlap_start),
         static_cast<unsigned long long>(overlap_end),
@@ -1147,6 +1313,8 @@ static void trace_gap_watch_free_event(void* ptr,
         "[%s] [+%.3fs] TRACE_GAP_WATCH_FREE free_id=%zu watch_name=%s "
         "ptr=0x%llx end=0x%llx size_bytes=%zu device=%d phase=%s alloc_id=%zu "
         "alloc_phase=%s alloc_predicted_class=%s alloc_action=%s "
+        "alloc_policy_source=%s alloc_policy_success=%d alloc_policy_error=%s "
+        "gap_watch_target_class=%s gap_watch_policy_action=%s "
         "overlap_start=0x%llx overlap_end=0x%llx overlap_bytes=%zu "
         "overlap_ratio_of_watch=%.6f lifetime_s=%.6f total_bytes=%zu\n",
         timestamp,
@@ -1162,6 +1330,11 @@ static void trace_gap_watch_free_event(void* ptr,
         info->phase.c_str(),
         info->alloc_class_name.c_str(),
         info->policy_action_name.c_str(),
+        info->policy_source_name.c_str(),
+        info->policy_action_success ? 1 : 0,
+        info->policy_action_error.c_str(),
+        info->gap_watch_target_class_name.c_str(),
+        info->gap_watch_policy_action_name.c_str(),
         static_cast<unsigned long long>(info->gap_overlap_start),
         static_cast<unsigned long long>(info->gap_overlap_end),
         info->gap_overlap_bytes,
@@ -1300,7 +1473,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         static_cast<size_t>(size)
     );
     // 决定是否要对该内存块采取特殊动作（如主动 Advise 或 Prefetch）
-    PolicyAction policy_action = choose_policy_action(
+    PolicyAction base_policy_action = choose_policy_action(
         alloc_class,
         static_cast<size_t>(size),
         device
@@ -1332,6 +1505,28 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         static_cast<size_t>(size),
         gap_overlap_bytes
     );
+    bool gap_watch_class_match = false;
+    const char* policy_source = "base_policy";
+    PolicyAction gap_watch_policy_action = choose_gap_watch_policy_action(
+        alloc_class,
+        static_cast<size_t>(size),
+        device,
+        gap_overlap_bytes,
+        &gap_watch_class_match,
+        &policy_source
+    );
+    PolicyAction policy_action =
+        (gap_watch_policy_action != PolicyAction::ManagedDefault)
+            ? gap_watch_policy_action
+            : base_policy_action;
+
+    if (gap_overlap_bytes > 0) {
+        gap_watch_overlap_allocs.fetch_add(1);
+        gap_watch_overlap_bytes_total.fetch_add(gap_overlap_bytes);
+        if (gap_watch_class_match) {
+            gap_watch_target_class_match_allocs.fetch_add(1);
+        }
+    }
     bool store_active_info =
         static_cast<size_t>(size) >= trace_min_bytes ||
         log_unknown_detail || log_gap_watch;
@@ -1347,21 +1542,31 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             alloc_elapsed,
             allocation_class_to_string(alloc_class),
             policy_action_to_string(policy_action),
+            policy_source,
+            true,
+            "none",
             size_bucket,
             log_unknown_detail,
             log_gap_watch,
             gap_overlap_start,
             gap_overlap_end,
             gap_overlap_bytes,
+            gap_watch_target_class,
+            policy_action_to_string(gap_watch_policy_action),
         };
     }
 
     // 8. 策略执行阶段：主动显存调优
-    if (policy_action == PolicyAction::ManagedPrefetchGpu && ptr != NULL) {
+    if ((policy_action == PolicyAction::ManagedPrefetchGpu ||
+         policy_action == PolicyAction::ManagedAdvisePrefetchGpu) &&
+        ptr != NULL) {
         
         // 8.1 内存建议 (MemAdvise)：提示 CUDA 驱动该内存的首选物理位置在 GPU 上
         // 这可以在真正发生缺页中断时，降低驱动寻找最佳页存放地的开销。
-        if (policy_warmup_advise_gpu) {
+        bool should_advise =
+            policy_action == PolicyAction::ManagedAdvisePrefetchGpu ||
+            policy_warmup_advise_gpu;
+        if (should_advise) {
             cudaError_t advise_err = cudaMemAdvise(
                 ptr,
                 static_cast<size_t>(size),
@@ -1391,11 +1596,41 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
+    if (gap_overlap_bytes > 0 &&
+        policy_source != nullptr &&
+        strcmp(policy_source, "gap_watch_policy") == 0 &&
+        policy_action != PolicyAction::ManagedDefault) {
+        gap_watch_policy_applied_allocs.fetch_add(1);
+        gap_watch_policy_applied_overlap_bytes.fetch_add(gap_overlap_bytes);
+        if (policy_action_success) {
+            gap_watch_policy_success_allocs.fetch_add(1);
+        } else {
+            gap_watch_policy_failed_allocs.fetch_add(1);
+        }
+    }
+
+    if (store_active_info) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        auto it = active_allocations.find(ptr);
+        if (it != active_allocations.end()) {
+            it->second.policy_action_name = policy_action_to_string(policy_action);
+            it->second.policy_source_name = policy_source ? policy_source : "unknown";
+            it->second.policy_action_success = policy_action_success;
+            it->second.policy_action_error = policy_action_error;
+            it->second.gap_watch_target_class_name = gap_watch_target_class;
+            it->second.gap_watch_policy_action_name =
+                policy_action_to_string(gap_watch_policy_action);
+        }
+    }
+
     // 记录策略引擎的判定与执行结果
     if (policy_enabled) {
         trace_policy_event(
             ptr, static_cast<size_t>(size), alloc_count, device,
             phase_snapshot, alloc_class, policy_action,
+            policy_source,
+            gap_watch_class_match,
+            gap_overlap_bytes,
             size_bucket,
             policy_action_success, policy_action_error
         );
@@ -1426,6 +1661,8 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             phase_snapshot,
             alloc_class,
             policy_action,
+            policy_source,
+            gap_watch_class_match,
             size_bucket,
             stream,
             gap_overlap_start,
@@ -1630,6 +1867,13 @@ void uvm_close_log(void) {
     fprintf(log_file, "  Total frees: %zu\n", num_frees.load());
     fprintf(log_file, "  Current allocated: %.2f GB\n", total_allocated.load() / 1e9);
     fprintf(log_file, "  Peak allocated: %.2f GB\n", peak_allocated.load() / 1e9);
+    fprintf(log_file, "  Gap-watch overlap allocations: %zu\n", gap_watch_overlap_allocs.load());
+    fprintf(log_file, "  Gap-watch overlap bytes total: %zu\n", gap_watch_overlap_bytes_total.load());
+    fprintf(log_file, "  Gap-watch target-class matches: %zu\n", gap_watch_target_class_match_allocs.load());
+    fprintf(log_file, "  Gap-watch policy applied: %zu\n", gap_watch_policy_applied_allocs.load());
+    fprintf(log_file, "  Gap-watch policy applied overlap bytes: %zu\n", gap_watch_policy_applied_overlap_bytes.load());
+    fprintf(log_file, "  Gap-watch policy success: %zu\n", gap_watch_policy_success_allocs.load());
+    fprintf(log_file, "  Gap-watch policy failed: %zu\n", gap_watch_policy_failed_allocs.load());
     fprintf(log_file, "========================================\n\n");
 
     fflush(log_file);
