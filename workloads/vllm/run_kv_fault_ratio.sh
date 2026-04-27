@@ -22,6 +22,8 @@ OUTPUT_LEN=512
 SEED=42
 STARTUP_TIMEOUT=600
 CHECK_INTERVAL=2
+SERVER_MAX_NUM_SEQS="${VLLM_SERVER_MAX_NUM_SEQS:-8}"
+SERVER_GPU_MEMORY_UTILIZATION="${VLLM_SERVER_GPU_MEMORY_UTILIZATION:-0.85}"
 
 DATASET_PATH="${DATASET_PATH:-$SCRIPT_DIR/datasets/ShareGPT_V3_unfiltered_cleaned_split.json}"
 ADDRESS_LOG="/tmp/vllm_uvm_address_regions.log"
@@ -49,6 +51,10 @@ UVM_GAP_WATCH_TARGET_CLASS="${VLLM_UVM_GAP_WATCH_TARGET_CLASS:-any}"
 UVM_GAP_WATCH_POLICY_ACTION="${VLLM_UVM_GAP_WATCH_POLICY_ACTION:-observe}"
 UVM_GAP_WATCH_CONTROL_FILE="${VLLM_UVM_GAP_WATCH_CONTROL_FILE:-}"
 UVM_GAP_WATCH_REFRESH_MS="${VLLM_UVM_GAP_WATCH_REFRESH_MS:-250}"
+UVM_DEVICE_DIRECT_ENABLE="${VLLM_UVM_DEVICE_DIRECT_ENABLE:-0}"
+UVM_DEVICE_DIRECT_MIN_BYTES="${VLLM_UVM_DEVICE_DIRECT_MIN_BYTES:-4096}"
+UVM_DEVICE_DIRECT_MAX_BYTES="${VLLM_UVM_DEVICE_DIRECT_MAX_BYTES:-1048576}"
+UVM_DEVICE_DIRECT_TARGET_PHASES="${VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES:-enabled:attention,enabled:moe,enabled:model_forward}"
 GAP_WATCH_METRICS_SUMMARY_JSON=""
 
 AUTO_GAP_WATCH_ENABLE=0
@@ -132,11 +138,21 @@ Options:
   --uvm-gap-watch-target-class <name>
                              Optional target class for watch policy: any|runtime_scratch|runtime_workspace|warmup_workspace|weight_persistent|kv_persistent
   --uvm-gap-watch-policy-action <mode>
-                             Watch policy action: observe|prefetch|advise_prefetch (default: observe)
+                             Watch policy action: observe|prefetch|advise_prefetch|device_direct_trace|device_direct
+                             device_direct changes backend only when --uvm-device-direct-enable=1 (default: observe)
   --uvm-gap-watch-control-file <path>
                              Optional runtime-updatable control file for same-process gap watch
   --uvm-gap-watch-refresh-ms <n>
                              Control-file polling interval in allocator (default: 250)
+  --uvm-device-direct-enable <0|1>
+                             Stage C device-direct execution gate; default 0 keeps trace-only behavior
+  --uvm-device-direct-min-bytes <n>
+                             Min allocation size to mark device-direct eligible (default: 4096)
+  --uvm-device-direct-max-bytes <n>
+                             Max allocation size to mark device-direct eligible (default: 1048576)
+  --uvm-device-direct-target-phases <csv>
+                             Comma-separated phase prefixes allowed for Stage B eligibility
+                             (default: enabled:attention,enabled:moe,enabled:model_forward)
   --gap-watch-metrics-summary-json <path>
                              Optional post-run JSON summary proving whether gap-watch policy hit and succeeded
   --auto-gap-watch-enable <0|1>
@@ -153,11 +169,14 @@ Options:
                              Optional summary JSON emitted after main phase for gap consistency comparison
   --auto-gap-watch-policy-action-override <mode>
                              Override discovered policy action for A/B runs:
-                             observe|prefetch|advise_prefetch
+                             observe|prefetch|advise_prefetch|device_direct_trace|device_direct
   --auto-gap-watch-target-class-override <name>
                              Override discovered target class for A/B runs
   --startup-timeout <sec>    Server/KV wait timeout (default: 600)
   --check-interval <sec>     Poll interval (default: 2)
+  --server-max-num-seqs <n>  vLLM server --max-num-seqs (default: 8)
+  --server-gpu-memory-utilization <f>
+                             vLLM server --gpu-memory-utilization (default: 0.85)
   --with-address-log         Also enable per-fault address logs
   --no-cleanup               Skip workloads/cleanup_gpu.py before run
   --no-bench                 Configure params only, do not run benchmark
@@ -295,7 +314,11 @@ start_server() {
                 VLLM_UVM_GAP_WATCH_TARGET_CLASS='$UVM_GAP_WATCH_TARGET_CLASS' \
                 VLLM_UVM_GAP_WATCH_POLICY_ACTION='$UVM_GAP_WATCH_POLICY_ACTION' \
                 VLLM_UVM_GAP_WATCH_CONTROL_FILE='$UVM_GAP_WATCH_CONTROL_FILE' \
-                VLLM_UVM_GAP_WATCH_REFRESH_MS='$UVM_GAP_WATCH_REFRESH_MS'"
+                VLLM_UVM_GAP_WATCH_REFRESH_MS='$UVM_GAP_WATCH_REFRESH_MS' \
+                VLLM_UVM_DEVICE_DIRECT_ENABLE='$UVM_DEVICE_DIRECT_ENABLE' \
+                VLLM_UVM_DEVICE_DIRECT_MIN_BYTES='$UVM_DEVICE_DIRECT_MIN_BYTES' \
+                VLLM_UVM_DEVICE_DIRECT_MAX_BYTES='$UVM_DEVICE_DIRECT_MAX_BYTES' \
+                VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES='$UVM_DEVICE_DIRECT_TARGET_PHASES'"
 
     # 3. 构造服务器启动指令
     local server_cmd
@@ -306,7 +329,8 @@ start_server() {
     # - VLLM_UVM_ADDRESS_LOG_FILE: 指定 vLLM 将内存布局信息写到哪个文件
     # - uv run vllm serve: 使用 uv 工具启动 vLLM 推理引擎
     # - --enforce-eager: 强制使用 Eager 模式（通常为了避免 CUDA Graph 干扰显存地址分析）
-    # - --max-num-seqs 16: 限制并发序列数，便于观察显存受限时的行为
+    # - --max-num-seqs: 限制 warmup/运行时最大并发序列数，避免启动阶段 dummy sampler OOM
+    # - --gpu-memory-utilization: 给 sampler/logits/runtime workspace 留出显存余量
     # - > '$SERVER_LOG' 2>&1: 将标准输出和错误信息全部重定向到服务器日志
     server_cmd="cd '$SCRIPT_DIR' && \
                 VLLM_USE_UVM=1 \
@@ -316,7 +340,8 @@ start_server() {
                 $policy_env \
                 uv run vllm serve '$MODEL' \
                 --enforce-eager \
-                --max-num-seqs 16 \
+                --max-num-seqs '$SERVER_MAX_NUM_SEQS' \
+                --gpu-memory-utilization '$SERVER_GPU_MEMORY_UTILIZATION' \
                 --port '$PORT' > '$SERVER_LOG' 2>&1"
 
     # 4. 后台执行并脱离终端控制
@@ -652,6 +677,10 @@ parse_args() {
       --uvm-gap-watch-policy-action) UVM_GAP_WATCH_POLICY_ACTION="$2"; shift 2 ;; # gap watch 命中后的策略动作
       --uvm-gap-watch-control-file) UVM_GAP_WATCH_CONTROL_FILE="$2"; shift 2 ;; # allocator 运行时热更新的控制文件
       --uvm-gap-watch-refresh-ms) UVM_GAP_WATCH_REFRESH_MS="$2"; shift 2 ;; # allocator 轮询控制文件的间隔
+      --uvm-device-direct-enable) UVM_DEVICE_DIRECT_ENABLE="$2"; shift 2 ;; # device_direct 阶段 C 默认关闭的真实执行门控
+      --uvm-device-direct-min-bytes) UVM_DEVICE_DIRECT_MIN_BYTES="$2"; shift 2 ;; # device_direct 候选最小尺寸
+      --uvm-device-direct-max-bytes) UVM_DEVICE_DIRECT_MAX_BYTES="$2"; shift 2 ;; # device_direct 候选最大尺寸
+      --uvm-device-direct-target-phases) UVM_DEVICE_DIRECT_TARGET_PHASES="$2"; shift 2 ;; # device_direct 候选 phase 前缀 allowlist
       --gap-watch-metrics-summary-json) GAP_WATCH_METRICS_SUMMARY_JSON="$2"; shift 2 ;; # gap watch 命中/动作证明摘要
       --auto-gap-watch-enable) AUTO_GAP_WATCH_ENABLE="$2"; shift 2 ;; # 同进程 probe -> discover -> main 自动流程
       --auto-gap-watch-probe-prompts) AUTO_GAP_WATCH_PROBE_PROMPTS="$2"; shift 2 ;; # 自动流程 probe 阶段的 prompt 数
@@ -663,6 +692,8 @@ parse_args() {
       --auto-gap-watch-target-class-override) AUTO_GAP_WATCH_TARGET_CLASS_OVERRIDE="$2"; shift 2 ;; # 自动流程强制覆盖目标类别
       --startup-timeout) STARTUP_TIMEOUT="$2"; shift 2 ;;   # 设置等待服务器启动的超时时间
       --check-interval) CHECK_INTERVAL="$2"; shift 2 ;;     # 设置轮询检查的间隔时间
+      --server-max-num-seqs) SERVER_MAX_NUM_SEQS="$2"; shift 2 ;; # 设置 vLLM server 最大并发序列数
+      --server-gpu-memory-utilization) SERVER_GPU_MEMORY_UTILIZATION="$2"; shift 2 ;; # 设置 vLLM server 显存利用率
 
       # ==========================================
       # 布尔开关类型参数 (Boolean Flags): 只需要出现该选项即可，不需要值
@@ -746,13 +777,19 @@ validate_inputs() {
     [[ "$UVM_GAP_WATCH_ALL_CLASSES" =~ ^[01]$ ]] || die "--uvm-gap-watch-all-classes must be 0 or 1"
     [[ "$UVM_GAP_WATCH_MIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-gap-watch-min-bytes must be a non-negative integer"
     [[ "$UVM_GAP_WATCH_REFRESH_MS" =~ ^[0-9]+$ ]] || die "--uvm-gap-watch-refresh-ms must be a non-negative integer"
-    [[ "$UVM_GAP_WATCH_POLICY_ACTION" =~ ^(observe|prefetch|advise_prefetch|managed_default|managed_prefetch_gpu|managed_advise_prefetch_gpu)$ ]] || die "--uvm-gap-watch-policy-action must be observe, prefetch, advise_prefetch, managed_default, managed_prefetch_gpu, or managed_advise_prefetch_gpu"
+    [[ "$UVM_GAP_WATCH_POLICY_ACTION" =~ ^(observe|prefetch|advise_prefetch|device_direct_trace|device_direct|managed_default|managed_prefetch_gpu|managed_advise_prefetch_gpu)$ ]] || die "--uvm-gap-watch-policy-action must be observe, prefetch, advise_prefetch, device_direct_trace, device_direct, managed_default, managed_prefetch_gpu, or managed_advise_prefetch_gpu"
+    [[ "$UVM_DEVICE_DIRECT_ENABLE" =~ ^[01]$ ]] || die "--uvm-device-direct-enable must be 0 or 1"
+    [[ "$UVM_DEVICE_DIRECT_MIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-device-direct-min-bytes must be a non-negative integer"
+    [[ "$UVM_DEVICE_DIRECT_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-device-direct-max-bytes must be a non-negative integer"
+    [ -n "$UVM_DEVICE_DIRECT_TARGET_PHASES" ] || die "--uvm-device-direct-target-phases must not be empty"
+    [[ "$SERVER_MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]] || die "--server-max-num-seqs must be a positive integer"
+    [[ "$SERVER_GPU_MEMORY_UTILIZATION" =~ ^(0\.[0-9]+|1(\.0+)?)$ ]] || die "--server-gpu-memory-utilization must be in (0, 1]"
     [[ "$AUTO_GAP_WATCH_ENABLE" =~ ^[01]$ ]] || die "--auto-gap-watch-enable must be 0 or 1"
     [[ "$AUTO_GAP_WATCH_PROBE_PROMPTS" =~ ^[0-9]+$ ]] || die "--auto-gap-watch-probe-prompts must be a non-negative integer"
     [[ "$AUTO_GAP_WATCH_TARGET_GAP" =~ ^[0-9]+$ ]] || die "--auto-gap-watch-target-gap must be a non-negative integer"
     [[ "$AUTO_GAP_WATCH_FALLBACK_TO_HOTTEST" =~ ^[01]$ ]] || die "--auto-gap-watch-fallback-to-hottest must be 0 or 1"
     if [ -n "$AUTO_GAP_WATCH_POLICY_ACTION_OVERRIDE" ]; then
-      [[ "$AUTO_GAP_WATCH_POLICY_ACTION_OVERRIDE" =~ ^(observe|prefetch|advise_prefetch)$ ]] || die "--auto-gap-watch-policy-action-override must be observe, prefetch, or advise_prefetch"
+      [[ "$AUTO_GAP_WATCH_POLICY_ACTION_OVERRIDE" =~ ^(observe|prefetch|advise_prefetch|device_direct_trace|device_direct)$ ]] || die "--auto-gap-watch-policy-action-override must be observe, prefetch, advise_prefetch, device_direct_trace, or device_direct"
     fi
     if [ -n "$UVM_GAP_WATCH_START" ]; then
       [[ "$UVM_GAP_WATCH_START" =~ ^0x[0-9a-fA-F]+$ ]] || die "--uvm-gap-watch-start must be a hex address"

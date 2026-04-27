@@ -54,6 +54,11 @@ static std::string gap_watch_target_class = "any";
 static std::string gap_watch_policy_action = "observe";
 static std::string gap_watch_control_file = "";
 static size_t gap_watch_refresh_ms = 250;
+static int device_direct_enable = 0;
+static size_t device_direct_min_bytes = 4096;
+static size_t device_direct_max_bytes = 1 * 1024 * 1024;
+static std::string device_direct_target_phases =
+    "enabled:attention,enabled:moe,enabled:model_forward";
 static bool gap_watch_control_seen = false;
 static uint64_t gap_watch_control_mtime_ns = 0;
 static off_t gap_watch_control_size = -1;
@@ -67,36 +72,132 @@ static std::chrono::steady_clock::time_point start_time;
 static bool log_initialized = false;
 static std::string current_phase = "unscoped";
 
-// Gap-watch policy metrics
+// =============================================================================
+// 全局策略遥测与效能评估指标 (Global Policy Telemetry Metrics)
+// 采用无锁 (Lock-free) 的 std::atomic 实现，确保在多流、多线程高并发推理场景下
+// 收集指标时不会引入额外的锁竞争与长尾延迟。这些数据通常在 Session 结束时汇总打印。
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 1. Gap Watch 基础观测指标 (Gap Watch Observation Metrics)
+// 用于量化目标虚拟/物理地址空间（Gap）的内存活动密集度（即：热点有多“热”）
+// -----------------------------------------------------------------------------
+
+/// @brief 触发 Gap 重叠的分配总次数。只要申请的内存块与监控区间有交集即 +1。
 static std::atomic<size_t> gap_watch_overlap_allocs{0};
+
+/// @brief 落入监控区间的实际重叠字节总量。用于计算“热点区域空间利用率/重叠率”。
 static std::atomic<size_t> gap_watch_overlap_bytes_total{0};
+
+/// @brief 既与监控区间重叠，又完全符合预设意图类别（Target Class，如 KV Cache）的分配次数。
+/// @note 该指标与 gap_watch_overlap_allocs 的差值，反映了目标热点区域内的“内存噪声”
+/// （即有多少非目标类型的零碎内存恰好也分配在了这个区间）。
 static std::atomic<size_t> gap_watch_target_class_match_allocs{0};
+
+
+// -----------------------------------------------------------------------------
+// 2. Gap Watch 策略执行指标 (Gap Watch Policy Execution Metrics)
+// 用于评估主动干预动作（如强制 Advise 或 Prefetch）的覆盖面与系统兼容性
+// -----------------------------------------------------------------------------
+
+/// @brief 成功触发并尝试执行主动策略干预（提权动作）的分配次数。
 static std::atomic<size_t> gap_watch_policy_applied_allocs{0};
+
+/// @brief 被主动策略干预所覆盖的热点字节总量。
+/// @note 这是评估“预取/迁移带宽开销”的核心基准数据。
 static std::atomic<size_t> gap_watch_policy_applied_overlap_bytes{0};
+
+/// @brief 底层 CUDA API（如 cudaMemPrefetchAsync）调用成功的次数。
 static std::atomic<size_t> gap_watch_policy_success_allocs{0};
+
+/// @brief 策略执行失败的次数（例如：设备不支持并发预取、CUDA 流错误等）。
+/// @note 如果此数值异常升高，提示底层驱动或环境配置存在瓶颈，需结合 trace 日志排查。
 static std::atomic<size_t> gap_watch_policy_failed_allocs{0};
 
-struct AllocationInfo {
-    size_t size;
-    int device;
-    size_t alloc_id;
-    std::string phase;
-    double alloc_elapsed_seconds;
-    std::string alloc_class_name;
-    std::string policy_action_name;
-    std::string policy_source_name;
-    bool policy_action_success;
-    std::string policy_action_error;
-    std::string size_bucket;
-    bool unknown_detail_logged;
-    bool gap_watch_logged;
-    uintptr_t gap_overlap_start;
-    uintptr_t gap_overlap_end;
-    size_t gap_overlap_bytes;
-    std::string gap_watch_target_class_name;
-    std::string gap_watch_policy_action_name;
-};
 
+// -----------------------------------------------------------------------------
+// 3. Device Direct 演进指标 (Device Direct Evolution Metrics)
+// 用于支撑系统从“纯 UVM 托管”向“混合显存池（Bypass UVM）”演进的决策依据。
+// 这些是前瞻性评估指标，量化了如果切断 CPU 侧的 Page Fault 关联，能拯救多少内存。
+// -----------------------------------------------------------------------------
+
+/// @brief 参与 Device Direct 旁路分配评估的分配总次数（即经过 Device Direct Trace 策略判定的次数）。
+static std::atomic<size_t> device_direct_trace_allocs{0};
+
+/// @brief 经策略引擎判定，完全具备“安全绕过 UVM 直接分配纯显存”资格的分配次数。
+/// @note 达标条件通常包括：无 CPU 访问风险、属于明确的计算临时空间 (RuntimeWorkspace)、大小在设定阈值内。
+static std::atomic<size_t> device_direct_eligible_allocs{0};
+
+/// @brief Stage C 真正路由到 GPU-only backend 的分配次数。
+static std::atomic<size_t> device_direct_actual_allocs{0};
+
+/// @brief Stage C 真正路由到 GPU-only backend 的累计字节数。
+static std::atomic<size_t> device_direct_actual_bytes{0};
+
+/// @brief Stage C 试图启用 GPU-only backend 但 cudaMalloc 失败、回退到 managed 的次数。
+static std::atomic<size_t> device_direct_fallback_allocs{0};
+
+/// @brief Stage C GPU-only backend 分配在 free 阶段成功释放的次数。
+static std::atomic<size_t> device_direct_free_success_allocs{0};
+
+/// @brief 所有参与评估的内存请求累计字节量。
+/// @note 结合 eligible_allocs 的大小，可以量化出下一阶段（Phase C）真正开启 Device Direct 后，
+/// 能为系统节省多少 UVM 缺页追踪开销。
+static std::atomic<size_t> device_direct_requested_bytes{0};
+
+/**
+ * @struct AllocationInfo
+ * @brief UVM 显存分配的元数据生命周期快照 (Metadata Lifecycle Snapshot)
+ * * 此结构体充当每个 UVM 显存块的“数字档案”。它在内存分配 (cudaMallocManaged) 时被创建，
+ * 记录了从底层物理属性到上层业务意图（如 KV Cache、Weights）的完整映射关系。
+ * 这些详尽的追踪数据不仅用于运行时的动态策略干预（Gap Watch/Device Direct），
+ * 更是离线分析 CPU-GPU 耦合瓶颈、生成 eBPF 性能重放日志的核心数据源。
+ */
+struct AllocationInfo {
+    // ========================================================================
+    // 1. 基础物理与生命周期元数据 (Base Physical & Lifecycle Metadata)
+    // ========================================================================
+
+    size_t size;                    ///< 分配的内存字节数。
+    int device;                     ///< 目标设备的 ID（>=0 为特定 GPU，-1 通常代表 CPU/主机内存）。
+    size_t alloc_id;                ///< 全局单调递增的分配序号，用于在海量日志中精确定位单次申请。
+    std::string phase;              ///< 分配发生时上层系统（如 vLLM）所处的业务阶段（例如 "load_model", "initialize_kv_cache"）。
+    double alloc_elapsed_seconds;   ///< 相对于调度器/拦截器启动时间的时间戳。配合 free 时的相对时间，可精确计算内存生命周期。
+    std::string size_bucket;        ///< 将离散的 size 映射到预定义的区间（如 "1MiB-2MiB"），方便进行显存碎片率或分配频率的直方图统计。
+
+    // ========================================================================
+    // 2. 启发式意图与策略引擎状态 (Heuristic Intent & Policy Engine State)
+    // ========================================================================
+
+    std::string alloc_class_name;   ///< 启发式分类器推断出的内存用途类别（如 "WeightPersistent", "RuntimeScratch"）。
+    std::string policy_action_name; ///< 最终决定执行的主动干预动作（如 "ManagedPrefetchGpu", "ManagedDefault"）。
+    std::string policy_source_name; ///< 触发该动作的策略来源（"base_policy" 默认启发式，或 "gap_watch_policy" 动态热点干预）。
+    bool policy_action_success;     ///< 记录 cudaMemAdvise 或 cudaMemPrefetchAsync 是否调用成功。
+    std::string policy_action_error;///< 如果策略执行失败（如流冲突或设备不支持），记录具体的 CUDA 错误字符串。
+
+    // ========================================================================
+    // 3. 动态热点观测与隔离 (Dynamic Gap Watch & Hotspot Tracking)
+    // ========================================================================
+
+    bool unknown_detail_logged;     ///< 标志位：是否已将此未知内存的详细信息落盘，防止日志风暴。
+    bool gap_watch_logged;          ///< 标志位：是否已被 Gap Watch 机制捕获并记录。
+    uintptr_t gap_overlap_start;    ///< 该内存块与目标观测区间 (Gap) 发生重叠的起始绝对虚拟地址。
+    uintptr_t gap_overlap_end;      ///< 重叠区域的结束地址。
+    size_t gap_overlap_bytes;       ///< 实际落在观测热点区间内的字节数，用于计算重叠率 (Overlap Ratio)。
+    std::string gap_watch_target_class_name;  ///< 触发监控时，Gap Watch 所关注的目标内存类别。
+    std::string gap_watch_policy_action_name; ///< Gap Watch 机制为此热点区域尝试执行的提权动作（如强制预取）。
+    bool hot_gap_match;             ///< 核心高频标志：该分配是否完美命中了当前配置的活跃热点区域。
+
+    // ========================================================================
+    // 4. 后端路由与直接内存分配演进 (Backend Routing & Device Direct Stage)
+    // 用于量化 CPU-GPU 耦合问题，并在必要时绕过 UVM 直接分配纯显存
+    // ========================================================================
+
+    std::string placement_backend_name; ///< 实际使用的分配后端（当前大多为 "managed"，为演进到 "device_only" 预留）。
+    bool device_direct_eligible;    ///< 评估此内存块是否具备绕过 UVM、直接使用 cudaMalloc 的资格（取决于大小和生命周期）。
+    std::string device_direct_reason; ///< 判定是否具备绕过资格的具体原因（如 "below_min_bytes", "target_class_mismatch"）。
+    std::string cpu_access_risk;    ///< 风险评估标签：如果将其强制放置在 GPU 上，未来被 CPU 访问触发严重 Page Fault 的风险等级。
+};
 static std::unordered_map<void*, AllocationInfo> active_allocations;
 
 enum class AllocationClass {
@@ -148,7 +249,11 @@ enum class PolicyAction {
     ManagedDefault,//默认动作
     ManagedPrefetchGpu,//为阶段 1 预留,阶段 0 默认不会触发
     ManagedAdvisePrefetchGpu,//gap watch 的更激进版本：advise + prefetch
+    DeviceDirectTrace,//阶段 B：只记录 would-use-device-direct，不改变分配行为
+    DeviceDirect,//阶段 B 默认仍 trace-only，阶段 C 才会真正切换 GPU-only backend
 };
+
+static const char* allocation_class_to_string(AllocationClass alloc_class);
 
 /**
  * Get current timestamp string
@@ -255,6 +360,11 @@ static bool phase_contains(const std::string& phase, const char* needle) {
     return phase.find(needle) != std::string::npos;
 }
 
+static bool phase_starts_with(const std::string& phase,
+                              const std::string& prefix) {
+    return phase.rfind(prefix, 0) == 0;
+}
+
 static std::string trim_copy(const std::string& input) {
     size_t start = 0;
     while (start < input.size() &&
@@ -271,6 +381,36 @@ static std::string trim_copy(const std::string& input) {
     }
 
     return input.substr(start, end - start);
+}
+
+static bool comma_list_contains_phase_prefix(const std::string& csv,
+                                             const std::string& phase) {
+    if (csv.empty() || string_equals_ignore_case(csv, "any")) {
+        return true;
+    }
+
+    size_t start = 0;
+    while (start <= csv.size()) {
+        size_t comma = csv.find(',', start);
+        std::string token = trim_copy(
+            csv.substr(
+                start,
+                comma == std::string::npos ? std::string::npos : comma - start
+            )
+        );
+        if (!token.empty() && phase_starts_with(phase, token)) {
+            return true;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return false;
+}
+
+static bool is_device_direct_target_phase(const std::string& phase) {
+    return comma_list_contains_phase_prefix(device_direct_target_phases, phase);
 }
 
 static bool parse_bool_string(const std::string& value, bool* out) {
@@ -309,16 +449,32 @@ static bool parse_policy_action_string(const std::string& value,
         *out = PolicyAction::ManagedAdvisePrefetchGpu;
         return true;
     }
+    if (lowered == "device_direct_trace") {
+        *out = PolicyAction::DeviceDirectTrace;
+        return true;
+    }
+    if (lowered == "device_direct") {
+        *out = PolicyAction::DeviceDirect;
+        return true;
+    }
     return false;
 }
 
-static bool gap_watch_target_class_matches(const char* alloc_class_name) {
+static bool gap_watch_target_class_matches(AllocationClass alloc_class,
+                                           const std::string& phase) {
+    const char* alloc_class_name = allocation_class_to_string(alloc_class);
     if (!alloc_class_name || alloc_class_name[0] == '\0') {
         return false;
     }
     if (gap_watch_target_class.empty() ||
         string_equals_ignore_case(gap_watch_target_class, "any")) {
         return true;
+    }
+    if (string_equals_ignore_case(gap_watch_target_class, "gap_hot_runtime_scratch")) {
+        return is_device_direct_target_phase(phase) &&
+               (alloc_class == AllocationClass::UnknownManaged ||
+                alloc_class == AllocationClass::RuntimeScratch ||
+                alloc_class == AllocationClass::RuntimeWorkspace);
     }
     return string_equals_ignore_case(gap_watch_target_class, alloc_class_name);
 }
@@ -373,6 +529,10 @@ static const char* allocation_class_to_string(AllocationClass alloc_class) {
 
 static const char* policy_action_to_string(PolicyAction action) {
     switch (action) {
+        case PolicyAction::DeviceDirect:
+            return "device_direct";
+        case PolicyAction::DeviceDirectTrace:
+            return "device_direct_trace";
         case PolicyAction::ManagedAdvisePrefetchGpu:
             return "managed_advise_prefetch_gpu";
         case PolicyAction::ManagedPrefetchGpu:
@@ -381,6 +541,11 @@ static const char* policy_action_to_string(PolicyAction action) {
         default:
             return "managed_default";
     }
+}
+
+static bool is_device_direct_action(PolicyAction action) {
+    return action == PolicyAction::DeviceDirectTrace ||
+           action == PolicyAction::DeviceDirect;
 }
 
 static const char* size_bucket_for(size_t size) {
@@ -401,14 +566,59 @@ static uintptr_t region_end_for(uintptr_t start, size_t size) {
     return start + size - 1;
 }
 
+/**
+ * @struct GapWatchConfigSnapshot
+ * @brief 动态显存热点观测配置的“不可变快照” (Immutable Snapshot of Gap Watch Configuration)
+ * * @details
+ * 该结构体充当 Gap Watch 机制的控制平面 (Control Plane) 与数据平面 (Data Plane) 之间的契约。
+ * 系统通过轮询控制文件 (Control File)，在后台将最新的监控意图打包成此快照。
+ * 底层的 `uvm_malloc` / `uvm_free` 会直接基于此快照进行 O(1) 复杂度的重叠计算与策略路由，
+ * 从而在实现“零侵入式策略热更新”的同时，避免在 CUDA 分配关键路径上引入严重的锁竞争。
+ */
 struct GapWatchConfigSnapshot {
+    // ========================================================================
+    // 1. 空间定位与全局开关 (Spatial Targeting & Master Switch)
+    // ========================================================================
+
+    /// @brief 全局拨测开关。若为 false，分配器将完全跳过地址重叠计算，以最低开销放行。
     bool enabled;
+
+    /// @brief 监控区间的起始绝对地址（通常为虚拟地址）。
+    /// @note 在 xCoord 等软硬协同架构中，这可能对应一段被频繁触发 CPU-GPU UVM 缺页抖动的热点物理内存映射区。
     uintptr_t start;
+
+    /// @brief 监控区间的结束绝对地址。与 start 共同划定了一个“楚河汉界”。
     uintptr_t end;
+
+    /// @brief 该观测任务的可读标识符（如 "layer_0_kv_cache_hotspot"）。
+    /// @note 极具工程价值：它会被直接透传到详细日志中，方便与 eBPF 探针收集到的内核级
+    /// page fault 堆栈或 SysAI-Agent 的时序图谱进行无缝联合关联 (Join)。
     std::string name;
+
+    // ========================================================================
+    // 2. 启发式意图过滤器 (Heuristic Intent Filters)
+    // 决定哪些内存请求有资格触发干预，避免“误杀”或陷入细碎内存的追踪泥潭。
+    // ========================================================================
+
+    /// @brief 泛类型匹配标志位。若为 true，则无视内存的具体业务语义（Class），拦截区间内所有分配。
     bool all_classes;
+
+    /// @brief 尺寸噪声过滤器。只有单次申请大小 >= 此阈值（如 1MB）的内存块才会被监控。
+    /// @note 过滤掉极高频但无足轻重的 RuntimeScratch 碎片，是保障分析信噪比的关键。
     size_t min_bytes;
+
+    /// @brief 精准打击目标类别（当 all_classes = false 时生效）。
+    /// @note 例如仅针对 "KvPersistent" (KV Cache) 执行特定的监控或迁移操作，
+    /// 从而保护 "WeightPersistent" (只读权重) 不受影响。
     std::string target_class;
+
+    // ========================================================================
+    // 3. 提权干预动作 (Privilege Escalation Action)
+    // ========================================================================
+
+    /// @brief 命中观测区间且通过过滤器后，分配器需要强制重载（Override）的策略动作名称。
+    /// @note 例如，原启发式规则认为这块内存该走 "ManagedDefault"，但快照指示
+    /// 这里是高危抖动区，强制执行 "ManagedAdvisePrefetchGpu" 或尝试 "DeviceDirect"。
     std::string policy_action_name;
 };
 
@@ -548,46 +758,74 @@ static bool should_trace_gap_watch(AllocationClass alloc_class,
            alloc_class == AllocationClass::UnknownManaged;
 }
 
+/**
+ * @brief 从外部控制文件动态刷新 Gap Watch 配置 (Dynamic Configuration Hot-reload)
+ * * @details
+ * 这是一个为了在不重启 vLLM/推理服务的前提下，动态调整 UVM 观测热点而设计的轮询引擎。
+ * 由于此函数在 `uvm_malloc` 的关键路径中被调用，必须极力避免长尾延迟。
+ * 设计上采用了“三级短路机制”来降低 IO 与系统调用开销：
+ * 1. 软限流 (Time-based Throttling)：基于时钟，避免 ms 级别内的频繁 stat 调用。
+ * 2. 元数据比对 (Stat Mtime Check)：对比文件修改时间和大小，内容未变则跳过解析。
+ * 3. 内存快照 (Atomic Snapshot)：仅在配置真正变更时，才加锁更新全局状态。
+ * * @param force 是否无视时间节流阀，强制执行一次文件系统探测（通常在初始化阶段置为 true）。
+ */
 static void refresh_gap_watch_from_control_file_if_needed(bool force) {
+    // 短路检查 0：如果没有配置控制文件路径，直接退回默认状态
     if (gap_watch_control_file.empty()) {
         return;
     }
 
     auto now = std::chrono::steady_clock::now();
+
+    // ========================================================================
+    // 阶段 1：软限流机制 (Time-based Throttling)
+    // 防止高并发显存申请时，每个线程都疯狂发起文件系统调用，导致内核态开销激增。
+    // ========================================================================
     if (!force &&
         gap_watch_last_refresh_check != std::chrono::steady_clock::time_point::min()) {
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - gap_watch_last_refresh_check
         ).count();
+        // 只有当距离上次检查的时间超过 gap_watch_refresh_ms (如 250ms) 时，才放行
         if (elapsed_ms >= 0 &&
             static_cast<size_t>(elapsed_ms) < gap_watch_refresh_ms) {
             return;
         }
     }
+    // 更新最后检查时间戳（即使后续 stat 失败也需更新，避免密集重试）
     gap_watch_last_refresh_check = now;
 
+    // ========================================================================
+    // 阶段 2：文件元数据探测 (Filesystem Stat Fast-path)
+    // ========================================================================
     struct stat st {};
     if (stat(gap_watch_control_file.c_str(), &st) != 0) {
-        return;
+        return; // 文件不存在或无权限，静默返回，保持现有配置
     }
 
     uint64_t mtime_ns = stat_mtime_ns(st);
+    // 比对文件的 MTime 和 Size。只有当文件被实际修改过时，才进入昂贵的 fopen 和解析逻辑。
     if (!force && gap_watch_control_seen &&
         mtime_ns == gap_watch_control_mtime_ns &&
         st.st_size == gap_watch_control_size) {
         return;
     }
 
+    // ========================================================================
+    // 阶段 3：解析控制平面指令 (Control Plane Parsing)
+    // ========================================================================
     FILE* control = fopen(gap_watch_control_file.c_str(), "r");
     if (!control) {
         return;
     }
 
+    // 基于当前活跃的快照作为基准进行修改，保证未在文件中显式声明的字段继承旧值
     GapWatchConfigSnapshot next = current_gap_watch_config_snapshot();
     next.enabled = false;
     next.start = 0;
     next.end = 0;
 
+    // 解析状态机变量
     bool saw_enabled = false;
     bool parsed_enabled = false;
     bool parsed_all_classes = false;
@@ -597,6 +835,8 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
     bool parsed_min_bytes = false;
     bool parsed_target_class = false;
     bool parsed_policy_action = false;
+
+    // 解析缓冲变量
     bool enabled_value = false;
     bool all_classes_value = gap_watch_all_classes != 0;
     uintptr_t start_value = 0;
@@ -607,6 +847,7 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
     std::string policy_action_value = gap_watch_policy_action;
     char buffer[1024];
 
+    // 逐行解析 K-V 格式的配置文件，支持 # 注释和空行
     while (fgets(buffer, sizeof(buffer), control) != nullptr) {
         std::string line = trim_copy(buffer);
         if (line.empty() || line[0] == '#') {
@@ -620,6 +861,8 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
 
         std::string key = trim_copy(line.substr(0, eq_pos));
         std::string value = trim_copy(line.substr(eq_pos + 1));
+
+        // 路由解析指令到具体的转换函数 (支持 hex 地址、bool、size 等)
         if (key == "enabled") {
             saw_enabled = true;
             parsed_enabled = parse_bool_string(value, &enabled_value);
@@ -647,15 +890,22 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
     }
     fclose(control);
 
+    // 记录本次成功解析的元数据特征，用于下一次的短路检查
     gap_watch_control_seen = true;
     gap_watch_control_mtime_ns = mtime_ns;
     gap_watch_control_size = st.st_size;
 
     const char* reason = "control_file";
+    // 强制校验：控制文件必须至少包含清晰的 enabled 字段，否则视为无效修改，丢弃变更
     if (!saw_enabled || !parsed_enabled) {
         return;
     }
 
+    // ========================================================================
+    // 阶段 4：配置快照构建与应用 (Snapshot Construction & Commit)
+    // ========================================================================
+
+    // 合并解析到的新值与系统旧值
     next.name = parsed_name ? name_value : gap_watch_name;
     next.all_classes = parsed_all_classes ? all_classes_value :
         (gap_watch_all_classes != 0);
@@ -665,6 +915,7 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
     next.policy_action_name = parsed_policy_action ? policy_action_value :
         gap_watch_policy_action;
 
+    // 场景 A：被用户手动置为 disabled，清空监控区间并提交
     if (!enabled_value) {
         next.enabled = false;
         next.start = 0;
@@ -674,6 +925,7 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
         return;
     }
 
+    // 场景 B：非法地址区间（如 end < start），自动执行熔断并降级为 disabled
     if (!parsed_start || !parsed_end || end_value < start_value) {
         next.enabled = false;
         next.start = 0;
@@ -683,10 +935,12 @@ static void refresh_gap_watch_from_control_file_if_needed(bool force) {
         return;
     }
 
+    // 场景 C：合法配置，正式装载新的监控边界
     next.enabled = true;
     next.start = start_value;
     next.end = end_value;
 
+    // 获取日志与配置更新锁，原子性地提交给全局数据平面
     std::lock_guard<std::mutex> lock(log_mutex);
     apply_gap_watch_config_locked(next, "control_file", reason);
 }
@@ -728,7 +982,7 @@ static AllocationClass classify_allocation(const std::string& phase,
     // 4. 正式推理阶段：根据大小进一步细分
     // 当 phase 被设置为 "enabled" 时，代表模型已经开始处理用户请求。
     // 此时无法仅凭阶段名区分意图，必须引入【尺寸启发式 (Size Heuristics)】。
-    if (phase == "enabled") {
+    if (phase == "enabled" || phase.rfind("enabled:", 0) == 0) {
         // 4.1 运行时临时碎片 (1MB ~ 16MB)
         // 通常是一些算子的中间极短命输出，或者很小的临时变量。
         if (size >= 1 * 1024 * 1024 && size <= 16 * 1024 * 1024) {
@@ -788,6 +1042,7 @@ static PolicyAction choose_policy_action(AllocationClass alloc_class,
 }
 
 static PolicyAction choose_gap_watch_policy_action(AllocationClass alloc_class,
+                                                   const std::string& phase,
                                                    size_t size,
                                                    int device,
                                                    size_t gap_overlap_bytes,
@@ -804,8 +1059,7 @@ static PolicyAction choose_gap_watch_policy_action(AllocationClass alloc_class,
         return PolicyAction::ManagedDefault;
     }
 
-    const char* alloc_class_name = allocation_class_to_string(alloc_class);
-    bool class_match = gap_watch_target_class_matches(alloc_class_name);
+    bool class_match = gap_watch_target_class_matches(alloc_class, phase);
     if (class_match_out) {
         *class_match_out = class_match;
     }
@@ -913,6 +1167,20 @@ static void init_log_file() {
             "VLLM_UVM_GAP_WATCH_REFRESH_MS",
             gap_watch_refresh_ms
         );
+        device_direct_enable =
+            read_bool_from_env("VLLM_UVM_DEVICE_DIRECT_ENABLE", false) ? 1 : 0;
+        device_direct_min_bytes = read_size_from_env(
+            "VLLM_UVM_DEVICE_DIRECT_MIN_BYTES",
+            device_direct_min_bytes
+        );
+        device_direct_max_bytes = read_size_from_env(
+            "VLLM_UVM_DEVICE_DIRECT_MAX_BYTES",
+            device_direct_max_bytes
+        );
+        device_direct_target_phases = read_string_from_env(
+            "VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES",
+            device_direct_target_phases.c_str()
+        );
         uintptr_t parsed_gap_start = 0;
         uintptr_t parsed_gap_end = 0;
         if (read_hex_u64_from_env("VLLM_UVM_GAP_WATCH_START", &parsed_gap_start) &&
@@ -954,7 +1222,9 @@ static void init_log_file() {
                 "gap_watch_start=0x%llx gap_watch_end=0x%llx "
                 "gap_watch_all_classes=%d gap_watch_min_bytes=%zu "
                 "gap_watch_target_class=%s gap_watch_policy_action=%s "
-                "gap_watch_control_file=%s gap_watch_refresh_ms=%zu\n",
+                "gap_watch_control_file=%s gap_watch_refresh_ms=%zu "
+                "device_direct_enable=%d device_direct_min_bytes=%zu "
+                "device_direct_max_bytes=%zu device_direct_target_phases=%s\n",
                 timestamp, policy_enabled, policy_mode.c_str(),
                 policy_warmup_prefetch_enabled, policy_warmup_prefetch_min_bytes,
                 policy_warmup_advise_gpu,
@@ -969,7 +1239,11 @@ static void init_log_file() {
                 gap_watch_target_class.c_str(),
                 gap_watch_policy_action.c_str(),
                 gap_watch_control_file.empty() ? "none" : gap_watch_control_file.c_str(),
-                gap_watch_refresh_ms
+                gap_watch_refresh_ms,
+                device_direct_enable,
+                device_direct_min_bytes,
+                device_direct_max_bytes,
+                device_direct_target_phases.c_str()
             );
             fprintf(log_file, "========================================\n");
 
@@ -1130,6 +1404,11 @@ static void trace_policy_event(void* ptr,
                                bool gap_watch_class_match,
                                size_t gap_overlap_bytes,
                                const char* size_bucket,
+                               const char* placement_backend,
+                               bool device_direct_eligible,
+                               const char* device_direct_reason,
+                               const char* cpu_access_risk,
+                               bool hot_gap_match,
                                bool action_success,
                                const char* action_error) {
     if (!log_file || !policy_enabled) return;
@@ -1149,7 +1428,9 @@ static void trace_policy_event(void* ptr,
         "size_bytes=%zu size_bucket=%s device=%d phase=%s "
         "predicted_class=%s action=%s policy_source=%s "
         "gap_watch_class_match=%d gap_overlap_bytes=%zu "
-        "action_success=%d action_error=%s\n",
+        "action_success=%d action_error=%s placement_backend=%s "
+        "device_direct_eligible=%d device_direct_reason=%s "
+        "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
         alloc_num,
@@ -1165,7 +1446,12 @@ static void trace_policy_event(void* ptr,
         gap_watch_class_match ? 1 : 0,
         gap_overlap_bytes,
         action_success ? 1 : 0,
-        safe_error
+        safe_error,
+        placement_backend ? placement_backend : "managed",
+        device_direct_eligible ? 1 : 0,
+        device_direct_reason ? device_direct_reason : "not_requested",
+        cpu_access_risk ? cpu_access_risk : "unknown",
+        hot_gap_match ? 1 : 0
     );
     fflush(log_file);
 }
@@ -1232,7 +1518,12 @@ static void trace_gap_watch_alloc_event(void* ptr,
                                         cudaStream_t stream,
                                         uintptr_t overlap_start,
                                         uintptr_t overlap_end,
-                                        size_t overlap_bytes) {
+                                        size_t overlap_bytes,
+                                        const char* placement_backend,
+                                        bool device_direct_eligible,
+                                        const char* device_direct_reason,
+                                        const char* cpu_access_risk,
+                                        bool hot_gap_match) {
     if (!log_file) return;
 
     std::lock_guard<std::mutex> lock(log_mutex);
@@ -1257,7 +1548,9 @@ static void trace_gap_watch_alloc_event(void* ptr,
         "ptr=0x%llx end=0x%llx size_bytes=%zu size_bucket=%s device=%d phase=%s "
         "predicted_class=%s action=%s policy_source=%s "
         "gap_watch_target_class=%s gap_watch_class_match=%d stream=0x%llx overlap_start=0x%llx "
-        "overlap_end=0x%llx overlap_bytes=%zu overlap_ratio_of_watch=%.6f\n",
+        "overlap_end=0x%llx overlap_bytes=%zu overlap_ratio_of_watch=%.6f "
+        "placement_backend=%s device_direct_eligible=%d device_direct_reason=%s "
+        "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
         alloc_num,
@@ -1277,7 +1570,12 @@ static void trace_gap_watch_alloc_event(void* ptr,
         static_cast<unsigned long long>(overlap_start),
         static_cast<unsigned long long>(overlap_end),
         overlap_bytes,
-        gap_ratio
+        gap_ratio,
+        placement_backend ? placement_backend : "managed",
+        device_direct_eligible ? 1 : 0,
+        device_direct_reason ? device_direct_reason : "not_requested",
+        cpu_access_risk ? cpu_access_risk : "unknown",
+        hot_gap_match ? 1 : 0
     );
     fflush(log_file);
 }
@@ -1316,7 +1614,9 @@ static void trace_gap_watch_free_event(void* ptr,
         "alloc_policy_source=%s alloc_policy_success=%d alloc_policy_error=%s "
         "gap_watch_target_class=%s gap_watch_policy_action=%s "
         "overlap_start=0x%llx overlap_end=0x%llx overlap_bytes=%zu "
-        "overlap_ratio_of_watch=%.6f lifetime_s=%.6f total_bytes=%zu\n",
+        "overlap_ratio_of_watch=%.6f lifetime_s=%.6f total_bytes=%zu "
+        "placement_backend=%s device_direct_eligible=%d device_direct_reason=%s "
+        "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
         free_num,
@@ -1340,7 +1640,12 @@ static void trace_gap_watch_free_event(void* ptr,
         info->gap_overlap_bytes,
         gap_ratio,
         lifetime_seconds,
-        current_total
+        current_total,
+        info->placement_backend_name.c_str(),
+        info->device_direct_eligible ? 1 : 0,
+        info->device_direct_reason.c_str(),
+        info->cpu_access_risk.c_str(),
+        info->hot_gap_match ? 1 : 0
     );
     fflush(log_file);
 }
@@ -1451,14 +1756,6 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         log_allocation("ALLOC", size, alloc_count, current, peak_allocated.load(), device);
     }
 
-    // 结构化的详细追踪日志，用于后续的离线分析或 eBPF 性能重放关联
-    if (size >= trace_min_bytes) {
-        trace_allocation_event(
-            ptr, static_cast<size_t>(size), alloc_count, current, 
-            peak_allocated.load(), device, phase_snapshot
-        );
-    }
-
     // 标准错误输出 (stderr) 回显，通常用于本地调试
     if (verbose_logging && size > 100 * 1024 * 1024) {
         fprintf(stderr, "[vLLM UVM] Alloc #%zu: %.2f MB (total: %.2f GB, peak: %.2f GB)\n",
@@ -1509,6 +1806,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     const char* policy_source = "base_policy";
     PolicyAction gap_watch_policy_action = choose_gap_watch_policy_action(
         alloc_class,
+        phase_snapshot,
         static_cast<size_t>(size),
         device,
         gap_overlap_bytes,
@@ -1519,6 +1817,93 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         (gap_watch_policy_action != PolicyAction::ManagedDefault)
             ? gap_watch_policy_action
             : base_policy_action;
+    bool hot_gap_match = gap_watch_enabled && gap_overlap_bytes > 0;
+    bool device_direct_requested = is_device_direct_action(policy_action);
+    bool device_direct_phase_match = is_device_direct_target_phase(phase_snapshot);
+    const char* placement_backend = "managed";
+    const char* cpu_access_risk = device_direct_phase_match
+        ? "low_no_cpu_access_evidence_runtime_phase"
+        : "unknown";
+    const char* device_direct_reason = "not_requested";
+    bool device_direct_eligible = false;
+
+    if (device_direct_requested) {
+        if (device < 0) {
+            device_direct_reason = "invalid_device";
+        } else if (!hot_gap_match) {
+            device_direct_reason = "no_hot_gap_match";
+        } else if (!gap_watch_class_match) {
+            device_direct_reason = "target_class_mismatch";
+        } else if (!device_direct_phase_match) {
+            device_direct_reason = "phase_not_allowed";
+        } else if (static_cast<size_t>(size) < device_direct_min_bytes) {
+            device_direct_reason = "below_min_bytes";
+        } else if (static_cast<size_t>(size) > device_direct_max_bytes) {
+            device_direct_reason = "above_max_bytes";
+        } else {
+            device_direct_eligible = true;
+            if (policy_action == PolicyAction::DeviceDirect && device_direct_enable) {
+                device_direct_reason = "device_direct_enabled";
+            } else if (policy_action == PolicyAction::DeviceDirectTrace) {
+                device_direct_reason = "trace_action_only";
+            } else {
+                device_direct_reason = "trace_only_not_enabled";
+            }
+        }
+        device_direct_trace_allocs.fetch_add(1);
+        device_direct_requested_bytes.fetch_add(static_cast<size_t>(size));
+        if (device_direct_eligible) {
+            device_direct_eligible_allocs.fetch_add(1);
+        }
+    }
+
+    if (device_direct_eligible &&
+        policy_action == PolicyAction::DeviceDirect &&
+        device_direct_enable &&
+        ptr != NULL) {
+        void* device_ptr = NULL;
+        int previous_device = -1;
+        cudaError_t get_device_err = cudaGetDevice(&previous_device);
+        if (device >= 0) {
+            cudaSetDevice(device);
+        }
+        cudaError_t device_alloc_err = cudaMalloc(&device_ptr, static_cast<size_t>(size));
+        if (get_device_err == cudaSuccess && previous_device >= 0) {
+            cudaSetDevice(previous_device);
+        }
+
+        if (device_alloc_err == cudaSuccess && device_ptr != NULL) {
+            cudaError_t free_candidate_err = cudaFree(ptr);
+            if (free_candidate_err == cudaSuccess) {
+                ptr = device_ptr;
+                placement_backend = "device_direct";
+                policy_action_success = true;
+                policy_action_error = "none";
+                device_direct_reason = "device_direct_enabled";
+                device_direct_actual_allocs.fetch_add(1);
+                device_direct_actual_bytes.fetch_add(static_cast<size_t>(size));
+            } else {
+                cudaFree(device_ptr);
+                policy_action_success = false;
+                policy_action_error = cudaGetErrorString(free_candidate_err);
+                device_direct_reason = "managed_candidate_free_failed";
+                device_direct_fallback_allocs.fetch_add(1);
+            }
+        } else {
+            policy_action_success = false;
+            policy_action_error = cudaGetErrorString(device_alloc_err);
+            device_direct_reason = "device_malloc_failed_fallback_managed";
+            device_direct_fallback_allocs.fetch_add(1);
+        }
+    }
+
+    // 结构化的详细追踪日志，用于后续的离线分析或 eBPF 性能重放关联
+    if (size >= trace_min_bytes) {
+        trace_allocation_event(
+            ptr, static_cast<size_t>(size), alloc_count, current,
+            peak_allocated.load(), device, phase_snapshot
+        );
+    }
 
     if (gap_overlap_bytes > 0) {
         gap_watch_overlap_allocs.fetch_add(1);
@@ -1529,7 +1914,8 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     }
     bool store_active_info =
         static_cast<size_t>(size) >= trace_min_bytes ||
-        log_unknown_detail || log_gap_watch;
+        log_unknown_detail || log_gap_watch ||
+        strcmp(placement_backend, "device_direct") == 0;
 
     // 7.1 记录活跃分配元数据，供 free / gap watch / unknown detail 使用
     if (store_active_info) {
@@ -1540,12 +1926,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             alloc_count,
             phase_snapshot,
             alloc_elapsed,
+            size_bucket,
             allocation_class_to_string(alloc_class),
             policy_action_to_string(policy_action),
             policy_source,
             true,
             "none",
-            size_bucket,
             log_unknown_detail,
             log_gap_watch,
             gap_overlap_start,
@@ -1553,6 +1939,11 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             gap_overlap_bytes,
             gap_watch_target_class,
             policy_action_to_string(gap_watch_policy_action),
+            hot_gap_match,
+            placement_backend,
+            device_direct_eligible,
+            device_direct_reason,
+            cpu_access_risk,
         };
     }
 
@@ -1620,6 +2011,11 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             it->second.gap_watch_target_class_name = gap_watch_target_class;
             it->second.gap_watch_policy_action_name =
                 policy_action_to_string(gap_watch_policy_action);
+            it->second.placement_backend_name = placement_backend;
+            it->second.device_direct_eligible = device_direct_eligible;
+            it->second.device_direct_reason = device_direct_reason;
+            it->second.cpu_access_risk = cpu_access_risk;
+            it->second.hot_gap_match = hot_gap_match;
         }
     }
 
@@ -1632,6 +2028,11 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             gap_watch_class_match,
             gap_overlap_bytes,
             size_bucket,
+            placement_backend,
+            device_direct_eligible,
+            device_direct_reason,
+            cpu_access_risk,
+            hot_gap_match,
             policy_action_success, policy_action_error
         );
     }
@@ -1667,7 +2068,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             stream,
             gap_overlap_start,
             gap_overlap_end,
-            gap_overlap_bytes
+            gap_overlap_bytes,
+            placement_backend,
+            device_direct_eligible,
+            device_direct_reason,
+            cpu_access_risk,
+            hot_gap_match
         );
     }
 
@@ -1675,7 +2081,8 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     // 如果系统开启了全局预取 (enable_prefetch=1)，且策略引擎没有覆盖该内存块，则执行普适性预取。
     // 在生产环境的推理服务中，由于 PCIe 带宽的脆弱性，此选项通常不建议保持常开。
     if (enable_prefetch && device >= 0 && ptr != NULL &&
-        policy_action != PolicyAction::ManagedPrefetchGpu) {
+        policy_action != PolicyAction::ManagedPrefetchGpu &&
+        policy_action != PolicyAction::ManagedAdvisePrefetchGpu) {
         cudaMemPrefetchAsync(ptr, size, device, stream);
     }
 
@@ -1714,6 +2121,11 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
                 has_info = true;
                 active_allocations.erase(it);
             }
+        }
+        if (has_info &&
+            info.placement_backend_name == "device_direct" &&
+            err == cudaSuccess) {
+            device_direct_free_success_allocs.fetch_add(1);
         }
 
         // Log large frees (> 100MB) to file
@@ -1874,6 +2286,13 @@ void uvm_close_log(void) {
     fprintf(log_file, "  Gap-watch policy applied overlap bytes: %zu\n", gap_watch_policy_applied_overlap_bytes.load());
     fprintf(log_file, "  Gap-watch policy success: %zu\n", gap_watch_policy_success_allocs.load());
     fprintf(log_file, "  Gap-watch policy failed: %zu\n", gap_watch_policy_failed_allocs.load());
+    fprintf(log_file, "  Device-direct trace allocations: %zu\n", device_direct_trace_allocs.load());
+    fprintf(log_file, "  Device-direct eligible allocations: %zu\n", device_direct_eligible_allocs.load());
+    fprintf(log_file, "  Device-direct requested bytes: %zu\n", device_direct_requested_bytes.load());
+    fprintf(log_file, "  Device-direct actual allocations: %zu\n", device_direct_actual_allocs.load());
+    fprintf(log_file, "  Device-direct actual bytes: %zu\n", device_direct_actual_bytes.load());
+    fprintf(log_file, "  Device-direct fallback allocations: %zu\n", device_direct_fallback_allocs.load());
+    fprintf(log_file, "  Device-direct free success: %zu\n", device_direct_free_success_allocs.load());
     fprintf(log_file, "========================================\n\n");
 
     fflush(log_file);

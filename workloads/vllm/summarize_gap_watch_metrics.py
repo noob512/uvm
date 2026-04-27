@@ -39,6 +39,21 @@ TRACE_GAP_FREE_RE = re.compile(
     r".* overlap_bytes=(?P<overlap_bytes>\d+) .* lifetime_s=(?P<lifetime_s>-?[0-9.]+)"
 )
 SUMMARY_KEY_RE = re.compile(r"^\s{2}(?P<key>[^:]+): (?P<value>.+)$")
+KV_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>[^ ]+)")
+
+
+def parse_kv_fields(line: str) -> dict[str, str]:
+    return {
+        match.group("key"): match.group("value").strip()
+        for match in KV_RE.finditer(line)
+    }
+
+
+def counter_ratios(counter: Counter[str]) -> dict[str, float]:
+    total = sum(counter.values())
+    if total <= 0:
+        return {}
+    return {key: value / total for key, value in counter.items()}
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,9 +92,14 @@ def main() -> int:
     phase_counter: Counter[str] = Counter()
     target_class_counter: Counter[str] = Counter()
     policy_source_counter: Counter[str] = Counter()
+    placement_backend_counter: Counter[str] = Counter()
+    device_direct_reason_counter: Counter[str] = Counter()
     lifetime_values: list[float] = []
     session_summary: dict[str, str] = {}
     in_summary = False
+    device_direct_trace_records = 0
+    device_direct_eligible_records = 0
+    hot_gap_match_records = 0
 
     with allocator_log.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -101,6 +121,7 @@ def main() -> int:
 
             gap_alloc_match = TRACE_GAP_ALLOC_RE.search(line)
             if gap_alloc_match is not None:
+                kv_fields = parse_kv_fields(line)
                 gap_overlap_records += 1
                 overlap_bytes = int(gap_alloc_match.group("overlap_bytes"))
                 gap_overlap_bytes += overlap_bytes
@@ -115,6 +136,16 @@ def main() -> int:
                 action_counter[action] += 1
                 policy_source_counter[policy_source] += 1
                 target_class_counter[target_class] += 1
+                placement_backend_counter[kv_fields.get("placement_backend", "unknown")] += 1
+                device_direct_reason_counter[
+                    kv_fields.get("device_direct_reason", "not_recorded")
+                ] += 1
+                if action in {"device_direct_trace", "device_direct"}:
+                    device_direct_trace_records += 1
+                if kv_fields.get("device_direct_eligible") == "1":
+                    device_direct_eligible_records += 1
+                if kv_fields.get("hot_gap_match") == "1":
+                    hot_gap_match_records += 1
                 if class_match:
                     class_match_records += 1
                 if policy_source == "gap_watch_policy" and action != "managed_default":
@@ -150,8 +181,17 @@ def main() -> int:
         "policy_source_counts": dict(policy_source_counter),
         "predicted_class_counts": dict(class_counter),
         "phase_counts": dict(phase_counter),
+        "phase_record_ratios": counter_ratios(phase_counter),
         "action_counts": dict(action_counter),
         "target_class_counts": dict(target_class_counter),
+        "placement_backend_counts": dict(placement_backend_counter),
+        "device_direct_reason_counts": dict(device_direct_reason_counter),
+        "device_direct_trace_records": device_direct_trace_records,
+        "device_direct_eligible_records": device_direct_eligible_records,
+        "device_direct_actual_records": placement_backend_counter.get(
+            "device_direct", 0
+        ),
+        "hot_gap_match_records": hot_gap_match_records,
         "median_lifetime_s": (
             sorted(lifetime_values)[len(lifetime_values) // 2]
             if lifetime_values
@@ -175,6 +215,12 @@ def main() -> int:
     print(f"- dominant_phase={summary['dominant_phase']}")
     print(f"- dominant_action={summary['dominant_action']}")
     print(f"- dominant_target_class={summary['dominant_target_class']}")
+    print(f"- phase_record_ratios={summary['phase_record_ratios']}")
+    print(f"- placement_backend_counts={summary['placement_backend_counts']}")
+    print(f"- device_direct_trace_records={device_direct_trace_records}")
+    print(f"- device_direct_eligible_records={device_direct_eligible_records}")
+    print(f"- device_direct_actual_records={summary['device_direct_actual_records']}")
+    print(f"- hot_gap_match_records={hot_gap_match_records}")
     print(f"- median_lifetime_s={summary['median_lifetime_s']}")
     return 0
 

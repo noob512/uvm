@@ -269,6 +269,21 @@ def uvm_allocation_phase(phase: str):
         _set_uvm_phase(restored)
 
 
+@contextmanager
+def uvm_enabled_allocation_phase(phase: str):
+    """Attach a finer phase only while serving is in enabled mode."""
+    if not _uvm_enabled or _uvm_lib is None:
+        yield
+        return
+
+    current_phase = _uvm_phase_stack[-1] if _uvm_phase_stack else "enabled"
+    if current_phase == "enabled" or current_phase.startswith("enabled:"):
+        with uvm_allocation_phase(phase):
+            yield
+    else:
+        yield
+
+
 def get_uvm_stats() -> dict:
     """
     Get UVM memory statistics.

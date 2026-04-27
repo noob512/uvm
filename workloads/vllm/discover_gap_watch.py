@@ -130,7 +130,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--policy-action-override",
         default=None,
-        choices=("observe", "prefetch", "advise_prefetch"),
+        choices=(
+            "observe",
+            "prefetch",
+            "advise_prefetch",
+            "device_direct_trace",
+            "device_direct",
+        ),
         help="Override the recommended policy action written to the control file.",
     )
     parser.add_argument(
@@ -251,13 +257,19 @@ def classify_gap_kind_from_allocator(
         for line in handle:
             policy_match = TRACE_POLICY_RE.search(line)
             if policy_match is not None:
-                start = int(policy_match.group("ptr"), 16)
-                end = int(policy_match.group("end"), 16)
-                overlap_start = max(gap_start, start)
-                overlap_end = min(gap_end, end)
-                if overlap_start > overlap_end:
-                    continue
-                overlap_bytes = overlap_end - overlap_start + 1
+                logged_overlap_bytes = policy_match.group("gap_overlap_bytes")
+                if logged_overlap_bytes is not None:
+                    overlap_bytes = int(logged_overlap_bytes)
+                    if overlap_bytes <= 0:
+                        continue
+                else:
+                    start = int(policy_match.group("ptr"), 16)
+                    end = int(policy_match.group("end"), 16)
+                    overlap_start = max(gap_start, start)
+                    overlap_end = min(gap_end, end)
+                    if overlap_start > overlap_end:
+                        continue
+                    overlap_bytes = overlap_end - overlap_start + 1
                 alloc_id = int(policy_match.group("alloc_id"))
                 predicted_class = policy_match.group("predicted_class")
                 phase = policy_match.group("phase")
@@ -286,9 +298,27 @@ def classify_gap_kind_from_allocator(
     recommended_policy_action = "prefetch"
 
     median_lifetime_s = None
+    p95_lifetime_s = None
     if lifetime_by_alloc_id:
         ordered = sorted(lifetime_by_alloc_id.values())
         median_lifetime_s = ordered[len(ordered) // 2]
+        p95_lifetime_s = ordered[max(len(ordered) - 1, 0) * 95 // 100]
+
+    dominant_is_runtime_phase = (
+        dominant_phase == "enabled"
+        or (isinstance(dominant_phase, str) and dominant_phase.startswith("enabled:"))
+    )
+    if (
+        dominant_is_runtime_phase
+        and dominant_predicted_class in {
+            "unknown_managed",
+            "runtime_scratch",
+            "runtime_workspace",
+        }
+        and median_lifetime_s is not None
+        and median_lifetime_s < 0.01
+    ):
+        recommended_target_class = "gap_hot_runtime_scratch"
 
     if dominant_predicted_class in {"runtime_scratch", "runtime_workspace"}:
         recommended_policy_action = (
@@ -310,6 +340,7 @@ def classify_gap_kind_from_allocator(
         "predicted_class_counts": dict(class_counts),
         "predicted_class_overlap_bytes": dict(overlap_bytes_by_class),
         "median_lifetime_s": median_lifetime_s,
+        "p95_lifetime_s": p95_lifetime_s,
     }
 
 

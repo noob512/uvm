@@ -104,6 +104,8 @@ observe -> managed_prefetch_gpu -> device_direct_trace -> device_direct
 
 ## 4. 阶段 B：新增 `device_direct` 动作，但默认 trace-only
 
+状态：已实现。详细实现见 [vllm_uvm_device_direct_stage_b_implementation.md](/home/ubuntu/nvidia-uvm-gpu/docs/vllm_uvm_device_direct_stage_b_implementation.md)。
+
 ### 4.1 目标
 
 先让 allocator 能表达 `device_direct`，但不改变实际分配行为。

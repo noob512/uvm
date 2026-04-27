@@ -15,6 +15,7 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
+from vllm.device_allocator.uvm import uvm_enabled_allocation_phase
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -1743,7 +1744,8 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(hidden_states, router_logits)
+        with uvm_enabled_allocation_phase("enabled:moe"):
+            return self.forward_native(hidden_states, router_logits)
 
     def forward_impl_chunked(
         self,
@@ -2097,7 +2099,8 @@ def moe_forward(
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     assert self.shared_experts is None
-    return self.forward_impl(hidden_states, router_logits)
+    with uvm_enabled_allocation_phase("enabled:moe"):
+        return self.forward_impl(hidden_states, router_logits)
 
 
 def moe_forward_fake(
@@ -2125,7 +2128,8 @@ def moe_forward_shared(
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     assert self.shared_experts is not None
-    return self.forward_impl(hidden_states, router_logits)
+    with uvm_enabled_allocation_phase("enabled:moe"):
+        return self.forward_impl(hidden_states, router_logits)
 
 
 def moe_forward_shared_fake(

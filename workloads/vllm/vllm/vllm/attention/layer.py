@@ -19,6 +19,7 @@ from vllm.attention.utils.kv_transfer_utils import maybe_transfer_kv_layer
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.multimodal import MultiModalConfig
 from vllm.config.vllm import VllmConfig
+from vllm.device_allocator.uvm import uvm_enabled_allocation_phase
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -351,62 +352,73 @@ class Attention(nn.Module, AttentionLayerBase):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
-        if self.calculate_kv_scales:
-            torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
-        output_dtype = query.dtype
-        if self.query_quant is not None:
-            # quantizing with a simple torch operation enables
-            # torch.compile to fuse this into previous ops
-            # which reduces overheads during decoding.
-            # Otherwise queries are quantized using custom ops
-            # which causes decoding overheads
-            assert self.kv_cache_dtype in {"fp8", "fp8_e4m3"}
-
-            # check if query quantization is supported
-            if self.impl.supports_quant_query_input():
-                query, _ = self.query_quant(query, self._q_scale)
-
-        if self.use_output:
-            output_shape = output_shape if output_shape is not None else query.shape
-            output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
-            hidden_size = output_shape[-1]
-            # Reshape the query, key, and value tensors.
-            # NOTE(woosuk): We do this outside the custom op to minimize the
-            # CPU overheads from the non-CUDA-graph regions.
-            query = query.view(-1, self.num_heads, self.head_size)
-            output = output.view(-1, self.num_heads, self.head_size)
-            if key is not None:
-                key = key.view(-1, self.num_kv_heads, self.head_size)
-            if value is not None:
-                value = value.view(-1, self.num_kv_heads, self.head_size)
-            if self.use_direct_call:
-                forward_context: ForwardContext = get_forward_context()
-                attn_metadata = forward_context.attn_metadata
-                if isinstance(attn_metadata, dict):
-                    attn_metadata = attn_metadata[self.layer_name]
-                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                self.impl.forward(
-                    self, query, key, value, self_kv_cache, attn_metadata, output=output
-                )
-            else:
-                torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name
-                )
-            return output.view(-1, hidden_size)
-        else:
-            if self.use_direct_call:
-                forward_context = get_forward_context()
-                attn_metadata = forward_context.attn_metadata
-                if isinstance(attn_metadata, dict):
-                    attn_metadata = attn_metadata[self.layer_name]
-                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                return self.impl.forward(
-                    self, query, key, value, self_kv_cache, attn_metadata
-                )
-            else:
-                return torch.ops.vllm.unified_attention(
+        with uvm_enabled_allocation_phase("enabled:attention"):
+            if self.calculate_kv_scales:
+                torch.ops.vllm.maybe_calc_kv_scales(
                     query, key, value, self.layer_name
                 )
+            output_dtype = query.dtype
+            if self.query_quant is not None:
+                # quantizing with a simple torch operation enables
+                # torch.compile to fuse this into previous ops
+                # which reduces overheads during decoding.
+                # Otherwise queries are quantized using custom ops
+                # which causes decoding overheads
+                assert self.kv_cache_dtype in {"fp8", "fp8_e4m3"}
+
+                # check if query quantization is supported
+                if self.impl.supports_quant_query_input():
+                    query, _ = self.query_quant(query, self._q_scale)
+
+            if self.use_output:
+                output_shape = output_shape if output_shape is not None else query.shape
+                output = torch.empty(
+                    output_shape, dtype=output_dtype, device=query.device
+                )
+                hidden_size = output_shape[-1]
+                # Reshape the query, key, and value tensors.
+                # NOTE(woosuk): We do this outside the custom op to minimize the
+                # CPU overheads from the non-CUDA-graph regions.
+                query = query.view(-1, self.num_heads, self.head_size)
+                output = output.view(-1, self.num_heads, self.head_size)
+                if key is not None:
+                    key = key.view(-1, self.num_kv_heads, self.head_size)
+                if value is not None:
+                    value = value.view(-1, self.num_kv_heads, self.head_size)
+                if self.use_direct_call:
+                    forward_context: ForwardContext = get_forward_context()
+                    attn_metadata = forward_context.attn_metadata
+                    if isinstance(attn_metadata, dict):
+                        attn_metadata = attn_metadata[self.layer_name]
+                    self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                    self.impl.forward(
+                        self,
+                        query,
+                        key,
+                        value,
+                        self_kv_cache,
+                        attn_metadata,
+                        output=output,
+                    )
+                else:
+                    torch.ops.vllm.unified_attention_with_output(
+                        query, key, value, output, self.layer_name
+                    )
+                return output.view(-1, hidden_size)
+            else:
+                if self.use_direct_call:
+                    forward_context = get_forward_context()
+                    attn_metadata = forward_context.attn_metadata
+                    if isinstance(attn_metadata, dict):
+                        attn_metadata = attn_metadata[self.layer_name]
+                    self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                    return self.impl.forward(
+                        self, query, key, value, self_kv_cache, attn_metadata
+                    )
+                else:
+                    return torch.ops.vllm.unified_attention(
+                        query, key, value, self.layer_name
+                    )
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)

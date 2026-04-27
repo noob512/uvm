@@ -49,7 +49,10 @@ from vllm.distributed.parallel_state import (
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
-from vllm.device_allocator.uvm import uvm_allocation_phase
+from vllm.device_allocator.uvm import (
+    uvm_allocation_phase,
+    uvm_enabled_allocation_phase,
+)
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -2548,23 +2551,43 @@ class GPUModelRunner(
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        if spec_decode_metadata is None:
-            # Update output token ids with tokens sampled in last step
-            # if async scheduling and required by current sampling params.
-            self.input_batch.update_async_output_token_ids()
-            return self.sampler(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
+        with uvm_enabled_allocation_phase("enabled:sampler"):
+            if spec_decode_metadata is None:
+                # Update output token ids with tokens sampled in last step
+                # if async scheduling and required by current sampling params.
+                self.input_batch.update_async_output_token_ids()
+                return self.sampler(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                )
 
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
         self._update_states_after_model_execute(sampler_output.sampled_token_ids)
         return sampler_output
+
+    def _uvm_enabled_step_phase(self, scheduler_output: "SchedulerOutput") -> str:
+        """Return a finer UVM phase for the current enabled serving step."""
+        if scheduler_output.total_num_scheduled_tokens <= 0:
+            return "enabled:idle_step"
+
+        token_counts = tuple(scheduler_output.num_scheduled_tokens.values())
+        has_prefill_like_work = bool(scheduler_output.scheduled_new_reqs) or any(
+            count > self.uniform_decode_query_len for count in token_counts
+        )
+        has_decode_like_work = any(
+            0 < count <= self.uniform_decode_query_len for count in token_counts
+        )
+
+        if has_prefill_like_work and has_decode_like_work:
+            return "enabled:mixed_step"
+        if has_prefill_like_work:
+            return "enabled:prefill_step"
+        return "enabled:decode_step"
 
     def _bookkeeping_sync(
         self,
@@ -2900,7 +2923,9 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        enabled_step_phase = self._uvm_enabled_step_phase(scheduler_output)
         with (
+            uvm_allocation_phase(enabled_step_phase),
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2913,15 +2938,19 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            with uvm_enabled_allocation_phase("enabled:model_forward"):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+        with (
+            uvm_allocation_phase(enabled_step_phase),
+            record_function_or_nullcontext("gpu_model_runner: postprocess"),
+        ):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -2948,7 +2977,8 @@ class GPUModelRunner(
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                with uvm_enabled_allocation_phase("enabled:compute_logits"):
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2967,11 +2997,13 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    with uvm_enabled_allocation_phase("enabled:compute_logits"):
+                        logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
-                    model_output_broadcast_data["logits"] = logits.contiguous()
+                    with uvm_enabled_allocation_phase("enabled:logits"):
+                        model_output_broadcast_data["logits"] = logits.contiguous()
 
                 broadcasted = get_pp_group().broadcast_tensor_dict(
                     model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
@@ -3033,7 +3065,10 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
+        with (
+            uvm_allocation_phase(self._uvm_enabled_step_phase(scheduler_output)),
+            record_function_or_nullcontext("gpu_model_runner: sample"),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self.input_batch.prev_sampled_token_ids = None
@@ -4004,7 +4039,8 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            with uvm_enabled_allocation_phase("enabled:compute_logits"):
+                logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
@@ -4012,10 +4048,11 @@ class GPUModelRunner(
             tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
 
             # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+            with uvm_enabled_allocation_phase("enabled:logits"):
+                logprobs = self.sampler.compute_logprobs(logits)
+                token_ids, logprobs, ranks = self.sampler.gather_logprobs(
+                    logprobs, num_prompt_logprobs, tgt_token_ids
+                )
 
             # Transfer GPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)
@@ -4410,42 +4447,50 @@ class GPUModelRunner(
     ) -> torch.Tensor:
         # The dummy hidden states may contain special values,
         # like `inf` or `nan`.
-        # To avoid breaking the sampler, we use a random tensor here instead.
-        hidden_states = torch.rand_like(hidden_states)
+        # To avoid breaking the sampler, overwrite the existing warmup buffer
+        # in-place instead of allocating another full-size rand_like tensor.
+        dummy_request_count = hidden_states.shape[0]
 
-        logits = self.model.compute_logits(hidden_states)
-        num_reqs = logits.size(0)
-
-        dummy_tensors = lambda v: torch.full((num_reqs,), v, device=self.device)
-
-        dummy_metadata = SamplingMetadata(
-            temperature=dummy_tensors(0.5),
-            all_greedy=False,
-            all_random=False,
-            top_p=dummy_tensors(0.9),
-            top_k=dummy_tensors(logits.size(1) - 1),
-            generators={},
-            max_num_logprobs=None,
-            no_penalties=True,
-            prompt_token_ids=None,
-            frequency_penalties=dummy_tensors(0.1),
-            presence_penalties=dummy_tensors(0.1),
-            repetition_penalties=dummy_tensors(0.1),
-            output_token_ids=[[] for _ in range(num_reqs)],
-            spec_token_ids=[[] for _ in range(num_reqs)],
-            allowed_token_ids_mask=None,
-            bad_words_token_ids={},
-            logitsprocs=LogitsProcessors(),
-        )
         try:
-            sampler_output = self.sampler(
-                logits=logits, sampling_metadata=dummy_metadata
+            with uvm_enabled_allocation_phase("enabled:dummy_sampler"):
+                hidden_states.uniform_(-1e-3, 1e-3)
+
+            with uvm_enabled_allocation_phase("enabled:compute_logits"):
+                logits = self.model.compute_logits(hidden_states)
+            num_reqs = logits.size(0)
+
+            dummy_tensors = lambda v: torch.full(
+                (num_reqs,), v, device=self.device
             )
-        except RuntimeError as e:
-            if "out of memory" in str(e):
+
+            dummy_metadata = SamplingMetadata(
+                temperature=dummy_tensors(0.5),
+                all_greedy=False,
+                all_random=False,
+                top_p=dummy_tensors(0.9),
+                top_k=dummy_tensors(logits.size(1) - 1),
+                generators={},
+                max_num_logprobs=None,
+                no_penalties=True,
+                prompt_token_ids=None,
+                frequency_penalties=dummy_tensors(0.1),
+                presence_penalties=dummy_tensors(0.1),
+                repetition_penalties=dummy_tensors(0.1),
+                output_token_ids=[[] for _ in range(num_reqs)],
+                spec_token_ids=[[] for _ in range(num_reqs)],
+                allowed_token_ids_mask=None,
+                bad_words_token_ids={},
+                logitsprocs=LogitsProcessors(),
+            )
+            with uvm_enabled_allocation_phase("enabled:sampler"):
+                sampler_output = self.sampler(
+                    logits=logits, sampling_metadata=dummy_metadata
+                )
+        except Exception as e:
+            if "out of memory" in str(e).lower():
                 raise RuntimeError(
                     "CUDA out of memory occurred when warming up sampler with "
-                    f"{num_reqs} dummy requests. Please try lowering "
+                    f"{dummy_request_count} dummy requests. Please try lowering "
                     "`max_num_seqs` or `gpu_memory_utilization` when "
                     "initializing the engine."
                 ) from e

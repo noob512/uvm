@@ -636,15 +636,19 @@ class Worker(WorkerBase):
                 self.scheduler_config.max_num_batched_tokens,
             )
 
-            # We skip EPLB here since we don't want to record dummy metrics
-            hidden_states, last_hidden_states = self.model_runner._dummy_run(
-                num_tokens=max_num_reqs,
-                skip_eplb=True,
-            )
-            if self.model_runner.is_pooling_model:
-                self.model_runner._dummy_pooler_run(hidden_states)
-            else:
-                self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+            # We skip EPLB here since we don't want to record dummy metrics.
+            # Keep this sampler warmup out of enabled:* serving phases.
+            with uvm_allocation_phase("sampler_warmup"):
+                hidden_states, last_hidden_states = self.model_runner._dummy_run(
+                    num_tokens=max_num_reqs,
+                    skip_eplb=True,
+                )
+                if self.model_runner.is_pooling_model:
+                    self.model_runner._dummy_pooler_run(hidden_states)
+                else:
+                    self.model_runner._dummy_sampler_run(
+                        hidden_states=last_hidden_states
+                    )
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.

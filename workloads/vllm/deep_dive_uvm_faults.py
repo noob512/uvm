@@ -168,6 +168,26 @@ def parse_args() -> argparse.Namespace:
         help="Stop after analyzing N parsed fault records.",
     )
     parser.add_argument(
+        "--fault-start-line",
+        "--main-start-line",
+        dest="fault_start_line",
+        type=int,
+        default=1,
+        help=(
+            "Start reading the fault log from this 1-based line. Use the "
+            "Auto gap-watch main start line to analyze main phase only."
+        ),
+    )
+    parser.add_argument(
+        "--allocator-phase-prefix",
+        action="append",
+        default=[],
+        help=(
+            "Only correlate allocator records whose allocation phase starts "
+            "with this prefix. Repeatable, e.g. --allocator-phase-prefix enabled:."
+        ),
+    )
+    parser.add_argument(
         "--focus-gap",
         type=int,
         default=None,
@@ -372,21 +392,81 @@ def phase_looks_like_warmup_or_workspace(phase: str) -> bool:
     return any(keyword in lowered for keyword in keywords)
 
 
+def phase_looks_like_enabled_runtime(phase: str | None) -> bool:
+    return phase == "enabled" or (phase is not None and phase.startswith("enabled:"))
+
+
+def percentile(sorted_values: list[float], pct: float) -> float | None:
+    if not sorted_values:
+        return None
+    index = int((len(sorted_values) - 1) * pct)
+    return sorted_values[index]
+
+
+def lifetime_summary(values: list[float]) -> dict[str, object]:
+    ordered = sorted(value for value in values if value >= 0)
+    return {
+        "freed_count": len(ordered),
+        "min_s": ordered[0] if ordered else None,
+        "median_s": statistics.median(ordered) if ordered else None,
+        "p95_s": percentile(ordered, 0.95),
+        "max_s": ordered[-1] if ordered else None,
+    }
+
+
+def phase_is_allowed(phase: str, prefixes: list[str]) -> bool:
+    return not prefixes or any(phase.startswith(prefix) for prefix in prefixes)
+
+
+def phase_breakdown(
+    phase_counts: Counter[str],
+    phase_overlap_bytes: Counter[str],
+    phase_lifetimes: dict[str, list[float]],
+) -> list[dict[str, object]]:
+    total_records = sum(phase_counts.values())
+    total_bytes = sum(phase_overlap_bytes.values())
+    rows: list[dict[str, object]] = []
+    for phase, records in phase_counts.items():
+        overlap_bytes = phase_overlap_bytes.get(phase, 0)
+        rows.append(
+            {
+                "phase": phase,
+                "allocation_records": records,
+                "record_share": records / total_records if total_records else 0.0,
+                "overlap_bytes": overlap_bytes,
+                "byte_share": overlap_bytes / total_bytes if total_bytes else 0.0,
+                "lifetime_stats": lifetime_summary(phase_lifetimes.get(phase, [])),
+            }
+        )
+    rows.sort(
+        key=lambda item: (
+            -int(item["allocation_records"]),
+            -int(item["overlap_bytes"]),
+            str(item["phase"]),
+        )
+    )
+    return rows
+
+
 def correlate_allocator_allocations(
     gap_summaries: list[dict[str, object]],
     allocator_report: dict[str, object],
     top_gaps: int,
+    allocator_phase_prefixes: list[str] | None = None,
 ) -> dict[str, object]:
     allocations: list[AllocationTrace] = allocator_report["allocations"]  # type: ignore[assignment]
     per_gap: list[dict[str, object]] = []
+    phase_prefixes = allocator_phase_prefixes or []
 
     for gap in gap_summaries[:top_gaps]:
         gap_start = int(gap["start_hex"], 16)
         gap_end = int(gap["end_hex"], 16)
         gap_size = int(gap["size_bytes"])
         overlapping: list[dict[str, object]] = []
+        phase_counts: Counter[str] = Counter()
         phase_overlap_bytes: Counter[str] = Counter()
         class_overlap_bytes: Counter[str] = Counter()
+        phase_lifetimes: dict[str, list[float]] = defaultdict(list)
         freed_overlap_bytes = 0
         live_overlap_bytes = 0
         exact_match_count = 0
@@ -396,12 +476,15 @@ def correlate_allocator_allocations(
         for alloc in allocations:
             if alloc.size_bytes <= 0 or alloc.ptr == 0:
                 continue
+            if not phase_is_allowed(alloc.phase, phase_prefixes):
+                continue
             overlap_start = max(gap_start, alloc.ptr)
             overlap_end = min(gap_end, alloc.end)
             if overlap_start > overlap_end:
                 continue
 
             overlap_bytes = overlap_end - overlap_start + 1
+            phase_counts[alloc.phase] += 1
             phase_overlap_bytes[alloc.phase] += overlap_bytes
             if alloc.predicted_class is not None:
                 class_overlap_bytes[alloc.predicted_class] += overlap_bytes
@@ -410,6 +493,7 @@ def correlate_allocator_allocations(
                 freed_overlap_bytes += overlap_bytes
                 if alloc.lifetime_s is not None and alloc.lifetime_s >= 0:
                     freed_lifetimes_s.append(alloc.lifetime_s)
+                    phase_lifetimes[alloc.phase].append(alloc.lifetime_s)
             else:
                 live_overlap_bytes += overlap_bytes
             if alloc.ptr == gap_start and alloc.end == gap_end:
@@ -459,20 +543,13 @@ def correlate_allocator_allocations(
             interval_end - interval_start + 1
             for interval_start, interval_end in merged_overlap_intervals
         )
-        lifetime_stats = {
-            "freed_count": len(freed_lifetimes_s),
-            "min_s": min(freed_lifetimes_s) if freed_lifetimes_s else None,
-            "median_s": statistics.median(freed_lifetimes_s) if freed_lifetimes_s else None,
-            "p95_s": (
-                sorted(freed_lifetimes_s)[max(len(freed_lifetimes_s) - 1, 0) * 95 // 100]
-                if freed_lifetimes_s
-                else None
-            ),
-            "max_s": max(freed_lifetimes_s) if freed_lifetimes_s else None,
-        }
+        lifetime_stats = lifetime_summary(freed_lifetimes_s)
+        median_lifetime = lifetime_stats["median_s"] or 0.0
+        p95_lifetime = lifetime_stats["p95_s"] or 0.0
+        runtime_dominant = phase_looks_like_enabled_runtime(dominant_phase)
 
-        if warmup_overlap_bytes > 0 and freed_overlap_bytes >= max(warmup_overlap_bytes // 2, 1):
-            likely_kind = "warmup_workspace"
+        if runtime_dominant and freed_lifetimes_s and median_lifetime < 0.01:
+            likely_kind = "gap_hot_runtime_scratch"
         elif dominant_predicted_class in {
             "runtime_scratch",
             "runtime_workspace",
@@ -481,8 +558,7 @@ def correlate_allocator_allocations(
             "weight_persistent",
         }:
             likely_kind = dominant_predicted_class
-        elif dominant_phase == "enabled" and freed_lifetimes_s:
-            median_lifetime = lifetime_stats["median_s"] or 0.0
+        elif phase_looks_like_enabled_runtime(dominant_phase) and freed_lifetimes_s:
             if median_lifetime < 0.01:
                 likely_kind = "runtime_scratch"
             else:
@@ -498,7 +574,11 @@ def correlate_allocator_allocations(
         else:
             likely_kind = "unresolved_unknown_gap"
 
-        if exact_match_count > 0 and warmup_overlap_bytes > 0 and freed_overlap_bytes >= warmup_overlap_bytes:
+        if likely_kind == "gap_hot_runtime_scratch" and p95_lifetime < 0.02:
+            assessment = "runtime_hot_gap_short_lived_scratch"
+        elif likely_kind == "gap_hot_runtime_scratch":
+            assessment = "runtime_hot_gap_probable_scratch"
+        elif exact_match_count > 0 and warmup_overlap_bytes > 0 and freed_overlap_bytes >= warmup_overlap_bytes:
             assessment = "strong_evidence_of_temporary_workspace_or_scratch"
         elif warmup_overlap_bytes > 0 and freed_overlap_bytes >= max(warmup_overlap_bytes // 2, 1):
             assessment = "likely_temporary_workspace_or_scratch"
@@ -528,6 +608,10 @@ def correlate_allocator_allocations(
                 ),
                 "exact_match_count": exact_match_count,
                 "phase_overlap_bytes": dict(phase_overlap_bytes),
+                "phase_counts": dict(phase_counts),
+                "phase_breakdown": phase_breakdown(
+                    phase_counts, phase_overlap_bytes, phase_lifetimes
+                ),
                 "predicted_class_overlap_bytes": dict(class_overlap_bytes),
                 "lifetime_stats": lifetime_stats,
                 "likely_kind": likely_kind,
@@ -672,6 +756,7 @@ def build_focused_gap_report(
     gap_index: int,
     gap_summaries: list[dict[str, object]],
     allocator_report: dict[str, object],
+    allocator_phase_prefixes: list[str] | None = None,
 ) -> dict[str, object]:
     gap_summary = find_gap_summary(gap_summaries, gap_index)
     if gap_summary is None:
@@ -681,10 +766,12 @@ def build_focused_gap_report(
     gap_end = int(gap_summary["end_hex"], 16)
     gap_size = int(gap_summary["size_bytes"])
     allocations: list[AllocationTrace] = allocator_report["allocations"]  # type: ignore[assignment]
+    phase_prefixes = allocator_phase_prefixes or []
 
     overlaps = [
         overlap
         for alloc in allocations
+        if phase_is_allowed(alloc.phase, phase_prefixes)
         if (overlap := overlap_record_for_gap(gap_start, gap_end, gap_size, alloc)) is not None
     ]
     overlaps.sort(
@@ -700,7 +787,13 @@ def build_focused_gap_report(
         if item["predicted_class"] is not None
     )
     class_overlap_bytes = Counter()
+    phase_overlap_bytes: Counter[str] = Counter()
+    phase_lifetimes: dict[str, list[float]] = defaultdict(list)
     for item in overlaps:
+        phase = str(item["phase"])
+        phase_overlap_bytes[phase] += int(item["overlap_bytes"])
+        if item["lifetime_s"] is not None and float(item["lifetime_s"]) >= 0:
+            phase_lifetimes[phase].append(float(item["lifetime_s"]))
         if item["predicted_class"] is not None:
             class_overlap_bytes[str(item["predicted_class"])] += int(item["overlap_bytes"])
 
@@ -715,6 +808,10 @@ def build_focused_gap_report(
             class_overlap_bytes.most_common(1)[0][0] if class_overlap_bytes else None
         ),
         "phase_counts": dict(phase_counter),
+        "phase_overlap_bytes": dict(phase_overlap_bytes),
+        "phase_breakdown": phase_breakdown(
+            phase_counter, phase_overlap_bytes, phase_lifetimes
+        ),
         "predicted_class_counts": dict(class_counter),
         "predicted_class_overlap_bytes": dict(class_overlap_bytes),
         "ordered_overlaps": overlaps,
@@ -944,6 +1041,7 @@ def analyze_faults(
     gaps: list[Gap],
     use_raw_address: bool,
     max_faults: int | None,
+    start_line: int = 1,
 ) -> dict[str, object]:
     class_stats = {
         "weight": empty_class_stats(),
@@ -968,6 +1066,8 @@ def analyze_faults(
 
     with fault_log_path.open("r", encoding="utf-8", errors="replace") as handle:
         for total_lines, line in enumerate(handle, start=1):
+            if total_lines < start_line:
+                continue
             record = parse_fault_record(line, total_lines)
             if record is None:
                 ignored_lines += 1
@@ -1169,6 +1269,32 @@ def print_report(report: dict[str, object], top_gaps: int) -> None:
                     f"p95={lifetime_stats['p95_s']:.6f}s "
                     f"max={lifetime_stats['max_s']:.6f}s"
                 )
+            if gap.get("phase_breakdown"):
+                print("  phase_breakdown:")
+                for phase_row in gap["phase_breakdown"][:5]:
+                    row_lifetime = phase_row["lifetime_stats"]
+                    median_lifetime = row_lifetime.get("median_s")
+                    p95_lifetime = row_lifetime.get("p95_s")
+                    median_text = (
+                        f"{median_lifetime:.6f}s"
+                        if median_lifetime is not None
+                        else "None"
+                    )
+                    p95_text = (
+                        f"{p95_lifetime:.6f}s"
+                        if p95_lifetime is not None
+                        else "None"
+                    )
+                    print(
+                        "    "
+                        f"phase={phase_row['phase']} "
+                        f"records={phase_row['allocation_records']} "
+                        f"record_share={phase_row['record_share']:.2%} "
+                        f"bytes={phase_row['overlap_bytes']} "
+                        f"byte_share={phase_row['byte_share']:.2%} "
+                        f"median_lifetime={median_text} "
+                        f"p95_lifetime={p95_text}"
+                    )
             for alloc in gap["top_overlapping_allocations"][:5]:
                 print(
                     "  overlap: "
@@ -1192,6 +1318,30 @@ def print_report(report: dict[str, object], top_gaps: int) -> None:
             f"dominant_predicted_class={focused_gap['dominant_predicted_class']} "
             f"dominant_predicted_class_by_bytes={focused_gap['dominant_predicted_class_by_bytes']}"
         )
+        if focused_gap.get("phase_breakdown"):
+            print("  focused_phase_breakdown:")
+            for phase_row in focused_gap["phase_breakdown"][:8]:
+                row_lifetime = phase_row["lifetime_stats"]
+                median_lifetime = row_lifetime.get("median_s")
+                p95_lifetime = row_lifetime.get("p95_s")
+                median_text = (
+                    f"{median_lifetime:.6f}s"
+                    if median_lifetime is not None
+                    else "None"
+                )
+                p95_text = (
+                    f"{p95_lifetime:.6f}s" if p95_lifetime is not None else "None"
+                )
+                print(
+                    "    "
+                    f"phase={phase_row['phase']} "
+                    f"records={phase_row['allocation_records']} "
+                    f"record_share={phase_row['record_share']:.2%} "
+                    f"bytes={phase_row['overlap_bytes']} "
+                    f"byte_share={phase_row['byte_share']:.2%} "
+                    f"median_lifetime={median_text} "
+                    f"p95_lifetime={p95_text}"
+                )
         for overlap in focused_gap["ordered_overlap_preview"][:10]:
             print(
                 "  ordered_overlap: "
@@ -1246,6 +1396,7 @@ def main() -> int:
         gaps=gaps,
         use_raw_address=args.use_raw_address,
         max_faults=args.max_faults,
+        start_line=max(args.fault_start_line, 1),
     )
     top_gap_summaries = fault_analysis["unknown_gap_summaries"][: args.top_gaps]
     allocator_correlation = None
@@ -1260,6 +1411,7 @@ def main() -> int:
             gap_summaries=fault_analysis["unknown_gap_summaries"],
             allocator_report=allocator_report,
             top_gaps=args.top_gaps,
+            allocator_phase_prefixes=args.allocator_phase_prefix,
         )
     heuristic = warmup_workspace_assessment(
         class_summaries=fault_analysis["class_summaries"],
@@ -1278,6 +1430,7 @@ def main() -> int:
                 gap_index=args.focus_gap,
                 gap_summaries=fault_analysis["unknown_gap_summaries"],
                 allocator_report=allocator_report,
+                allocator_phase_prefixes=args.allocator_phase_prefix,
             )
             focused_gap = compact_focused_gap_report(
                 focused_gap_full,
@@ -1292,6 +1445,8 @@ def main() -> int:
         "address_log": str(address_log_path),
         "fault_log": str(fault_log_path),
         "used_raw_addresses": bool(args.use_raw_address),
+        "fault_start_line": max(args.fault_start_line, 1),
+        "allocator_phase_prefixes": args.allocator_phase_prefix,
         "warnings": warnings,
         "gap_count": len(gaps),
         "fault_analysis": fault_analysis,
