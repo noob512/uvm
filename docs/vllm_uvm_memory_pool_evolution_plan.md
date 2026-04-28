@@ -197,6 +197,22 @@ cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
 
 ## 4. 阶段 C1：Device-direct 总预算
 
+当前项目已实现 C1。实现位置包括：
+
+1. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/vllm/uvm_test/uvm_allocator.cpp`
+2. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/run_kv_fault_ratio.sh`
+3. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/summarize_gap_watch_metrics.py`
+4. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/run_stage_c_attention_p20_ab.sh`
+5. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/compare_stage_c_attention_p20_ab.py`
+6. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/run_stage_c_attention_c1_budget_sweep.sh`
+7. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/compare_stage_c_budget_sweep.py`
+
+C1 补全实现文档：
+
+```text
+/home/ubuntu/nvidia-uvm-gpu/docs/vllm_uvm_stage_c1_completion_implementation.md
+```
+
 ### 4.1 为什么必须做预算
 
 直接使用 `cudaMalloc` 会占用真实 GPU VRAM。即使每个对象小于 1 MiB，在高并发和重叠生命周期下也可能累计占用大量显存。
@@ -240,6 +256,18 @@ VLLM_UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES
 ```
 
 如果为 `0`，可表示不限制，但实验阶段不建议开放。
+
+当前实现默认值为：
+
+```text
+268435456    # 256 MiB
+```
+
+也可以通过 A/B 脚本的环境变量覆盖：
+
+```bash
+DEVICE_DIRECT_MAX_TOTAL_BYTES=536870912 ./run_stage_c_attention_p20_ab.sh
+```
 
 ### 4.3 allocator 设计
 
@@ -285,6 +313,15 @@ device_direct_live_bytes -= size
 5. cudaMalloc 失败则 live_bytes -= size
 ```
 
+当前实现采用上述 CAS reservation。关键行为：
+
+1. 只有通过 C0 严格 gating 的候选才会进入预算预留。
+2. `max_total_bytes > 0` 且 `live_bytes + size > max_total_bytes` 时拒绝本次 `device_direct`。
+3. 拒绝时不会调用 `cudaMalloc`，会保留 managed candidate。
+4. 日志中记录 `device_direct_reason=device_direct_budget_exceeded`。
+5. `cudaMalloc` 失败或 managed candidate 释放失败时会释放已预留预算。
+6. 真正 `device_direct` 对象在 `uvm_free` 成功后扣减 `device_direct_live_bytes`。
+
 ### 4.4 新增日志字段
 
 `TRACE_POLICY` 和 `TRACE_GAP_WATCH_ALLOC` 建议增加：
@@ -302,6 +339,23 @@ Device-direct max total bytes
 Device-direct live bytes
 Device-direct peak live bytes
 Device-direct budget rejects
+```
+
+当前实现已在 `TRACE_POLICY` 和 `TRACE_GAP_WATCH_ALLOC` 中输出这些字段，并在 allocator session summary 中输出上述汇总项。
+
+`summarize_gap_watch_metrics.py` 会额外汇总：
+
+```text
+device_direct_budget_reject_records
+device_direct_max_total_bytes
+device_direct_peak_live_bytes_observed
+device_direct_min_budget_remaining_observed
+```
+
+其中 `device_direct_peak_live_bytes_observed` 应该满足：
+
+```text
+device_direct_peak_live_bytes_observed <= device_direct_max_total_bytes
 ```
 
 ### 4.5 验证矩阵
@@ -324,6 +378,26 @@ Device-direct budget rejects
 5. OOM / failed requests
 6. TTFT / TPOT
 
+推荐 C1 p20 A/B 命令：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
+
+DEVICE_DIRECT_MAX_TOTAL_BYTES=268435456 ./run_stage_c_attention_p20_ab.sh
+```
+
+如果 256 MiB 下 `device_direct_budget_reject_records` 很高、收益明显变弱，但没有 OOM，可以继续：
+
+```bash
+DEVICE_DIRECT_MAX_TOTAL_BYTES=536870912 ./run_stage_c_attention_p20_ab.sh
+```
+
+如果 512 MiB 仍稳定，再测试：
+
+```bash
+DEVICE_DIRECT_MAX_TOTAL_BYTES=1073741824 ./run_stage_c_attention_p20_ab.sh
+```
+
 ### 4.6 成功标准
 
 1. 无 OOM。
@@ -331,7 +405,59 @@ Device-direct budget rejects
 3. gap2 faults 下降。
 4. `device_direct_budget_rejects` 可以存在，但不应导致性能剧烈抖动。
 
+额外建议同时看 A/B 报告中的：
+
+1. `success_signal=True`
+2. `effectiveness_signal=True`
+3. `device_peak_live_within_budget=True`
+4. `device_direct_actual_records > 0`
+5. `gap_policy_fail=0`
+6. `Failed requests = 0`
+
+### 4.7 当前补全状态
+
+当前 C1 已补齐两个实验闭环能力：
+
+1. `run_kv_fault_ratio.sh` 的 delta stats parser 已支持当前中文 UVM stats 格式，可以从 `本批次总缺页实例数=...`、`KV类的总缺页数=...`、`总缺页数=...`、`kv总错误数=...` 中解析 batch、total、after-dedup，并推导 duplicate counters。
+2. 新增 C1 budget sweep 一键脚本，可以固定 `cuda_malloc` backend，对多个 `DEVICE_DIRECT_MAX_TOTAL_BYTES` 连续运行 Stage C attention A/B，并生成预算横向汇总 JSON。
+
+推荐 C1 budget sweep：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
+
+PROMPTS=10 \
+BUDGETS_CSV=524288,1048576,2097152,4194304 \
+./run_stage_c_attention_c1_budget_sweep.sh
+```
+
+输出目录：
+
+```text
+/tmp/vllm_stage_c1_budget_sweep_<timestamp>/
+```
+
+汇总文件：
+
+```text
+vllm_stage_c1_budget_sweep_p<PROMPTS>.json
+```
+
+当前 C1/C2 backend A/B 结论：
+
+1. `cuda_malloc` 是当前推荐 C1 backend。
+2. `cuda_malloc_async` 已通过正确性验证，但在 p10 / 1 MiB budget 对照中，gap faults 和 TPOT 均弱于 `cuda_malloc`，暂不设为默认。
+3. 后续应先完成 C1 budget sweep 和 stats delta 稳定化，再考虑 C2 memory pool threshold 或 MoE 扩展。
+
 ## 5. 阶段 C2：`cudaMallocAsync` / CUDA Memory Pool
+
+当前项目已实现 C2 的第一步：可切换 `cudaMallocAsync/cudaFreeAsync` backend。默认仍保持 C1 的 `cuda_malloc` 路径，只有显式设置 backend 时才启用 async 路径。
+
+实现文档：
+
+```text
+/home/ubuntu/nvidia-uvm-gpu/docs/vllm_uvm_device_direct_stage_c2_async_backend_implementation.md
+```
 
 ### 5.1 为什么需要 C2
 
@@ -375,6 +501,12 @@ C2 实验时切换为：
 cuda_malloc_async
 ```
 
+当前实现还支持 A/B 脚本环境变量：
+
+```bash
+DEVICE_DIRECT_BACKEND=cuda_malloc_async ./run_stage_c_attention_p20_ab.sh
+```
+
 ### 5.3 allocator 设计
 
 新增 enum：
@@ -404,6 +536,16 @@ cudaFreeAsync(ptr, stream);
 2. free 时根据 backend 选择 `cudaFree` 或 `cudaFreeAsync`。
 3. 如果 stream 无效或为空，可 fallback 到 `cudaMalloc/cudaFree`。
 4. 如果 vLLM/PyTorch allocator 调用 free 时传入的 stream 与 allocation stream 不一致，需要评估 stream-ordered 语义是否安全。
+
+当前实现细节：
+
+1. `VLLM_UVM_DEVICE_DIRECT_BACKEND=cuda_malloc` 时保持 C1 行为，使用 `cudaMalloc/cudaFree`。
+2. `VLLM_UVM_DEVICE_DIRECT_BACKEND=cuda_malloc_async` 时，真实 device-direct 分配使用 `cudaMallocAsync(&ptr, size, stream)`。
+3. 每个 allocation 会记录 `device_direct_backend_name`。
+4. `uvm_free` 会先查询 allocation 元数据，再决定调用 `cudaFree` 还是 `cudaFreeAsync(ptr, stream)`。
+5. C1 总预算逻辑完全保留：先 CAS reserve budget，再执行 CUDA allocation；失败或 cleanup 成功时释放预算；正常 free 成功后释放 live budget。
+6. `TRACE_POLICY` 和 `TRACE_GAP_WATCH_ALLOC/FREE` 会输出 `device_direct_backend=<backend>`。
+7. `summarize_gap_watch_metrics.py` 会输出 `device_direct_backend_counts`。
 
 ### 5.4 CUDA memory pool 调优
 
@@ -436,6 +578,43 @@ cudaMemPoolAttrReleaseThreshold
 3. allocator latency 降低。
 4. OOM 不增加。
 5. free 成功率保持 100%。
+
+推荐首轮 C2 验证命令：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
+
+PROMPTS=10 \
+DEVICE_DIRECT_MAX_TOTAL_BYTES=1048576 \
+DEVICE_DIRECT_BACKEND=cuda_malloc_async \
+./run_stage_c_attention_p20_ab.sh
+```
+
+重点看：
+
+```text
+success_signal=True
+effectiveness_signal=True
+device_peak_live_within_budget=True
+device_direct_backend_counts 中出现 cuda_malloc_async
+device_direct_actual_records > 0
+device_direct_budget_reject_records 可存在
+gap_policy_fail=0
+Failed requests=0
+```
+
+C2 对照实验建议固定相同预算和 prompts，分别跑：
+
+```bash
+PROMPTS=10 DEVICE_DIRECT_MAX_TOTAL_BYTES=1048576 DEVICE_DIRECT_BACKEND=cuda_malloc ./run_stage_c_attention_p20_ab.sh
+PROMPTS=10 DEVICE_DIRECT_MAX_TOTAL_BYTES=1048576 DEVICE_DIRECT_BACKEND=cuda_malloc_async ./run_stage_c_attention_p20_ab.sh
+```
+
+如果 async backend 稳定，再扩展到 p20：
+
+```bash
+PROMPTS=20 DEVICE_DIRECT_MAX_TOTAL_BYTES=1048576 DEVICE_DIRECT_BACKEND=cuda_malloc_async ./run_stage_c_attention_p20_ab.sh
+```
 
 ## 6. 阶段 D：KV 独立预算
 

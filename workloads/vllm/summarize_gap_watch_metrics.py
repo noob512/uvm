@@ -93,6 +93,7 @@ def main() -> int:
     target_class_counter: Counter[str] = Counter()
     policy_source_counter: Counter[str] = Counter()
     placement_backend_counter: Counter[str] = Counter()
+    device_direct_backend_counter: Counter[str] = Counter()
     device_direct_reason_counter: Counter[str] = Counter()
     lifetime_values: list[float] = []
     session_summary: dict[str, str] = {}
@@ -100,6 +101,9 @@ def main() -> int:
     device_direct_trace_records = 0
     device_direct_eligible_records = 0
     hot_gap_match_records = 0
+    device_direct_max_total_bytes_values: list[int] = []
+    device_direct_live_bytes_values: list[int] = []
+    device_direct_budget_remaining_values: list[int] = []
 
     with allocator_log.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -137,6 +141,9 @@ def main() -> int:
                 policy_source_counter[policy_source] += 1
                 target_class_counter[target_class] += 1
                 placement_backend_counter[kv_fields.get("placement_backend", "unknown")] += 1
+                device_direct_backend_counter[
+                    kv_fields.get("device_direct_backend", "none")
+                ] += 1
                 device_direct_reason_counter[
                     kv_fields.get("device_direct_reason", "not_recorded")
                 ] += 1
@@ -146,6 +153,18 @@ def main() -> int:
                     device_direct_eligible_records += 1
                 if kv_fields.get("hot_gap_match") == "1":
                     hot_gap_match_records += 1
+                if "device_direct_max_total_bytes" in kv_fields:
+                    device_direct_max_total_bytes_values.append(
+                        int(kv_fields["device_direct_max_total_bytes"])
+                    )
+                if "device_direct_live_bytes" in kv_fields:
+                    device_direct_live_bytes_values.append(
+                        int(kv_fields["device_direct_live_bytes"])
+                    )
+                if "device_direct_budget_remaining" in kv_fields:
+                    device_direct_budget_remaining_values.append(
+                        int(kv_fields["device_direct_budget_remaining"])
+                    )
                 if class_match:
                     class_match_records += 1
                 if policy_source == "gap_watch_policy" and action != "managed_default":
@@ -185,11 +204,30 @@ def main() -> int:
         "action_counts": dict(action_counter),
         "target_class_counts": dict(target_class_counter),
         "placement_backend_counts": dict(placement_backend_counter),
+        "device_direct_backend_counts": dict(device_direct_backend_counter),
         "device_direct_reason_counts": dict(device_direct_reason_counter),
         "device_direct_trace_records": device_direct_trace_records,
         "device_direct_eligible_records": device_direct_eligible_records,
         "device_direct_actual_records": placement_backend_counter.get(
             "device_direct", 0
+        ),
+        "device_direct_budget_reject_records": device_direct_reason_counter.get(
+            "device_direct_budget_exceeded", 0
+        ),
+        "device_direct_max_total_bytes": (
+            device_direct_max_total_bytes_values[-1]
+            if device_direct_max_total_bytes_values
+            else None
+        ),
+        "device_direct_peak_live_bytes_observed": (
+            max(device_direct_live_bytes_values)
+            if device_direct_live_bytes_values
+            else None
+        ),
+        "device_direct_min_budget_remaining_observed": (
+            min(device_direct_budget_remaining_values)
+            if device_direct_budget_remaining_values
+            else None
         ),
         "hot_gap_match_records": hot_gap_match_records,
         "median_lifetime_s": (
@@ -217,9 +255,14 @@ def main() -> int:
     print(f"- dominant_target_class={summary['dominant_target_class']}")
     print(f"- phase_record_ratios={summary['phase_record_ratios']}")
     print(f"- placement_backend_counts={summary['placement_backend_counts']}")
+    print(f"- device_direct_backend_counts={summary['device_direct_backend_counts']}")
     print(f"- device_direct_trace_records={device_direct_trace_records}")
     print(f"- device_direct_eligible_records={device_direct_eligible_records}")
     print(f"- device_direct_actual_records={summary['device_direct_actual_records']}")
+    print(f"- device_direct_budget_reject_records={summary['device_direct_budget_reject_records']}")
+    print(f"- device_direct_max_total_bytes={summary['device_direct_max_total_bytes']}")
+    print(f"- device_direct_peak_live_bytes_observed={summary['device_direct_peak_live_bytes_observed']}")
+    print(f"- device_direct_min_budget_remaining_observed={summary['device_direct_min_budget_remaining_observed']}")
     print(f"- hot_gap_match_records={hot_gap_match_records}")
     print(f"- median_lifetime_s={summary['median_lifetime_s']}")
     return 0

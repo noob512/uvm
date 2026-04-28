@@ -167,6 +167,21 @@ def run_summary(
                 "device_direct_eligible_records"
             ),
             "device_direct_actual_records": metrics.get("device_direct_actual_records"),
+            "device_direct_backend_counts": metrics.get(
+                "device_direct_backend_counts"
+            ),
+            "device_direct_budget_reject_records": metrics.get(
+                "device_direct_budget_reject_records"
+            ),
+            "device_direct_max_total_bytes": metrics.get(
+                "device_direct_max_total_bytes"
+            ),
+            "device_direct_peak_live_bytes_observed": metrics.get(
+                "device_direct_peak_live_bytes_observed"
+            ),
+            "device_direct_min_budget_remaining_observed": metrics.get(
+                "device_direct_min_budget_remaining_observed"
+            ),
             "device_direct_reason_counts": metrics.get("device_direct_reason_counts"),
             "hot_gap_match_records": metrics.get("hot_gap_match_records"),
             "median_lifetime_s": metrics.get("median_lifetime_s"),
@@ -213,6 +228,14 @@ def verdict(trace_run: dict[str, Any], device_run: dict[str, Any]) -> dict[str, 
         ),
         "device_direct_backend_present": (placement.get("device_direct") or 0) > 0,
         "device_policy_fail_zero": device_metrics.get("gap_policy_fail") == 0,
+        "device_peak_live_within_budget": (
+            device_metrics.get("device_direct_max_total_bytes") in (None, 0)
+            or (
+                device_metrics.get("device_direct_peak_live_bytes_observed") is not None
+                and device_metrics.get("device_direct_peak_live_bytes_observed")
+                <= device_metrics.get("device_direct_max_total_bytes")
+            )
+        ),
         "device_gap_faults_lower_than_trace": (
             gap_fault_delta is not None and gap_fault_delta < 0
         ),
@@ -248,6 +271,7 @@ def verdict(trace_run: dict[str, Any], device_run: dict[str, Any]) -> dict[str, 
             and checks["device_direct_records_present"]
             and checks["device_direct_backend_present"]
             and checks["device_policy_fail_zero"]
+            and checks["device_peak_live_within_budget"]
         ),
         "effectiveness_signal": (
             checks["device_gap_faults_lower_than_trace"]
@@ -332,6 +356,18 @@ def main() -> int:
         f"{device_run['metrics'].get('device_direct_actual_records')} "
         "placement_backend_counts="
         f"{device_run['metrics'].get('placement_backend_counts')}"
+    )
+    print(
+        "- device_direct_backend_counts="
+        f"{device_run['metrics'].get('device_direct_backend_counts')}"
+    )
+    print(
+        "- device_direct_budget="
+        f"{device_run['metrics'].get('device_direct_max_total_bytes')} "
+        "peak_live_observed="
+        f"{device_run['metrics'].get('device_direct_peak_live_bytes_observed')} "
+        "budget_reject_records="
+        f"{device_run['metrics'].get('device_direct_budget_reject_records')}"
     )
     print(
         f"- success_signal={comp['success_signal']} "

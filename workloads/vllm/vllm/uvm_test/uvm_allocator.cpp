@@ -13,6 +13,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <ctime>
@@ -57,6 +58,8 @@ static size_t gap_watch_refresh_ms = 250;
 static int device_direct_enable = 0;
 static size_t device_direct_min_bytes = 4096;
 static size_t device_direct_max_bytes = 1 * 1024 * 1024;
+static size_t device_direct_max_total_bytes = 256 * 1024 * 1024;
+static std::string device_direct_backend = "cuda_malloc";
 static std::string device_direct_target_phases =
     "enabled:attention,enabled:moe,enabled:model_forward";
 static bool gap_watch_control_seen = false;
@@ -134,6 +137,15 @@ static std::atomic<size_t> device_direct_actual_allocs{0};
 /// @brief Stage C 真正路由到 GPU-only backend 的累计字节数。
 static std::atomic<size_t> device_direct_actual_bytes{0};
 
+/// @brief Stage C GPU-only backend 当前仍然存活的真实显存字节数。
+static std::atomic<size_t> device_direct_live_bytes{0};
+
+/// @brief Stage C GPU-only backend 存活显存高水位，用于验证 C1 总预算是否生效。
+static std::atomic<size_t> device_direct_peak_live_bytes{0};
+
+/// @brief Stage C 因总预算不足而拒绝 device_direct、回退 managed 的次数。
+static std::atomic<size_t> device_direct_budget_rejects{0};
+
 /// @brief Stage C 试图启用 GPU-only backend 但 cudaMalloc 失败、回退到 managed 的次数。
 static std::atomic<size_t> device_direct_fallback_allocs{0};
 
@@ -194,6 +206,7 @@ struct AllocationInfo {
     // ========================================================================
 
     std::string placement_backend_name; ///< 实际使用的分配后端（当前大多为 "managed"，为演进到 "device_only" 预留）。
+    std::string device_direct_backend_name; ///< device_direct 实际使用的 CUDA 分配后端，如 cuda_malloc 或 cuda_malloc_async。
     bool device_direct_eligible;    ///< 评估此内存块是否具备绕过 UVM、直接使用 cudaMalloc 的资格（取决于大小和生命周期）。
     std::string device_direct_reason; ///< 判定是否具备绕过资格的具体原因（如 "below_min_bytes", "target_class_mismatch"）。
     std::string cpu_access_risk;    ///< 风险评估标签：如果将其强制放置在 GPU 上，未来被 CPU 访问触发严重 Page Fault 的风险等级。
@@ -314,6 +327,20 @@ static size_t read_size_from_env(const char* name, size_t default_value) {
     return static_cast<size_t>(parsed);
 }
 
+static size_t read_size_from_env_allow_zero(const char* name, size_t default_value) {
+    const char* raw = getenv(name);
+    if (!raw || !*raw) {
+        return default_value;
+    }
+
+    char* end_ptr = nullptr;
+    unsigned long long parsed = strtoull(raw, &end_ptr, 10);
+    if (end_ptr == raw || *end_ptr != '\0') {
+        return default_value;
+    }
+    return static_cast<size_t>(parsed);
+}
+
 static bool read_hex_u64_from_env(const char* name, uintptr_t* value_out) {
     const char* raw = getenv(name);
     if (!raw || !*raw || !value_out) {
@@ -381,6 +408,14 @@ static std::string trim_copy(const std::string& input) {
     }
 
     return input.substr(start, end - start);
+}
+
+static std::string normalize_device_direct_backend(const std::string& value) {
+    std::string lowered = lower_copy(trim_copy(value));
+    if (lowered == "cuda_malloc_async" || lowered == "cuda_async") {
+        return "cuda_malloc_async";
+    }
+    return "cuda_malloc";
 }
 
 static bool comma_list_contains_phase_prefix(const std::string& csv,
@@ -546,6 +581,56 @@ static const char* policy_action_to_string(PolicyAction action) {
 static bool is_device_direct_action(PolicyAction action) {
     return action == PolicyAction::DeviceDirectTrace ||
            action == PolicyAction::DeviceDirect;
+}
+
+static void update_device_direct_peak_live(size_t current_live) {
+    size_t peak = device_direct_peak_live_bytes.load();
+    while (current_live > peak) {
+        if (device_direct_peak_live_bytes.compare_exchange_weak(peak, current_live)) {
+            break;
+        }
+    }
+}
+
+static bool reserve_device_direct_budget(size_t size) {
+    size_t live = device_direct_live_bytes.load();
+    while (true) {
+        if (device_direct_max_total_bytes > 0 &&
+            live > device_direct_max_total_bytes - std::min(size, device_direct_max_total_bytes)) {
+            return false;
+        }
+        size_t next_live = live + size;
+        if (next_live < live) {
+            return false;
+        }
+        if (device_direct_max_total_bytes > 0 &&
+            next_live > device_direct_max_total_bytes) {
+            return false;
+        }
+        if (device_direct_live_bytes.compare_exchange_weak(live, next_live)) {
+            update_device_direct_peak_live(next_live);
+            return true;
+        }
+    }
+}
+
+static void release_device_direct_budget(size_t size) {
+    size_t live = device_direct_live_bytes.load();
+    while (true) {
+        size_t next_live = live >= size ? live - size : 0;
+        if (device_direct_live_bytes.compare_exchange_weak(live, next_live)) {
+            return;
+        }
+    }
+}
+
+static size_t device_direct_budget_remaining_snapshot(size_t live) {
+    if (device_direct_max_total_bytes == 0) {
+        return 0;
+    }
+    return live >= device_direct_max_total_bytes
+        ? 0
+        : device_direct_max_total_bytes - live;
 }
 
 static const char* size_bucket_for(size_t size) {
@@ -1177,6 +1262,20 @@ static void init_log_file() {
             "VLLM_UVM_DEVICE_DIRECT_MAX_BYTES",
             device_direct_max_bytes
         );
+        device_direct_max_total_bytes = read_size_from_env(
+            "VLLM_UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES",
+            device_direct_max_total_bytes
+        );
+        device_direct_max_total_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES",
+            device_direct_max_total_bytes
+        );
+        device_direct_backend = normalize_device_direct_backend(
+            read_string_from_env(
+                "VLLM_UVM_DEVICE_DIRECT_BACKEND",
+                device_direct_backend.c_str()
+            )
+        );
         device_direct_target_phases = read_string_from_env(
             "VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES",
             device_direct_target_phases.c_str()
@@ -1224,7 +1323,10 @@ static void init_log_file() {
                 "gap_watch_target_class=%s gap_watch_policy_action=%s "
                 "gap_watch_control_file=%s gap_watch_refresh_ms=%zu "
                 "device_direct_enable=%d device_direct_min_bytes=%zu "
-                "device_direct_max_bytes=%zu device_direct_target_phases=%s\n",
+                "device_direct_max_bytes=%zu "
+                "device_direct_max_total_bytes=%zu "
+                "device_direct_backend=%s "
+                "device_direct_target_phases=%s\n",
                 timestamp, policy_enabled, policy_mode.c_str(),
                 policy_warmup_prefetch_enabled, policy_warmup_prefetch_min_bytes,
                 policy_warmup_advise_gpu,
@@ -1243,6 +1345,8 @@ static void init_log_file() {
                 device_direct_enable,
                 device_direct_min_bytes,
                 device_direct_max_bytes,
+                device_direct_max_total_bytes,
+                device_direct_backend.c_str(),
                 device_direct_target_phases.c_str()
             );
             fprintf(log_file, "========================================\n");
@@ -1405,6 +1509,7 @@ static void trace_policy_event(void* ptr,
                                size_t gap_overlap_bytes,
                                const char* size_bucket,
                                const char* placement_backend,
+                               const char* device_direct_backend_used,
                                bool device_direct_eligible,
                                const char* device_direct_reason,
                                const char* cpu_access_risk,
@@ -1421,6 +1526,9 @@ static void trace_policy_event(void* ptr,
     uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
     uintptr_t end = region_end_for(start, size);
     const char* safe_error = (action_error && action_error[0] != '\0') ? action_error : "none";
+    size_t device_direct_live_snapshot = device_direct_live_bytes.load();
+    size_t device_direct_budget_remaining =
+        device_direct_budget_remaining_snapshot(device_direct_live_snapshot);
 
     fprintf(
         log_file,
@@ -1429,7 +1537,10 @@ static void trace_policy_event(void* ptr,
         "predicted_class=%s action=%s policy_source=%s "
         "gap_watch_class_match=%d gap_overlap_bytes=%zu "
         "action_success=%d action_error=%s placement_backend=%s "
+        "device_direct_backend=%s "
         "device_direct_eligible=%d device_direct_reason=%s "
+        "device_direct_live_bytes=%zu device_direct_max_total_bytes=%zu "
+        "device_direct_budget_remaining=%zu "
         "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
@@ -1448,8 +1559,12 @@ static void trace_policy_event(void* ptr,
         action_success ? 1 : 0,
         safe_error,
         placement_backend ? placement_backend : "managed",
+        device_direct_backend_used ? device_direct_backend_used : "none",
         device_direct_eligible ? 1 : 0,
         device_direct_reason ? device_direct_reason : "not_requested",
+        device_direct_live_snapshot,
+        device_direct_max_total_bytes,
+        device_direct_budget_remaining,
         cpu_access_risk ? cpu_access_risk : "unknown",
         hot_gap_match ? 1 : 0
     );
@@ -1520,6 +1635,7 @@ static void trace_gap_watch_alloc_event(void* ptr,
                                         uintptr_t overlap_end,
                                         size_t overlap_bytes,
                                         const char* placement_backend,
+                                        const char* device_direct_backend_used,
                                         bool device_direct_eligible,
                                         const char* device_direct_reason,
                                         const char* cpu_access_risk,
@@ -1541,6 +1657,9 @@ static void trace_gap_watch_alloc_event(void* ptr,
                         static_cast<double>(gap_size);
         }
     }
+    size_t device_direct_live_snapshot = device_direct_live_bytes.load();
+    size_t device_direct_budget_remaining =
+        device_direct_budget_remaining_snapshot(device_direct_live_snapshot);
 
     fprintf(
         log_file,
@@ -1549,7 +1668,10 @@ static void trace_gap_watch_alloc_event(void* ptr,
         "predicted_class=%s action=%s policy_source=%s "
         "gap_watch_target_class=%s gap_watch_class_match=%d stream=0x%llx overlap_start=0x%llx "
         "overlap_end=0x%llx overlap_bytes=%zu overlap_ratio_of_watch=%.6f "
-        "placement_backend=%s device_direct_eligible=%d device_direct_reason=%s "
+        "placement_backend=%s device_direct_backend=%s "
+        "device_direct_eligible=%d device_direct_reason=%s "
+        "device_direct_live_bytes=%zu device_direct_max_total_bytes=%zu "
+        "device_direct_budget_remaining=%zu "
         "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
@@ -1572,8 +1694,12 @@ static void trace_gap_watch_alloc_event(void* ptr,
         overlap_bytes,
         gap_ratio,
         placement_backend ? placement_backend : "managed",
+        device_direct_backend_used ? device_direct_backend_used : "none",
         device_direct_eligible ? 1 : 0,
         device_direct_reason ? device_direct_reason : "not_requested",
+        device_direct_live_snapshot,
+        device_direct_max_total_bytes,
+        device_direct_budget_remaining,
         cpu_access_risk ? cpu_access_risk : "unknown",
         hot_gap_match ? 1 : 0
     );
@@ -1615,7 +1741,8 @@ static void trace_gap_watch_free_event(void* ptr,
         "gap_watch_target_class=%s gap_watch_policy_action=%s "
         "overlap_start=0x%llx overlap_end=0x%llx overlap_bytes=%zu "
         "overlap_ratio_of_watch=%.6f lifetime_s=%.6f total_bytes=%zu "
-        "placement_backend=%s device_direct_eligible=%d device_direct_reason=%s "
+        "placement_backend=%s device_direct_backend=%s "
+        "device_direct_eligible=%d device_direct_reason=%s "
         "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
@@ -1642,6 +1769,7 @@ static void trace_gap_watch_free_event(void* ptr,
         lifetime_seconds,
         current_total,
         info->placement_backend_name.c_str(),
+        info->device_direct_backend_name.c_str(),
         info->device_direct_eligible ? 1 : 0,
         info->device_direct_reason.c_str(),
         info->cpu_access_risk.c_str(),
@@ -1821,6 +1949,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     bool device_direct_requested = is_device_direct_action(policy_action);
     bool device_direct_phase_match = is_device_direct_target_phase(phase_snapshot);
     const char* placement_backend = "managed";
+    const char* device_direct_backend_used = "none";
     const char* cpu_access_risk = device_direct_phase_match
         ? "low_no_cpu_access_evidence_runtime_phase"
         : "unknown";
@@ -1862,38 +1991,56 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         device_direct_enable &&
         ptr != NULL) {
         void* device_ptr = NULL;
-        int previous_device = -1;
-        cudaError_t get_device_err = cudaGetDevice(&previous_device);
-        if (device >= 0) {
-            cudaSetDevice(device);
-        }
-        cudaError_t device_alloc_err = cudaMalloc(&device_ptr, static_cast<size_t>(size));
-        if (get_device_err == cudaSuccess && previous_device >= 0) {
-            cudaSetDevice(previous_device);
-        }
+        bool budget_reserved = reserve_device_direct_budget(static_cast<size_t>(size));
+        if (!budget_reserved) {
+            device_direct_reason = "device_direct_budget_exceeded";
+            device_direct_budget_rejects.fetch_add(1);
+        } else {
+            int previous_device = -1;
+            cudaError_t get_device_err = cudaGetDevice(&previous_device);
+            if (device >= 0) {
+                cudaSetDevice(device);
+            }
+            bool use_async_backend = device_direct_backend == "cuda_malloc_async";
+            cudaError_t device_alloc_err = use_async_backend
+                ? cudaMallocAsync(&device_ptr, static_cast<size_t>(size), stream)
+                : cudaMalloc(&device_ptr, static_cast<size_t>(size));
+            if (get_device_err == cudaSuccess && previous_device >= 0) {
+                cudaSetDevice(previous_device);
+            }
 
-        if (device_alloc_err == cudaSuccess && device_ptr != NULL) {
-            cudaError_t free_candidate_err = cudaFree(ptr);
-            if (free_candidate_err == cudaSuccess) {
-                ptr = device_ptr;
-                placement_backend = "device_direct";
-                policy_action_success = true;
-                policy_action_error = "none";
-                device_direct_reason = "device_direct_enabled";
-                device_direct_actual_allocs.fetch_add(1);
-                device_direct_actual_bytes.fetch_add(static_cast<size_t>(size));
+            if (device_alloc_err == cudaSuccess && device_ptr != NULL) {
+                cudaError_t free_candidate_err = cudaFree(ptr);
+                if (free_candidate_err == cudaSuccess) {
+                    ptr = device_ptr;
+                    placement_backend = "device_direct";
+                    device_direct_backend_used = device_direct_backend.c_str();
+                    policy_action_success = true;
+                    policy_action_error = "none";
+                    device_direct_reason = "device_direct_enabled";
+                    device_direct_actual_allocs.fetch_add(1);
+                    device_direct_actual_bytes.fetch_add(static_cast<size_t>(size));
+                } else {
+                    cudaError_t cleanup_device_err = use_async_backend
+                        ? cudaFreeAsync(device_ptr, stream)
+                        : cudaFree(device_ptr);
+                    if (cleanup_device_err == cudaSuccess) {
+                        release_device_direct_budget(static_cast<size_t>(size));
+                    }
+                    policy_action_success = false;
+                    policy_action_error = cudaGetErrorString(free_candidate_err);
+                    device_direct_reason = "managed_candidate_free_failed";
+                    device_direct_fallback_allocs.fetch_add(1);
+                }
             } else {
-                cudaFree(device_ptr);
+                release_device_direct_budget(static_cast<size_t>(size));
                 policy_action_success = false;
-                policy_action_error = cudaGetErrorString(free_candidate_err);
-                device_direct_reason = "managed_candidate_free_failed";
+                policy_action_error = cudaGetErrorString(device_alloc_err);
+                device_direct_reason = use_async_backend
+                    ? "device_malloc_async_failed_fallback_managed"
+                    : "device_malloc_failed_fallback_managed";
                 device_direct_fallback_allocs.fetch_add(1);
             }
-        } else {
-            policy_action_success = false;
-            policy_action_error = cudaGetErrorString(device_alloc_err);
-            device_direct_reason = "device_malloc_failed_fallback_managed";
-            device_direct_fallback_allocs.fetch_add(1);
         }
     }
 
@@ -1941,6 +2088,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             policy_action_to_string(gap_watch_policy_action),
             hot_gap_match,
             placement_backend,
+            device_direct_backend_used,
             device_direct_eligible,
             device_direct_reason,
             cpu_access_risk,
@@ -2012,6 +2160,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             it->second.gap_watch_policy_action_name =
                 policy_action_to_string(gap_watch_policy_action);
             it->second.placement_backend_name = placement_backend;
+            it->second.device_direct_backend_name = device_direct_backend_used;
             it->second.device_direct_eligible = device_direct_eligible;
             it->second.device_direct_reason = device_direct_reason;
             it->second.cpu_access_risk = cpu_access_risk;
@@ -2029,6 +2178,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             gap_overlap_bytes,
             size_bucket,
             placement_backend,
+            device_direct_backend_used,
             device_direct_eligible,
             device_direct_reason,
             cpu_access_risk,
@@ -2070,6 +2220,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             gap_overlap_end,
             gap_overlap_bytes,
             placement_backend,
+            device_direct_backend_used,
             device_direct_eligible,
             device_direct_reason,
             cpu_access_risk,
@@ -2099,15 +2250,6 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
  */
 void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
     if (ptr != NULL) {
-        cudaError_t err = cudaFree(ptr);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[vLLM UVM] cudaFree failed: %s\n",
-                    cudaGetErrorString(err));
-        }
-
-        // Update statistics
-        size_t current = total_allocated.fetch_sub(size) - size;
-        size_t free_count = num_frees.fetch_add(1) + 1;
         AllocationInfo info{};
         bool has_info = false;
         std::string phase_snapshot;
@@ -2122,9 +2264,29 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
                 active_allocations.erase(it);
             }
         }
+
+        bool is_device_direct =
+            has_info && info.placement_backend_name == "device_direct";
+        bool use_async_backend =
+            is_device_direct &&
+            info.device_direct_backend_name == "cuda_malloc_async";
+        cudaError_t err = use_async_backend
+            ? cudaFreeAsync(ptr, stream)
+            : cudaFree(ptr);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[vLLM UVM] %s failed: %s\n",
+                    use_async_backend ? "cudaFreeAsync" : "cudaFree",
+                    cudaGetErrorString(err));
+        }
+
+        // Update statistics
+        size_t current = total_allocated.fetch_sub(size) - size;
+        size_t free_count = num_frees.fetch_add(1) + 1;
+
         if (has_info &&
             info.placement_backend_name == "device_direct" &&
             err == cudaSuccess) {
+            release_device_direct_budget(info.size);
             device_direct_free_success_allocs.fetch_add(1);
         }
 
@@ -2245,6 +2407,9 @@ void uvm_reset_all_stats(void) {
     peak_allocated.store(0);
     num_allocs.store(0);
     num_frees.store(0);
+    device_direct_live_bytes.store(0);
+    device_direct_peak_live_bytes.store(0);
+    device_direct_budget_rejects.store(0);
 }
 
 /**
@@ -2289,8 +2454,13 @@ void uvm_close_log(void) {
     fprintf(log_file, "  Device-direct trace allocations: %zu\n", device_direct_trace_allocs.load());
     fprintf(log_file, "  Device-direct eligible allocations: %zu\n", device_direct_eligible_allocs.load());
     fprintf(log_file, "  Device-direct requested bytes: %zu\n", device_direct_requested_bytes.load());
+    fprintf(log_file, "  Device-direct backend: %s\n", device_direct_backend.c_str());
+    fprintf(log_file, "  Device-direct max total bytes: %zu\n", device_direct_max_total_bytes);
     fprintf(log_file, "  Device-direct actual allocations: %zu\n", device_direct_actual_allocs.load());
     fprintf(log_file, "  Device-direct actual bytes: %zu\n", device_direct_actual_bytes.load());
+    fprintf(log_file, "  Device-direct live bytes: %zu\n", device_direct_live_bytes.load());
+    fprintf(log_file, "  Device-direct peak live bytes: %zu\n", device_direct_peak_live_bytes.load());
+    fprintf(log_file, "  Device-direct budget rejects: %zu\n", device_direct_budget_rejects.load());
     fprintf(log_file, "  Device-direct fallback allocations: %zu\n", device_direct_fallback_allocs.load());
     fprintf(log_file, "  Device-direct free success: %zu\n", device_direct_free_success_allocs.load());
     fprintf(log_file, "========================================\n\n");

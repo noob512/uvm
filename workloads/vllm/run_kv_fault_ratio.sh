@@ -54,6 +54,8 @@ UVM_GAP_WATCH_REFRESH_MS="${VLLM_UVM_GAP_WATCH_REFRESH_MS:-250}"
 UVM_DEVICE_DIRECT_ENABLE="${VLLM_UVM_DEVICE_DIRECT_ENABLE:-0}"
 UVM_DEVICE_DIRECT_MIN_BYTES="${VLLM_UVM_DEVICE_DIRECT_MIN_BYTES:-4096}"
 UVM_DEVICE_DIRECT_MAX_BYTES="${VLLM_UVM_DEVICE_DIRECT_MAX_BYTES:-1048576}"
+UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES="${VLLM_UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES:-268435456}"
+UVM_DEVICE_DIRECT_BACKEND="${VLLM_UVM_DEVICE_DIRECT_BACKEND:-cuda_malloc}"
 UVM_DEVICE_DIRECT_TARGET_PHASES="${VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES:-enabled:attention,enabled:moe,enabled:model_forward}"
 GAP_WATCH_METRICS_SUMMARY_JSON=""
 
@@ -150,6 +152,12 @@ Options:
                              Min allocation size to mark device-direct eligible (default: 4096)
   --uvm-device-direct-max-bytes <n>
                              Max allocation size to mark device-direct eligible (default: 1048576)
+  --uvm-device-direct-max-total-bytes <n>
+                             Max live bytes allowed for Stage C device-direct backend;
+                             0 means unlimited (default: 268435456)
+  --uvm-device-direct-backend <backend>
+                             Stage C/C2 device-direct backend:
+                             cuda_malloc|cuda_malloc_async (default: cuda_malloc)
   --uvm-device-direct-target-phases <csv>
                              Comma-separated phase prefixes allowed for Stage B eligibility
                              (default: enabled:attention,enabled:moe,enabled:model_forward)
@@ -318,6 +326,8 @@ start_server() {
                 VLLM_UVM_DEVICE_DIRECT_ENABLE='$UVM_DEVICE_DIRECT_ENABLE' \
                 VLLM_UVM_DEVICE_DIRECT_MIN_BYTES='$UVM_DEVICE_DIRECT_MIN_BYTES' \
                 VLLM_UVM_DEVICE_DIRECT_MAX_BYTES='$UVM_DEVICE_DIRECT_MAX_BYTES' \
+                VLLM_UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES='$UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES' \
+                VLLM_UVM_DEVICE_DIRECT_BACKEND='$UVM_DEVICE_DIRECT_BACKEND' \
                 VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES='$UVM_DEVICE_DIRECT_TARGET_PHASES'"
 
     # 3. 构造服务器启动指令
@@ -680,6 +690,8 @@ parse_args() {
       --uvm-device-direct-enable) UVM_DEVICE_DIRECT_ENABLE="$2"; shift 2 ;; # device_direct 阶段 C 默认关闭的真实执行门控
       --uvm-device-direct-min-bytes) UVM_DEVICE_DIRECT_MIN_BYTES="$2"; shift 2 ;; # device_direct 候选最小尺寸
       --uvm-device-direct-max-bytes) UVM_DEVICE_DIRECT_MAX_BYTES="$2"; shift 2 ;; # device_direct 候选最大尺寸
+      --uvm-device-direct-max-total-bytes) UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES="$2"; shift 2 ;; # device_direct C1 总 live bytes 预算
+      --uvm-device-direct-backend) UVM_DEVICE_DIRECT_BACKEND="$2"; shift 2 ;; # device_direct C2 后端 cuda_malloc/cuda_malloc_async
       --uvm-device-direct-target-phases) UVM_DEVICE_DIRECT_TARGET_PHASES="$2"; shift 2 ;; # device_direct 候选 phase 前缀 allowlist
       --gap-watch-metrics-summary-json) GAP_WATCH_METRICS_SUMMARY_JSON="$2"; shift 2 ;; # gap watch 命中/动作证明摘要
       --auto-gap-watch-enable) AUTO_GAP_WATCH_ENABLE="$2"; shift 2 ;; # 同进程 probe -> discover -> main 自动流程
@@ -781,6 +793,8 @@ validate_inputs() {
     [[ "$UVM_DEVICE_DIRECT_ENABLE" =~ ^[01]$ ]] || die "--uvm-device-direct-enable must be 0 or 1"
     [[ "$UVM_DEVICE_DIRECT_MIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-device-direct-min-bytes must be a non-negative integer"
     [[ "$UVM_DEVICE_DIRECT_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-device-direct-max-bytes must be a non-negative integer"
+    [[ "$UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-device-direct-max-total-bytes must be a non-negative integer"
+    [[ "$UVM_DEVICE_DIRECT_BACKEND" =~ ^(cuda_malloc|cuda_malloc_async)$ ]] || die "--uvm-device-direct-backend must be cuda_malloc or cuda_malloc_async"
     [ -n "$UVM_DEVICE_DIRECT_TARGET_PHASES" ] || die "--uvm-device-direct-target-phases must not be empty"
     [[ "$SERVER_MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]] || die "--server-max-num-seqs must be a positive integer"
     [[ "$SERVER_GPU_MEMORY_UTILIZATION" =~ ^(0\.[0-9]+|1(\.0+)?)$ ]] || die "--server-gpu-memory-utilization must be in (0, 1]"
@@ -1083,6 +1097,11 @@ extract_stat_int() {
       echo "$line" | sed -n 's/.*KV类的总缺页数=\([0-9][0-9]*\).*/\1/p'
       ;;
     batch_kv_duplicates)
+      # Localized logs expose the after-dedup value, not duplicate count.
+      # Leave this empty so print_delta_stats can derive duplicates.
+      true
+      ;;
+    batch_kv_after_dedup)
       echo "$line" | sed -n 's/.*KV类的总缺页数=[0-9][0-9]*,去重后=\([0-9][0-9]*\).*/\1/p'
       ;;
     total_faults)
@@ -1093,6 +1112,11 @@ extract_stat_int() {
       ;;
     total_kv_faults)
       echo "$line" | sed -n 's/.*kv总错误数=\([0-9][0-9]*\).*/\1/p'
+      ;;
+    total_kv_duplicates)
+      # Localized logs expose the after-dedup value, not duplicate count.
+      # Leave this empty so print_delta_stats can derive duplicates.
+      true
       ;;
     total_kv_after_dedup)
       echo "$line" | sed -n 's/.*kv总错误数=[0-9][0-9]*,去重后=\([0-9][0-9]*\).*/\1/p'
@@ -1163,22 +1187,13 @@ print_delta_stats() {
   last_total_kv_duplicates="$(extract_stat_int "$last_line" "total_kv_duplicates")"
   last_total_kv_after_dedup="$(extract_stat_int "$last_line" "total_kv_after_dedup")"
 
-  # Derive duplicate counters from fault totals and after-dedup values when the
-  # localized stats line does not expose explicit "*_duplicates" fields.
-  [ -n "$first_batch_duplicates" ] || first_batch_duplicates=$(( first_batch_faults - first_batch_after_dedup ))
-  [ -n "$first_batch_kv_duplicates" ] || first_batch_kv_duplicates=$(( first_batch_kv_faults - first_batch_kv_after_dedup ))
-  [ -n "$first_total_duplicates" ] || first_total_duplicates=$(( first_total_faults - first_total_after_dedup ))
-  [ -n "$first_total_kv_duplicates" ] || first_total_kv_duplicates=$(( first_total_kv_faults - first_total_kv_after_dedup ))
-  [ -n "$last_total_duplicates" ] || last_total_duplicates=$(( last_total_faults - last_total_after_dedup ))
-  [ -n "$last_total_kv_duplicates" ] || last_total_kv_duplicates=$(( last_total_kv_faults - last_total_kv_after_dedup ))
-
   for v in \
-    "$first_batch_faults" "$first_batch_duplicates" "$first_batch_after_dedup" \
-    "$first_batch_kv_faults" "$first_batch_kv_duplicates" "$first_batch_kv_after_dedup" \
-    "$first_total_faults" "$first_total_duplicates" "$first_total_after_dedup" \
-    "$first_total_kv_faults" "$first_total_kv_duplicates" "$first_total_kv_after_dedup" \
-    "$last_total_faults" "$last_total_duplicates" "$last_total_after_dedup" \
-    "$last_total_kv_faults" "$last_total_kv_duplicates" "$last_total_kv_after_dedup"
+    "$first_batch_faults" "$first_batch_after_dedup" \
+    "$first_batch_kv_faults" "$first_batch_kv_after_dedup" \
+    "$first_total_faults" "$first_total_after_dedup" \
+    "$first_total_kv_faults" "$first_total_kv_after_dedup" \
+    "$last_total_faults" "$last_total_after_dedup" \
+    "$last_total_kv_faults" "$last_total_kv_after_dedup"
   do
     [ -n "$v" ] || {
       echo "===== Delta Replayable fault stats (this workload) ====="
@@ -1187,6 +1202,15 @@ print_delta_stats() {
       return 0
     }
   done
+
+  # Derive duplicate counters from fault totals and after-dedup values when the
+  # localized stats line does not expose explicit "*_duplicates" fields.
+  [ -n "$first_batch_duplicates" ] || first_batch_duplicates=$(( first_batch_faults - first_batch_after_dedup ))
+  [ -n "$first_batch_kv_duplicates" ] || first_batch_kv_duplicates=$(( first_batch_kv_faults - first_batch_kv_after_dedup ))
+  [ -n "$first_total_duplicates" ] || first_total_duplicates=$(( first_total_faults - first_total_after_dedup ))
+  [ -n "$first_total_kv_duplicates" ] || first_total_kv_duplicates=$(( first_total_kv_faults - first_total_kv_after_dedup ))
+  [ -n "$last_total_duplicates" ] || last_total_duplicates=$(( last_total_faults - last_total_after_dedup ))
+  [ -n "$last_total_kv_duplicates" ] || last_total_kv_duplicates=$(( last_total_kv_faults - last_total_kv_after_dedup ))
 
   # Baseline at benchmark start:
   # baseline = first_total - first_batch

@@ -11,6 +11,8 @@ cd "$SCRIPT_DIR"
 PROMPTS="${PROMPTS:-20}"
 REQUEST_RATE="${REQUEST_RATE:-5}"
 OUTPUT_LEN="${OUTPUT_LEN:-512}"
+DEVICE_DIRECT_MAX_TOTAL_BYTES="${DEVICE_DIRECT_MAX_TOTAL_BYTES:-268435456}"
+DEVICE_DIRECT_BACKEND="${DEVICE_DIRECT_BACKEND:-cuda_malloc}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-/tmp/vllm_stage_c_attention_p20_ab_${RUN_ID}}"
 
@@ -19,6 +21,8 @@ mkdir -p "$OUT_DIR"
 echo "==========================================================="
 echo " Stage C Attention A/B p${PROMPTS}"
 echo " Output dir: $OUT_DIR"
+echo " Device-direct max total bytes: $DEVICE_DIRECT_MAX_TOTAL_BYTES"
+echo " Device-direct backend: $DEVICE_DIRECT_BACKEND"
 echo "==========================================================="
 
 echo
@@ -41,6 +45,8 @@ echo "==========================================================="
   --uvm-device-direct-enable 0 \
   --uvm-device-direct-min-bytes 4096 \
   --uvm-device-direct-max-bytes 1048576 \
+  --uvm-device-direct-max-total-bytes "$DEVICE_DIRECT_MAX_TOTAL_BYTES" \
+  --uvm-device-direct-backend "$DEVICE_DIRECT_BACKEND" \
   --uvm-device-direct-target-phases enabled:attention \
   --auto-gap-watch-enable 1 \
   --auto-gap-watch-probe-prompts 1 \
@@ -74,6 +80,8 @@ echo "==========================================================="
   --uvm-device-direct-enable 1 \
   --uvm-device-direct-min-bytes 4096 \
   --uvm-device-direct-max-bytes 1048576 \
+  --uvm-device-direct-max-total-bytes "$DEVICE_DIRECT_MAX_TOTAL_BYTES" \
+  --uvm-device-direct-backend "$DEVICE_DIRECT_BACKEND" \
   --uvm-device-direct-target-phases enabled:attention \
   --auto-gap-watch-enable 1 \
   --auto-gap-watch-probe-prompts 1 \
