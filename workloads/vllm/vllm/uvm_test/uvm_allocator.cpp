@@ -60,8 +60,18 @@ static size_t device_direct_min_bytes = 4096;
 static size_t device_direct_max_bytes = 1 * 1024 * 1024;
 static size_t device_direct_max_total_bytes = 256 * 1024 * 1024;
 static std::string device_direct_backend = "cuda_malloc";
+static bool device_direct_pool_release_threshold_set = false;
+static size_t device_direct_pool_release_threshold = 0;
+static bool device_direct_pool_config_attempted = false;
+static bool device_direct_pool_config_success = false;
+static int device_direct_pool_config_device = -1;
+static std::string device_direct_pool_config_error = "not_configured";
 static std::string device_direct_target_phases =
     "enabled:attention,enabled:moe,enabled:model_forward";
+static size_t kv_budget_bytes = 0;
+static std::string kv_budget_mode = "trace_only";
+static size_t weight_budget_bytes = 0;
+static std::string weight_budget_mode = "trace_only";
 static bool gap_watch_control_seen = false;
 static uint64_t gap_watch_control_mtime_ns = 0;
 static off_t gap_watch_control_size = -1;
@@ -71,6 +81,7 @@ static std::chrono::steady_clock::time_point gap_watch_last_refresh_check =
 // Log file handling
 static FILE* log_file = nullptr;
 static std::mutex log_mutex;
+static std::mutex device_direct_pool_mutex;
 static std::chrono::steady_clock::time_point start_time;
 static bool log_initialized = false;
 static std::string current_phase = "unscoped";
@@ -157,6 +168,48 @@ static std::atomic<size_t> device_direct_free_success_allocs{0};
 /// 能为系统节省多少 UVM 缺页追踪开销。
 static std::atomic<size_t> device_direct_requested_bytes{0};
 
+/// @brief Stage D：被识别为 KV cache 的分配次数。
+static std::atomic<size_t> kv_trace_allocs{0};
+
+/// @brief Stage D：KV cache 分配请求累计字节数。
+static std::atomic<size_t> kv_requested_bytes{0};
+
+/// @brief Stage D：当前仍存活的 KV cache 字节数。
+static std::atomic<size_t> kv_live_bytes{0};
+
+/// @brief Stage D：KV cache 存活字节高水位。
+static std::atomic<size_t> kv_peak_live_bytes{0};
+
+/// @brief Stage D：KV cache 分配后超过独立预算的次数。
+static std::atomic<size_t> kv_budget_over_allocs{0};
+
+/// @brief Stage D：KV budget enforce 模式下产生的软拒绝信号次数。
+static std::atomic<size_t> kv_budget_reject_allocs{0};
+
+/// @brief Stage D：KV cache 分配在 free 阶段成功释放的次数。
+static std::atomic<size_t> kv_free_success_allocs{0};
+
+/// @brief Stage E：被识别为模型权重的分配次数。
+static std::atomic<size_t> weight_trace_allocs{0};
+
+/// @brief Stage E：模型权重分配请求累计字节数。
+static std::atomic<size_t> weight_requested_bytes{0};
+
+/// @brief Stage E：当前仍存活的模型权重字节数。
+static std::atomic<size_t> weight_live_bytes{0};
+
+/// @brief Stage E：模型权重存活字节高水位。
+static std::atomic<size_t> weight_peak_live_bytes{0};
+
+/// @brief Stage E：模型权重分配后超过独立预算的次数。
+static std::atomic<size_t> weight_budget_over_allocs{0};
+
+/// @brief Stage E：weight budget enforce 模式下产生的软拒绝信号次数。
+static std::atomic<size_t> weight_budget_reject_allocs{0};
+
+/// @brief Stage E：模型权重分配在 free 阶段成功释放的次数。
+static std::atomic<size_t> weight_free_success_allocs{0};
+
 /**
  * @struct AllocationInfo
  * @brief UVM 显存分配的元数据生命周期快照 (Metadata Lifecycle Snapshot)
@@ -210,6 +263,12 @@ struct AllocationInfo {
     bool device_direct_eligible;    ///< 评估此内存块是否具备绕过 UVM、直接使用 cudaMalloc 的资格（取决于大小和生命周期）。
     std::string device_direct_reason; ///< 判定是否具备绕过资格的具体原因（如 "below_min_bytes", "target_class_mismatch"）。
     std::string cpu_access_risk;    ///< 风险评估标签：如果将其强制放置在 GPU 上，未来被 CPU 访问触发严重 Page Fault 的风险等级。
+    bool kv_budget_tracked;         ///< Stage D：此分配是否纳入 KV 独立预算遥测。
+    bool kv_budget_over_budget;     ///< Stage D：记录分配完成后 KV live bytes 是否超过预算。
+    std::string kv_budget_reason;   ///< Stage D：KV budget 判定原因。
+    bool weight_budget_tracked;      ///< Stage E：此分配是否纳入 weights 独立预算遥测。
+    bool weight_budget_over_budget;  ///< Stage E：记录分配完成后 weight live bytes 是否超过预算。
+    std::string weight_budget_reason;///< Stage E：weight budget 判定原因。
 };
 static std::unordered_map<void*, AllocationInfo> active_allocations;
 
@@ -418,6 +477,62 @@ static std::string normalize_device_direct_backend(const std::string& value) {
     return "cuda_malloc";
 }
 
+static std::string normalize_kv_budget_mode(const std::string& value) {
+    std::string lowered = lower_copy(trim_copy(value));
+    if (lowered == "enforce" || lowered == "soft_enforce") {
+        return "enforce";
+    }
+    return "trace_only";
+}
+
+static std::string normalize_weight_budget_mode(const std::string& value) {
+    std::string lowered = lower_copy(trim_copy(value));
+    if (lowered == "enforce" || lowered == "soft_enforce") {
+        return "enforce";
+    }
+    return "trace_only";
+}
+
+static bool configure_device_direct_async_pool_if_needed(int device) {
+    if (!device_direct_pool_release_threshold_set ||
+        device_direct_backend != "cuda_malloc_async") {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(device_direct_pool_mutex);
+    if (device_direct_pool_config_attempted &&
+        device_direct_pool_config_device == device) {
+        return device_direct_pool_config_success;
+    }
+
+    device_direct_pool_config_attempted = true;
+    device_direct_pool_config_success = false;
+    device_direct_pool_config_device = device;
+
+    cudaMemPool_t pool = nullptr;
+    cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, device);
+    if (err != cudaSuccess) {
+        device_direct_pool_config_error = cudaGetErrorString(err);
+        return false;
+    }
+
+    uint64_t threshold =
+        static_cast<uint64_t>(device_direct_pool_release_threshold);
+    err = cudaMemPoolSetAttribute(
+        pool,
+        cudaMemPoolAttrReleaseThreshold,
+        &threshold
+    );
+    if (err != cudaSuccess) {
+        device_direct_pool_config_error = cudaGetErrorString(err);
+        return false;
+    }
+
+    device_direct_pool_config_success = true;
+    device_direct_pool_config_error = "none";
+    return true;
+}
+
 static bool comma_list_contains_phase_prefix(const std::string& csv,
                                              const std::string& phase) {
     if (csv.empty() || string_equals_ignore_case(csv, "any")) {
@@ -583,6 +698,14 @@ static bool is_device_direct_action(PolicyAction action) {
            action == PolicyAction::DeviceDirect;
 }
 
+static bool is_kv_allocation(AllocationClass alloc_class) {
+    return alloc_class == AllocationClass::KvPersistent;
+}
+
+static bool is_weight_allocation(AllocationClass alloc_class) {
+    return alloc_class == AllocationClass::WeightPersistent;
+}
+
 static void update_device_direct_peak_live(size_t current_live) {
     size_t peak = device_direct_peak_live_bytes.load();
     while (current_live > peak) {
@@ -631,6 +754,129 @@ static size_t device_direct_budget_remaining_snapshot(size_t live) {
     return live >= device_direct_max_total_bytes
         ? 0
         : device_direct_max_total_bytes - live;
+}
+
+static void update_kv_peak_live(size_t current_live) {
+    size_t peak = kv_peak_live_bytes.load();
+    while (current_live > peak) {
+        if (kv_peak_live_bytes.compare_exchange_weak(peak, current_live)) {
+            break;
+        }
+    }
+}
+
+static size_t kv_budget_remaining_snapshot(size_t live) {
+    if (kv_budget_bytes == 0) {
+        return 0;
+    }
+    return live >= kv_budget_bytes ? 0 : kv_budget_bytes - live;
+}
+
+static void record_kv_allocation(size_t size,
+                                 bool* over_budget_out,
+                                 const char** reason_out) {
+    kv_trace_allocs.fetch_add(1);
+    kv_requested_bytes.fetch_add(size);
+
+    size_t current_live = kv_live_bytes.fetch_add(size) + size;
+    update_kv_peak_live(current_live);
+
+    bool over_budget = kv_budget_bytes > 0 && current_live > kv_budget_bytes;
+    if (over_budget) {
+        kv_budget_over_allocs.fetch_add(1);
+        if (kv_budget_mode == "enforce") {
+            kv_budget_reject_allocs.fetch_add(1);
+        }
+    }
+
+    if (over_budget_out) {
+        *over_budget_out = over_budget;
+    }
+    if (reason_out) {
+        if (kv_budget_bytes == 0) {
+            *reason_out = "kv_budget_unlimited";
+        } else if (!over_budget) {
+            *reason_out = "kv_budget_within_budget";
+        } else if (kv_budget_mode == "enforce") {
+            // Stage D enforce is intentionally soft at allocator level. The
+            // block manager must own real KV eviction/swap/recompute decisions.
+            *reason_out = "kv_budget_exceeded_soft_enforce";
+        } else {
+            *reason_out = "kv_budget_exceeded_trace_only";
+        }
+    }
+}
+
+static void release_kv_budget(size_t size) {
+    size_t live = kv_live_bytes.load();
+    while (true) {
+        size_t next_live = live >= size ? live - size : 0;
+        if (kv_live_bytes.compare_exchange_weak(live, next_live)) {
+            return;
+        }
+    }
+}
+
+static void update_weight_peak_live(size_t current_live) {
+    size_t peak = weight_peak_live_bytes.load();
+    while (current_live > peak) {
+        if (weight_peak_live_bytes.compare_exchange_weak(peak, current_live)) {
+            break;
+        }
+    }
+}
+
+static size_t weight_budget_remaining_snapshot(size_t live) {
+    if (weight_budget_bytes == 0) {
+        return 0;
+    }
+    return live >= weight_budget_bytes ? 0 : weight_budget_bytes - live;
+}
+
+static void record_weight_allocation(size_t size,
+                                     bool* over_budget_out,
+                                     const char** reason_out) {
+    weight_trace_allocs.fetch_add(1);
+    weight_requested_bytes.fetch_add(size);
+
+    size_t current_live = weight_live_bytes.fetch_add(size) + size;
+    update_weight_peak_live(current_live);
+
+    bool over_budget =
+        weight_budget_bytes > 0 && current_live > weight_budget_bytes;
+    if (over_budget) {
+        weight_budget_over_allocs.fetch_add(1);
+        if (weight_budget_mode == "enforce") {
+            weight_budget_reject_allocs.fetch_add(1);
+        }
+    }
+
+    if (over_budget_out) {
+        *over_budget_out = over_budget;
+    }
+    if (reason_out) {
+        if (weight_budget_bytes == 0) {
+            *reason_out = "weight_budget_unlimited";
+        } else if (!over_budget) {
+            *reason_out = "weight_budget_within_budget";
+        } else if (weight_budget_mode == "enforce") {
+            // Stage E only emits an allocator-side soft signal. Real weight
+            // offload/eviction must be owned by later model-loader/runtime work.
+            *reason_out = "weight_budget_exceeded_soft_enforce";
+        } else {
+            *reason_out = "weight_budget_exceeded_trace_only";
+        }
+    }
+}
+
+static void release_weight_budget(size_t size) {
+    size_t live = weight_live_bytes.load();
+    while (true) {
+        size_t next_live = live >= size ? live - size : 0;
+        if (weight_live_bytes.compare_exchange_weak(live, next_live)) {
+            return;
+        }
+    }
 }
 
 static const char* size_bucket_for(size_t size) {
@@ -1276,9 +1522,37 @@ static void init_log_file() {
                 device_direct_backend.c_str()
             )
         );
+        const char* pool_release_threshold_env =
+            getenv("VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD");
+        device_direct_pool_release_threshold_set =
+            pool_release_threshold_env && pool_release_threshold_env[0] != '\0';
+        device_direct_pool_release_threshold = read_size_from_env_allow_zero(
+            "VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD",
+            device_direct_pool_release_threshold
+        );
         device_direct_target_phases = read_string_from_env(
             "VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES",
             device_direct_target_phases.c_str()
+        );
+        kv_budget_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_KV_BUDGET_BYTES",
+            kv_budget_bytes
+        );
+        kv_budget_mode = normalize_kv_budget_mode(
+            read_string_from_env(
+                "VLLM_UVM_KV_BUDGET_MODE",
+                kv_budget_mode.c_str()
+            )
+        );
+        weight_budget_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_WEIGHT_BUDGET_BYTES",
+            weight_budget_bytes
+        );
+        weight_budget_mode = normalize_weight_budget_mode(
+            read_string_from_env(
+                "VLLM_UVM_WEIGHT_BUDGET_MODE",
+                weight_budget_mode.c_str()
+            )
         );
         uintptr_t parsed_gap_start = 0;
         uintptr_t parsed_gap_end = 0;
@@ -1326,7 +1600,11 @@ static void init_log_file() {
                 "device_direct_max_bytes=%zu "
                 "device_direct_max_total_bytes=%zu "
                 "device_direct_backend=%s "
-                "device_direct_target_phases=%s\n",
+                "device_direct_pool_release_threshold_set=%d "
+                "device_direct_pool_release_threshold=%zu "
+                "device_direct_target_phases=%s "
+                "kv_budget_bytes=%zu kv_budget_mode=%s "
+                "weight_budget_bytes=%zu weight_budget_mode=%s\n",
                 timestamp, policy_enabled, policy_mode.c_str(),
                 policy_warmup_prefetch_enabled, policy_warmup_prefetch_min_bytes,
                 policy_warmup_advise_gpu,
@@ -1347,7 +1625,13 @@ static void init_log_file() {
                 device_direct_max_bytes,
                 device_direct_max_total_bytes,
                 device_direct_backend.c_str(),
-                device_direct_target_phases.c_str()
+                device_direct_pool_release_threshold_set ? 1 : 0,
+                device_direct_pool_release_threshold,
+                device_direct_target_phases.c_str(),
+                kv_budget_bytes,
+                kv_budget_mode.c_str(),
+                weight_budget_bytes,
+                weight_budget_mode.c_str()
             );
             fprintf(log_file, "========================================\n");
 
@@ -1513,6 +1797,12 @@ static void trace_policy_event(void* ptr,
                                bool device_direct_eligible,
                                const char* device_direct_reason,
                                const char* cpu_access_risk,
+                               bool kv_budget_tracked,
+                               bool kv_budget_over_budget,
+                               const char* kv_budget_reason,
+                               bool weight_budget_tracked,
+                               bool weight_budget_over_budget,
+                               const char* weight_budget_reason,
                                bool hot_gap_match,
                                bool action_success,
                                const char* action_error) {
@@ -1529,6 +1819,22 @@ static void trace_policy_event(void* ptr,
     size_t device_direct_live_snapshot = device_direct_live_bytes.load();
     size_t device_direct_budget_remaining =
         device_direct_budget_remaining_snapshot(device_direct_live_snapshot);
+    size_t kv_live_snapshot = kv_live_bytes.load();
+    size_t kv_budget_remaining = kv_budget_remaining_snapshot(kv_live_snapshot);
+    size_t weight_live_snapshot = weight_live_bytes.load();
+    size_t weight_budget_remaining =
+        weight_budget_remaining_snapshot(weight_live_snapshot);
+    int pool_config_attempted_snapshot = 0;
+    int pool_config_success_snapshot = 0;
+    int pool_config_device_snapshot = -1;
+    {
+        std::lock_guard<std::mutex> pool_lock(device_direct_pool_mutex);
+        pool_config_attempted_snapshot =
+            device_direct_pool_config_attempted ? 1 : 0;
+        pool_config_success_snapshot =
+            device_direct_pool_config_success ? 1 : 0;
+        pool_config_device_snapshot = device_direct_pool_config_device;
+    }
 
     fprintf(
         log_file,
@@ -1541,6 +1847,18 @@ static void trace_policy_event(void* ptr,
         "device_direct_eligible=%d device_direct_reason=%s "
         "device_direct_live_bytes=%zu device_direct_max_total_bytes=%zu "
         "device_direct_budget_remaining=%zu "
+        "device_direct_pool_release_threshold_set=%d "
+        "device_direct_pool_release_threshold=%zu "
+        "device_direct_pool_config_attempted=%d "
+        "device_direct_pool_config_success=%d "
+        "device_direct_pool_config_device=%d "
+        "kv_budget_tracked=%d kv_budget_over_budget=%d "
+        "kv_budget_reason=%s kv_live_bytes=%zu kv_budget_bytes=%zu "
+        "kv_budget_remaining=%zu kv_budget_mode=%s "
+        "weight_budget_tracked=%d weight_budget_over_budget=%d "
+        "weight_budget_reason=%s weight_live_bytes=%zu "
+        "weight_budget_bytes=%zu weight_budget_remaining=%zu "
+        "weight_budget_mode=%s "
         "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
@@ -1565,6 +1883,25 @@ static void trace_policy_event(void* ptr,
         device_direct_live_snapshot,
         device_direct_max_total_bytes,
         device_direct_budget_remaining,
+        device_direct_pool_release_threshold_set ? 1 : 0,
+        device_direct_pool_release_threshold,
+        pool_config_attempted_snapshot,
+        pool_config_success_snapshot,
+        pool_config_device_snapshot,
+        kv_budget_tracked ? 1 : 0,
+        kv_budget_over_budget ? 1 : 0,
+        kv_budget_reason ? kv_budget_reason : "not_kv",
+        kv_live_snapshot,
+        kv_budget_bytes,
+        kv_budget_remaining,
+        kv_budget_mode.c_str(),
+        weight_budget_tracked ? 1 : 0,
+        weight_budget_over_budget ? 1 : 0,
+        weight_budget_reason ? weight_budget_reason : "not_weight",
+        weight_live_snapshot,
+        weight_budget_bytes,
+        weight_budget_remaining,
+        weight_budget_mode.c_str(),
         cpu_access_risk ? cpu_access_risk : "unknown",
         hot_gap_match ? 1 : 0
     );
@@ -1639,6 +1976,12 @@ static void trace_gap_watch_alloc_event(void* ptr,
                                         bool device_direct_eligible,
                                         const char* device_direct_reason,
                                         const char* cpu_access_risk,
+                                        bool kv_budget_tracked,
+                                        bool kv_budget_over_budget,
+                                        const char* kv_budget_reason,
+                                        bool weight_budget_tracked,
+                                        bool weight_budget_over_budget,
+                                        const char* weight_budget_reason,
                                         bool hot_gap_match) {
     if (!log_file) return;
 
@@ -1660,6 +2003,22 @@ static void trace_gap_watch_alloc_event(void* ptr,
     size_t device_direct_live_snapshot = device_direct_live_bytes.load();
     size_t device_direct_budget_remaining =
         device_direct_budget_remaining_snapshot(device_direct_live_snapshot);
+    size_t kv_live_snapshot = kv_live_bytes.load();
+    size_t kv_budget_remaining = kv_budget_remaining_snapshot(kv_live_snapshot);
+    size_t weight_live_snapshot = weight_live_bytes.load();
+    size_t weight_budget_remaining =
+        weight_budget_remaining_snapshot(weight_live_snapshot);
+    int pool_config_attempted_snapshot = 0;
+    int pool_config_success_snapshot = 0;
+    int pool_config_device_snapshot = -1;
+    {
+        std::lock_guard<std::mutex> pool_lock(device_direct_pool_mutex);
+        pool_config_attempted_snapshot =
+            device_direct_pool_config_attempted ? 1 : 0;
+        pool_config_success_snapshot =
+            device_direct_pool_config_success ? 1 : 0;
+        pool_config_device_snapshot = device_direct_pool_config_device;
+    }
 
     fprintf(
         log_file,
@@ -1672,6 +2031,18 @@ static void trace_gap_watch_alloc_event(void* ptr,
         "device_direct_eligible=%d device_direct_reason=%s "
         "device_direct_live_bytes=%zu device_direct_max_total_bytes=%zu "
         "device_direct_budget_remaining=%zu "
+        "device_direct_pool_release_threshold_set=%d "
+        "device_direct_pool_release_threshold=%zu "
+        "device_direct_pool_config_attempted=%d "
+        "device_direct_pool_config_success=%d "
+        "device_direct_pool_config_device=%d "
+        "kv_budget_tracked=%d kv_budget_over_budget=%d "
+        "kv_budget_reason=%s kv_live_bytes=%zu kv_budget_bytes=%zu "
+        "kv_budget_remaining=%zu kv_budget_mode=%s "
+        "weight_budget_tracked=%d weight_budget_over_budget=%d "
+        "weight_budget_reason=%s weight_live_bytes=%zu "
+        "weight_budget_bytes=%zu weight_budget_remaining=%zu "
+        "weight_budget_mode=%s "
         "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
@@ -1700,6 +2071,25 @@ static void trace_gap_watch_alloc_event(void* ptr,
         device_direct_live_snapshot,
         device_direct_max_total_bytes,
         device_direct_budget_remaining,
+        device_direct_pool_release_threshold_set ? 1 : 0,
+        device_direct_pool_release_threshold,
+        pool_config_attempted_snapshot,
+        pool_config_success_snapshot,
+        pool_config_device_snapshot,
+        kv_budget_tracked ? 1 : 0,
+        kv_budget_over_budget ? 1 : 0,
+        kv_budget_reason ? kv_budget_reason : "not_kv",
+        kv_live_snapshot,
+        kv_budget_bytes,
+        kv_budget_remaining,
+        kv_budget_mode.c_str(),
+        weight_budget_tracked ? 1 : 0,
+        weight_budget_over_budget ? 1 : 0,
+        weight_budget_reason ? weight_budget_reason : "not_weight",
+        weight_live_snapshot,
+        weight_budget_bytes,
+        weight_budget_remaining,
+        weight_budget_mode.c_str(),
         cpu_access_risk ? cpu_access_risk : "unknown",
         hot_gap_match ? 1 : 0
     );
@@ -1743,6 +2133,9 @@ static void trace_gap_watch_free_event(void* ptr,
         "overlap_ratio_of_watch=%.6f lifetime_s=%.6f total_bytes=%zu "
         "placement_backend=%s device_direct_backend=%s "
         "device_direct_eligible=%d device_direct_reason=%s "
+        "kv_budget_tracked=%d kv_budget_over_budget=%d kv_budget_reason=%s "
+        "weight_budget_tracked=%d weight_budget_over_budget=%d "
+        "weight_budget_reason=%s "
         "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
@@ -1772,6 +2165,12 @@ static void trace_gap_watch_free_event(void* ptr,
         info->device_direct_backend_name.c_str(),
         info->device_direct_eligible ? 1 : 0,
         info->device_direct_reason.c_str(),
+        info->kv_budget_tracked ? 1 : 0,
+        info->kv_budget_over_budget ? 1 : 0,
+        info->kv_budget_reason.c_str(),
+        info->weight_budget_tracked ? 1 : 0,
+        info->weight_budget_over_budget ? 1 : 0,
+        info->weight_budget_reason.c_str(),
         info->cpu_access_risk.c_str(),
         info->hot_gap_match ? 1 : 0
     );
@@ -1955,6 +2354,27 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         : "unknown";
     const char* device_direct_reason = "not_requested";
     bool device_direct_eligible = false;
+    bool kv_budget_tracked = is_kv_allocation(alloc_class);
+    bool kv_budget_over_budget = false;
+    const char* kv_budget_reason = "not_kv";
+    bool weight_budget_tracked = is_weight_allocation(alloc_class);
+    bool weight_budget_over_budget = false;
+    const char* weight_budget_reason = "not_weight";
+
+    if (kv_budget_tracked) {
+        record_kv_allocation(
+            static_cast<size_t>(size),
+            &kv_budget_over_budget,
+            &kv_budget_reason
+        );
+    }
+    if (weight_budget_tracked) {
+        record_weight_allocation(
+            static_cast<size_t>(size),
+            &weight_budget_over_budget,
+            &weight_budget_reason
+        );
+    }
 
     if (device_direct_requested) {
         if (device < 0) {
@@ -2002,9 +2422,24 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
                 cudaSetDevice(device);
             }
             bool use_async_backend = device_direct_backend == "cuda_malloc_async";
-            cudaError_t device_alloc_err = use_async_backend
-                ? cudaMallocAsync(&device_ptr, static_cast<size_t>(size), stream)
-                : cudaMalloc(&device_ptr, static_cast<size_t>(size));
+            bool pool_config_ready = true;
+            std::string pool_config_error_snapshot = "none";
+            if (use_async_backend) {
+                pool_config_ready =
+                    configure_device_direct_async_pool_if_needed(device);
+                if (!pool_config_ready) {
+                    std::lock_guard<std::mutex> pool_lock(device_direct_pool_mutex);
+                    pool_config_error_snapshot = device_direct_pool_config_error;
+                }
+            }
+            cudaError_t device_alloc_err = cudaSuccess;
+            if (pool_config_ready) {
+                device_alloc_err = use_async_backend
+                    ? cudaMallocAsync(&device_ptr, static_cast<size_t>(size), stream)
+                    : cudaMalloc(&device_ptr, static_cast<size_t>(size));
+            } else {
+                device_alloc_err = cudaErrorInvalidValue;
+            }
             if (get_device_err == cudaSuccess && previous_device >= 0) {
                 cudaSetDevice(previous_device);
             }
@@ -2035,10 +2470,16 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             } else {
                 release_device_direct_budget(static_cast<size_t>(size));
                 policy_action_success = false;
-                policy_action_error = cudaGetErrorString(device_alloc_err);
-                device_direct_reason = use_async_backend
-                    ? "device_malloc_async_failed_fallback_managed"
-                    : "device_malloc_failed_fallback_managed";
+                policy_action_error = pool_config_ready
+                    ? cudaGetErrorString(device_alloc_err)
+                    : pool_config_error_snapshot.c_str();
+                if (!pool_config_ready) {
+                    device_direct_reason = "device_direct_pool_config_failed";
+                } else {
+                    device_direct_reason = use_async_backend
+                        ? "device_malloc_async_failed_fallback_managed"
+                        : "device_malloc_failed_fallback_managed";
+                }
                 device_direct_fallback_allocs.fetch_add(1);
             }
         }
@@ -2062,7 +2503,9 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     bool store_active_info =
         static_cast<size_t>(size) >= trace_min_bytes ||
         log_unknown_detail || log_gap_watch ||
-        strcmp(placement_backend, "device_direct") == 0;
+        strcmp(placement_backend, "device_direct") == 0 ||
+        kv_budget_tracked ||
+        weight_budget_tracked;
 
     // 7.1 记录活跃分配元数据，供 free / gap watch / unknown detail 使用
     if (store_active_info) {
@@ -2092,6 +2535,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             device_direct_eligible,
             device_direct_reason,
             cpu_access_risk,
+            kv_budget_tracked,
+            kv_budget_over_budget,
+            kv_budget_reason,
+            weight_budget_tracked,
+            weight_budget_over_budget,
+            weight_budget_reason,
         };
     }
 
@@ -2164,6 +2613,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             it->second.device_direct_eligible = device_direct_eligible;
             it->second.device_direct_reason = device_direct_reason;
             it->second.cpu_access_risk = cpu_access_risk;
+            it->second.kv_budget_tracked = kv_budget_tracked;
+            it->second.kv_budget_over_budget = kv_budget_over_budget;
+            it->second.kv_budget_reason = kv_budget_reason;
+            it->second.weight_budget_tracked = weight_budget_tracked;
+            it->second.weight_budget_over_budget = weight_budget_over_budget;
+            it->second.weight_budget_reason = weight_budget_reason;
             it->second.hot_gap_match = hot_gap_match;
         }
     }
@@ -2182,6 +2637,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             device_direct_eligible,
             device_direct_reason,
             cpu_access_risk,
+            kv_budget_tracked,
+            kv_budget_over_budget,
+            kv_budget_reason,
+            weight_budget_tracked,
+            weight_budget_over_budget,
+            weight_budget_reason,
             hot_gap_match,
             policy_action_success, policy_action_error
         );
@@ -2224,6 +2685,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             device_direct_eligible,
             device_direct_reason,
             cpu_access_risk,
+            kv_budget_tracked,
+            kv_budget_over_budget,
+            kv_budget_reason,
+            weight_budget_tracked,
+            weight_budget_over_budget,
+            weight_budget_reason,
             hot_gap_match
         );
     }
@@ -2288,6 +2755,14 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
             err == cudaSuccess) {
             release_device_direct_budget(info.size);
             device_direct_free_success_allocs.fetch_add(1);
+        }
+        if (has_info && info.kv_budget_tracked && err == cudaSuccess) {
+            release_kv_budget(info.size);
+            kv_free_success_allocs.fetch_add(1);
+        }
+        if (has_info && info.weight_budget_tracked && err == cudaSuccess) {
+            release_weight_budget(info.size);
+            weight_free_success_allocs.fetch_add(1);
         }
 
         // Log large frees (> 100MB) to file
@@ -2410,6 +2885,20 @@ void uvm_reset_all_stats(void) {
     device_direct_live_bytes.store(0);
     device_direct_peak_live_bytes.store(0);
     device_direct_budget_rejects.store(0);
+    kv_trace_allocs.store(0);
+    kv_requested_bytes.store(0);
+    kv_live_bytes.store(0);
+    kv_peak_live_bytes.store(0);
+    kv_budget_over_allocs.store(0);
+    kv_budget_reject_allocs.store(0);
+    kv_free_success_allocs.store(0);
+    weight_trace_allocs.store(0);
+    weight_requested_bytes.store(0);
+    weight_live_bytes.store(0);
+    weight_peak_live_bytes.store(0);
+    weight_budget_over_allocs.store(0);
+    weight_budget_reject_allocs.store(0);
+    weight_free_success_allocs.store(0);
 }
 
 /**
@@ -2456,6 +2945,21 @@ void uvm_close_log(void) {
     fprintf(log_file, "  Device-direct requested bytes: %zu\n", device_direct_requested_bytes.load());
     fprintf(log_file, "  Device-direct backend: %s\n", device_direct_backend.c_str());
     fprintf(log_file, "  Device-direct max total bytes: %zu\n", device_direct_max_total_bytes);
+    {
+        std::lock_guard<std::mutex> pool_lock(device_direct_pool_mutex);
+        fprintf(log_file, "  Device-direct pool release threshold set: %d\n",
+                device_direct_pool_release_threshold_set ? 1 : 0);
+        fprintf(log_file, "  Device-direct pool release threshold: %zu\n",
+                device_direct_pool_release_threshold);
+        fprintf(log_file, "  Device-direct pool config attempted: %d\n",
+                device_direct_pool_config_attempted ? 1 : 0);
+        fprintf(log_file, "  Device-direct pool config success: %d\n",
+                device_direct_pool_config_success ? 1 : 0);
+        fprintf(log_file, "  Device-direct pool config device: %d\n",
+                device_direct_pool_config_device);
+        fprintf(log_file, "  Device-direct pool config error: %s\n",
+                device_direct_pool_config_error.c_str());
+    }
     fprintf(log_file, "  Device-direct actual allocations: %zu\n", device_direct_actual_allocs.load());
     fprintf(log_file, "  Device-direct actual bytes: %zu\n", device_direct_actual_bytes.load());
     fprintf(log_file, "  Device-direct live bytes: %zu\n", device_direct_live_bytes.load());
@@ -2463,6 +2967,28 @@ void uvm_close_log(void) {
     fprintf(log_file, "  Device-direct budget rejects: %zu\n", device_direct_budget_rejects.load());
     fprintf(log_file, "  Device-direct fallback allocations: %zu\n", device_direct_fallback_allocs.load());
     fprintf(log_file, "  Device-direct free success: %zu\n", device_direct_free_success_allocs.load());
+    fprintf(log_file, "  KV budget bytes: %zu\n", kv_budget_bytes);
+    fprintf(log_file, "  KV budget mode: %s\n", kv_budget_mode.c_str());
+    fprintf(log_file, "  KV trace allocations: %zu\n", kv_trace_allocs.load());
+    fprintf(log_file, "  KV requested bytes: %zu\n", kv_requested_bytes.load());
+    fprintf(log_file, "  KV live bytes: %zu\n", kv_live_bytes.load());
+    fprintf(log_file, "  KV peak live bytes: %zu\n", kv_peak_live_bytes.load());
+    fprintf(log_file, "  KV budget remaining: %zu\n",
+            kv_budget_remaining_snapshot(kv_live_bytes.load()));
+    fprintf(log_file, "  KV budget over allocations: %zu\n", kv_budget_over_allocs.load());
+    fprintf(log_file, "  KV budget reject allocations: %zu\n", kv_budget_reject_allocs.load());
+    fprintf(log_file, "  KV free success: %zu\n", kv_free_success_allocs.load());
+    fprintf(log_file, "  Weight budget bytes: %zu\n", weight_budget_bytes);
+    fprintf(log_file, "  Weight budget mode: %s\n", weight_budget_mode.c_str());
+    fprintf(log_file, "  Weight trace allocations: %zu\n", weight_trace_allocs.load());
+    fprintf(log_file, "  Weight requested bytes: %zu\n", weight_requested_bytes.load());
+    fprintf(log_file, "  Weight live bytes: %zu\n", weight_live_bytes.load());
+    fprintf(log_file, "  Weight peak live bytes: %zu\n", weight_peak_live_bytes.load());
+    fprintf(log_file, "  Weight budget remaining: %zu\n",
+            weight_budget_remaining_snapshot(weight_live_bytes.load()));
+    fprintf(log_file, "  Weight budget over allocations: %zu\n", weight_budget_over_allocs.load());
+    fprintf(log_file, "  Weight budget reject allocations: %zu\n", weight_budget_reject_allocs.load());
+    fprintf(log_file, "  Weight free success: %zu\n", weight_free_success_allocs.load());
     fprintf(log_file, "========================================\n\n");
 
     fflush(log_file);

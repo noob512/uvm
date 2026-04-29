@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import json
 import os
 import time
 from collections import defaultdict
@@ -608,6 +609,7 @@ class GPUModelRunner(
         self._logged_weight_ptrs: set[int] = set()
         self._logged_kv_ptrs: set[int] = set()
         self._uvm_address_log_prepared = False
+        self._uvm_weight_map_prepared = False
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -3426,6 +3428,17 @@ class GPUModelRunner(
             "VLLM_UVM_ADDRESS_LOG_FILE", "vllm_uvm_address_regions.log"
         )
 
+    def _is_uvm_weight_map_enabled(self) -> bool:
+        default_enabled = self._is_uvm_address_logging_enabled()
+        return self._env_flag_enabled(
+            "VLLM_UVM_WEIGHT_MAP_ENABLE", default=default_enabled
+        )
+
+    def _uvm_weight_map_file(self) -> str:
+        return os.environ.get(
+            "VLLM_UVM_WEIGHT_MAP_FILE", "vllm_uvm_weight_regions.jsonl"
+        )
+
     def _prepare_uvm_address_log(self) -> None:
         if self._uvm_address_log_prepared or not self._is_uvm_address_logging_enabled():
             return
@@ -3451,6 +3464,30 @@ class GPUModelRunner(
                     )
 
         self._uvm_address_log_prepared = True
+
+    def _prepare_uvm_weight_map_log(self) -> None:
+        if self._uvm_weight_map_prepared or not self._is_uvm_weight_map_enabled():
+            return
+
+        log_path = self._uvm_weight_map_file()
+        try:
+            if is_global_first_rank():
+                with open(log_path, "w", encoding="utf-8"):
+                    pass
+        except OSError as exc:
+            logger.warning("Failed to reset UVM weight map %s: %s", log_path, exc)
+        finally:
+            if torch.distributed.is_initialized():
+                try:
+                    get_world_group().barrier()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to synchronize UVM weight map reset for %s: %s",
+                        log_path,
+                        exc,
+                    )
+
+        self._uvm_weight_map_prepared = True
 
     def _append_uvm_address_log(
         self, phase: str, rows: list[tuple[str, str, int, int, int]]
@@ -3509,7 +3546,86 @@ class GPUModelRunner(
             # 仅记录警告日志而不是抛出异常导致程序崩溃，因为日志记录失败不应影响主推理流程的执行
             logger.warning("Failed to write UVM address log %s: %s", log_path, exc)
 
-    def _collect_weight_address_rows(self) -> list[tuple[str, str, int, int, int]]:
+    @staticmethod
+    def _uvm_weight_semantic_tags(name: str) -> dict[str, Any]:
+        parts = name.split(".")
+        layer_id: int | None = None
+        expert_id: int | None = None
+        role = "other"
+        shard_id: str | None = None
+        is_moe_expert = False
+
+        for idx, part in enumerate(parts):
+            if part == "layers" and idx + 1 < len(parts):
+                try:
+                    layer_id = int(parts[idx + 1])
+                except ValueError:
+                    pass
+            if part == "experts" and idx + 1 < len(parts):
+                try:
+                    expert_id = int(parts[idx + 1])
+                    is_moe_expert = True
+                except ValueError:
+                    pass
+
+        lowered = name.lower()
+        if "experts" in parts or "fused_experts" in lowered:
+            is_moe_expert = True
+        if any(token in lowered for token in ("w13", "gate_up_proj")):
+            role = "moe_gate_up"
+            shard_id = "w13"
+        elif any(token in lowered for token in ("w1", "gate_proj")):
+            role = "moe_gate"
+            shard_id = "w1"
+        elif any(token in lowered for token in ("w3", "up_proj")):
+            role = "moe_up"
+            shard_id = "w3"
+        elif any(token in lowered for token in ("w2", "down_proj")):
+            role = "moe_down"
+            shard_id = "w2"
+        elif "router" in lowered or "gate" in lowered:
+            role = "moe_router"
+        elif "self_attn" in lowered or ".attn." in lowered:
+            role = "attention"
+        elif "mlp" in lowered:
+            role = "mlp"
+        elif "embed" in lowered:
+            role = "embedding"
+        elif "norm" in lowered:
+            role = "norm"
+
+        return {
+            "layer_id": layer_id,
+            "expert_id": expert_id,
+            "role": role,
+            "shard_id": shard_id,
+            "is_moe_expert": is_moe_expert,
+        }
+
+    def _append_uvm_weight_map_log(
+        self, phase: str, records: list[dict[str, Any]]
+    ) -> None:
+        if not records or not self._is_uvm_weight_map_enabled():
+            return
+
+        self._prepare_uvm_weight_map_log()
+        log_path = self._uvm_weight_map_file()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        try:
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                for record in records:
+                    record = dict(record)
+                    record["timestamp"] = timestamp
+                    record["phase"] = phase
+                    record["pid"] = os.getpid()
+                    record["model"] = self.model_config.model
+                    log_file.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as exc:
+            logger.warning("Failed to write UVM weight map %s: %s", log_path, exc)
+
+    def _collect_weight_address_rows(
+        self,
+    ) -> tuple[list[tuple[str, str, int, int, int]], list[dict[str, Any]]]:
         """
         收集当前模型中所有权重和缓冲区的底层显存地址信息。
         
@@ -3519,6 +3635,7 @@ class GPUModelRunner(
         """
         # 初始化用于存储结果的列表
         rows: list[tuple[str, str, int, int, int]] = []
+        semantic_records: list[dict[str, Any]] = []
 
         # 定义一个内部辅助函数，用于处理和记录单个张量 (Tensor) 的信息
         def record_tensor(kind: str, name: str, tensor: torch.Tensor) -> None:
@@ -3551,6 +3668,22 @@ class GPUModelRunner(
             # 将收集到的信息打包为元组并添加到列表中。
             # 结束地址计算方式为：起始地址 + 总字节数 - 1
             rows.append((kind, name, ptr, ptr + size_bytes - 1, size_bytes))
+            semantic = self._uvm_weight_semantic_tags(name)
+            semantic_records.append(
+                {
+                    "kind": kind,
+                    "name": name,
+                    "start": f"0x{ptr:x}",
+                    "end": f"0x{ptr + size_bytes - 1:x}",
+                    "start_int": ptr,
+                    "end_int": ptr + size_bytes - 1,
+                    "size_bytes": size_bytes,
+                    "dtype": str(tensor.dtype),
+                    "shape": list(tensor.shape),
+                    "device": str(tensor.device),
+                    **semantic,
+                }
+            )
 
         # 获取底层的 PyTorch 模型实例
         model = self.get_model()
@@ -3568,8 +3701,8 @@ class GPUModelRunner(
         for name, buffer in model.named_buffers(recurse=True):
             record_tensor("weight:buffer", name, buffer)
 
-        # 返回收集到的所有内存块地址信息
-        return rows
+        # 返回旧 CSV 地址行和 Stage E2 语义 sidecar 记录
+        return rows, semantic_records
 
     def _collect_kv_cache_address_rows(
         self, kv_caches: dict[str, Any]
@@ -3701,11 +3834,12 @@ class GPUModelRunner(
 
         # 调用辅助方法，遍历模型的所有层，收集各个权重张量 (tensors) 的底层指针地址或页表信息，
         # 并将其整理为可记录的行结构 (rows)。
-        rows = self._collect_weight_address_rows()
+        rows, semantic_records = self._collect_weight_address_rows()
         
         # 将收集到的权重地址行追加写入到 UVM (统一虚拟内存) 地址专属的日志或记录表中，
         # 同时打上当前所属的 phase (阶段) 标签，方便后续按时间线进行内存变化追踪。
         self._append_uvm_address_log(phase, rows)
+        self._append_uvm_weight_map_log(phase, semantic_records)
 
     def _log_kv_cache_addresses(self, kv_caches: dict[str, Any], phase: str) -> None:
         """

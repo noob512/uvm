@@ -13,6 +13,7 @@ REQUEST_RATE="${REQUEST_RATE:-5}"
 OUTPUT_LEN="${OUTPUT_LEN:-512}"
 DEVICE_DIRECT_MAX_TOTAL_BYTES="${DEVICE_DIRECT_MAX_TOTAL_BYTES:-268435456}"
 DEVICE_DIRECT_BACKEND="${DEVICE_DIRECT_BACKEND:-cuda_malloc}"
+DEVICE_DIRECT_POOL_RELEASE_THRESHOLD="${DEVICE_DIRECT_POOL_RELEASE_THRESHOLD:-}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-/tmp/vllm_stage_c_attention_p20_ab_${RUN_ID}}"
 
@@ -23,6 +24,7 @@ echo " Stage C Attention A/B p${PROMPTS}"
 echo " Output dir: $OUT_DIR"
 echo " Device-direct max total bytes: $DEVICE_DIRECT_MAX_TOTAL_BYTES"
 echo " Device-direct backend: $DEVICE_DIRECT_BACKEND"
+echo " Device-direct pool release threshold: ${DEVICE_DIRECT_POOL_RELEASE_THRESHOLD:-<cuda-default>}"
 echo "==========================================================="
 
 echo
@@ -47,6 +49,7 @@ echo "==========================================================="
   --uvm-device-direct-max-bytes 1048576 \
   --uvm-device-direct-max-total-bytes "$DEVICE_DIRECT_MAX_TOTAL_BYTES" \
   --uvm-device-direct-backend "$DEVICE_DIRECT_BACKEND" \
+  --uvm-device-direct-pool-release-threshold "$DEVICE_DIRECT_POOL_RELEASE_THRESHOLD" \
   --uvm-device-direct-target-phases enabled:attention \
   --auto-gap-watch-enable 1 \
   --auto-gap-watch-probe-prompts 1 \
@@ -82,6 +85,7 @@ echo "==========================================================="
   --uvm-device-direct-max-bytes 1048576 \
   --uvm-device-direct-max-total-bytes "$DEVICE_DIRECT_MAX_TOTAL_BYTES" \
   --uvm-device-direct-backend "$DEVICE_DIRECT_BACKEND" \
+  --uvm-device-direct-pool-release-threshold "$DEVICE_DIRECT_POOL_RELEASE_THRESHOLD" \
   --uvm-device-direct-target-phases enabled:attention \
   --auto-gap-watch-enable 1 \
   --auto-gap-watch-probe-prompts 1 \

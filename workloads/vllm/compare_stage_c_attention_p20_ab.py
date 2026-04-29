@@ -182,7 +182,35 @@ def run_summary(
             "device_direct_min_budget_remaining_observed": metrics.get(
                 "device_direct_min_budget_remaining_observed"
             ),
+            "device_direct_pool_release_threshold_set": metrics.get(
+                "device_direct_pool_release_threshold_set"
+            ),
+            "device_direct_pool_release_threshold": metrics.get(
+                "device_direct_pool_release_threshold"
+            ),
+            "device_direct_pool_config_attempted": metrics.get(
+                "device_direct_pool_config_attempted"
+            ),
+            "device_direct_pool_config_success": metrics.get(
+                "device_direct_pool_config_success"
+            ),
+            "device_direct_pool_config_error": metrics.get(
+                "device_direct_pool_config_error"
+            ),
             "device_direct_reason_counts": metrics.get("device_direct_reason_counts"),
+            "kv_budget_bytes": metrics.get("kv_budget_bytes"),
+            "kv_budget_mode": metrics.get("kv_budget_mode"),
+            "kv_trace_allocations": metrics.get("kv_trace_allocations"),
+            "kv_live_bytes": metrics.get("kv_live_bytes"),
+            "kv_peak_live_bytes_observed": metrics.get(
+                "kv_peak_live_bytes_observed"
+            ),
+            "kv_min_budget_remaining_observed": metrics.get(
+                "kv_min_budget_remaining_observed"
+            ),
+            "kv_budget_over_records": metrics.get("kv_budget_over_records"),
+            "kv_budget_reject_records": metrics.get("kv_budget_reject_records"),
+            "kv_budget_reason_counts": metrics.get("kv_budget_reason_counts"),
             "hot_gap_match_records": metrics.get("hot_gap_match_records"),
             "median_lifetime_s": metrics.get("median_lifetime_s"),
             "phase_record_ratios": metrics.get("phase_record_ratios"),
@@ -236,6 +264,15 @@ def verdict(trace_run: dict[str, Any], device_run: dict[str, Any]) -> dict[str, 
                 <= device_metrics.get("device_direct_max_total_bytes")
             )
         ),
+        "device_pool_config_ok_if_requested": (
+            not device_metrics.get("device_direct_pool_release_threshold_set")
+            or (
+                device_metrics.get("device_direct_pool_config_attempted") == 1
+                and device_metrics.get("device_direct_pool_config_success") == 1
+                and device_metrics.get("device_direct_pool_config_error")
+                in (None, "none")
+            )
+        ),
         "device_gap_faults_lower_than_trace": (
             gap_fault_delta is not None and gap_fault_delta < 0
         ),
@@ -272,6 +309,7 @@ def verdict(trace_run: dict[str, Any], device_run: dict[str, Any]) -> dict[str, 
             and checks["device_direct_backend_present"]
             and checks["device_policy_fail_zero"]
             and checks["device_peak_live_within_budget"]
+            and checks["device_pool_config_ok_if_requested"]
         ),
         "effectiveness_signal": (
             checks["device_gap_faults_lower_than_trace"]
@@ -368,6 +406,18 @@ def main() -> int:
         f"{device_run['metrics'].get('device_direct_peak_live_bytes_observed')} "
         "budget_reject_records="
         f"{device_run['metrics'].get('device_direct_budget_reject_records')}"
+    )
+    print(
+        "- device_direct_pool_release_threshold_set="
+        f"{device_run['metrics'].get('device_direct_pool_release_threshold_set')} "
+        "threshold="
+        f"{device_run['metrics'].get('device_direct_pool_release_threshold')} "
+        "pool_config_attempted="
+        f"{device_run['metrics'].get('device_direct_pool_config_attempted')} "
+        "pool_config_success="
+        f"{device_run['metrics'].get('device_direct_pool_config_success')} "
+        "pool_config_error="
+        f"{device_run['metrics'].get('device_direct_pool_config_error')}"
     )
     print(
         f"- success_signal={comp['success_signal']} "

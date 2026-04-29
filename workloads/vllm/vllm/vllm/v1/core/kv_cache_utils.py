@@ -74,6 +74,137 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 logger = init_logger(__name__)
 
+
+def _read_uvm_kv_budget_bytes() -> int:
+    raw = os.environ.get("VLLM_UVM_KV_BUDGET_BYTES", "")
+    if not raw:
+        return 0
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid VLLM_UVM_KV_BUDGET_BYTES=%r; expected integer bytes.",
+            raw,
+        )
+        return 0
+    return max(parsed, 0)
+
+
+def _read_uvm_kv_budget_mode() -> str:
+    mode = os.environ.get("VLLM_UVM_KV_BUDGET_MODE", "trace_only")
+    mode = mode.strip().lower()
+    return mode if mode in ("trace_only", "enforce") else "trace_only"
+
+
+def _uvm_kv_budget_enforce_enabled() -> bool:
+    return _read_uvm_kv_budget_bytes() > 0 and _read_uvm_kv_budget_mode() == "enforce"
+
+
+def _kv_cache_config_total_bytes(kv_cache_config: KVCacheConfig) -> int:
+    return sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+
+
+def _apply_uvm_kv_budget_to_available_memory(
+    available_memory: list[int],
+) -> list[int]:
+    """Apply the Stage D2 per-worker KV budget before block planning.
+
+    This is the semantic enforcement point: vLLM generates fewer KV blocks
+    instead of letting the allocator observe an oversized KV pool afterwards.
+    """
+    budget_bytes = _read_uvm_kv_budget_bytes()
+    mode = _read_uvm_kv_budget_mode()
+    if budget_bytes <= 0 or mode != "enforce":
+        return available_memory
+
+    capped: list[int] = []
+    for worker_index, worker_memory in enumerate(available_memory):
+        capped_memory = min(worker_memory, budget_bytes)
+        capped.append(capped_memory)
+        if capped_memory < worker_memory:
+            logger.warning(
+                "Stage D2 KV budget enforce: capping worker %d KV planning "
+                "memory from %.2f GiB to %.2f GiB.",
+                worker_index,
+                worker_memory / GiB_bytes,
+                capped_memory / GiB_bytes,
+            )
+    return capped
+
+
+def _enforce_uvm_kv_budget_on_config(
+    kv_cache_config: KVCacheConfig,
+    *,
+    worker_index: int,
+    budget_cap_applied: bool,
+) -> KVCacheConfig:
+    """Final guardrail for Stage D2 KV budget enforcement.
+
+    num_gpu_blocks_override and alignment rules can otherwise inflate tensor
+    sizes after available-memory capping. This guard shrinks num_blocks
+    proportionally or fails early if even one KV block cannot fit the budget.
+    """
+    budget_bytes = _read_uvm_kv_budget_bytes()
+    mode = _read_uvm_kv_budget_mode()
+    current_bytes = _kv_cache_config_total_bytes(kv_cache_config)
+
+    kv_cache_config.uvm_kv_budget_bytes = budget_bytes if budget_bytes > 0 else None
+    kv_cache_config.uvm_kv_budget_mode = mode
+    kv_cache_config.uvm_kv_budget_final_bytes = current_bytes
+    kv_cache_config.uvm_kv_budget_enforced = budget_cap_applied
+
+    if budget_bytes <= 0 or mode != "enforce" or current_bytes <= budget_bytes:
+        return kv_cache_config
+
+    old_num_blocks = kv_cache_config.num_blocks
+    if old_num_blocks <= 0 or not kv_cache_config.kv_cache_tensors:
+        raise ValueError(
+            "Stage D2 KV budget enforcement cannot create a valid KV cache: "
+            f"worker={worker_index}, num_blocks={old_num_blocks}, "
+            f"current_bytes={current_bytes}, budget_bytes={budget_bytes}."
+        )
+
+    bytes_per_block = current_bytes // old_num_blocks
+    if bytes_per_block <= 0 or budget_bytes < bytes_per_block:
+        raise ValueError(
+            "Stage D2 KV budget is too small for one KV block: "
+            f"worker={worker_index}, bytes_per_block={bytes_per_block}, "
+            f"budget_bytes={budget_bytes}."
+        )
+
+    new_num_blocks = max(budget_bytes // bytes_per_block, 1)
+    while new_num_blocks > 0 and bytes_per_block * new_num_blocks > budget_bytes:
+        new_num_blocks -= 1
+    if new_num_blocks <= 0:
+        raise ValueError(
+            "Stage D2 KV budget is too small after alignment: "
+            f"worker={worker_index}, bytes_per_block={bytes_per_block}, "
+            f"budget_bytes={budget_bytes}."
+        )
+
+    for tensor in kv_cache_config.kv_cache_tensors:
+        assert tensor.size % old_num_blocks == 0
+        tensor.size = tensor.size // old_num_blocks * new_num_blocks
+
+    kv_cache_config.uvm_kv_budget_enforced = True
+    kv_cache_config.uvm_kv_budget_original_num_blocks = old_num_blocks
+    kv_cache_config.uvm_kv_budget_original_bytes = current_bytes
+    kv_cache_config.num_blocks = new_num_blocks
+    kv_cache_config.uvm_kv_budget_final_bytes = _kv_cache_config_total_bytes(
+        kv_cache_config
+    )
+    logger.warning(
+        "Stage D2 KV budget enforce: shrunk worker %d KV blocks from %d to %d "
+        "and KV tensor bytes from %.2f GiB to %.2f GiB (budget %.2f GiB).",
+        worker_index,
+        old_num_blocks,
+        new_num_blocks,
+        current_bytes / GiB_bytes,
+        kv_cache_config.uvm_kv_budget_final_bytes / GiB_bytes,
+        budget_bytes / GiB_bytes,
+    )
+    return kv_cache_config
+
 # The hash seed for the first block of any prefix block sequence.
 #
 # We use a random value to avoid hash collisions or PYTHONHASHSEED environment
@@ -1304,6 +1435,21 @@ def _report_kv_cache_config(
         max_concurrency,
         scope="local",
     )
+    if kv_cache_config.uvm_kv_budget_bytes is not None:
+        logger.info_once(
+            "Stage D2 UVM KV budget: mode=%s budget=%.2f GiB enforced=%s "
+            "final_kv_bytes=%.2f GiB original_kv_bytes=%s",
+            kv_cache_config.uvm_kv_budget_mode,
+            kv_cache_config.uvm_kv_budget_bytes / GiB_bytes,
+            kv_cache_config.uvm_kv_budget_enforced,
+            (kv_cache_config.uvm_kv_budget_final_bytes or 0) / GiB_bytes,
+            (
+                f"{kv_cache_config.uvm_kv_budget_original_bytes / GiB_bytes:.2f} GiB"
+                if kv_cache_config.uvm_kv_budget_original_bytes is not None
+                else "n/a"
+            ),
+            scope="local",
+        )
 
 
 def get_kv_cache_configs(
@@ -1338,9 +1484,13 @@ def get_kv_cache_configs(
         The generated KVCacheConfigs for each worker.
     """
 
+    effective_available_memory = _apply_uvm_kv_budget_to_available_memory(
+        available_memory
+    )
+
     # Check if the available memory is enough for each worker.
     for kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        kv_cache_specs, available_memory
+        kv_cache_specs, effective_available_memory
     ):
         check_enough_kv_cache_memory(
             vllm_config, kv_cache_spec_one_worker, available_memory_one_worker
@@ -1362,9 +1512,11 @@ def get_kv_cache_configs(
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
 
     kv_cache_configs: list[KVCacheConfig] = []
-    for kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        kv_cache_specs, available_memory
-    ):
+    for worker_index, (
+        kv_cache_spec_one_worker,
+        available_memory_one_worker,
+        original_available_memory_one_worker,
+    ) in enumerate(zip(kv_cache_specs, effective_available_memory, available_memory)):
         kv_cache_groups_one_worker: list[KVCacheGroupSpec] = []
         for group in global_kv_cache_groups:
             group_layer_names_one_worker = [
@@ -1379,8 +1531,15 @@ def get_kv_cache_configs(
             len(group.layer_names) for group in kv_cache_groups_one_worker
         ) == len(kv_cache_spec_one_worker), "Some layers are not assigned to any group."
         kv_cache_configs.append(
-            get_kv_cache_config_from_groups(
-                vllm_config, kv_cache_groups_one_worker, available_memory_one_worker
+            _enforce_uvm_kv_budget_on_config(
+                get_kv_cache_config_from_groups(
+                    vllm_config, kv_cache_groups_one_worker, available_memory_one_worker
+                ),
+                worker_index=worker_index,
+                budget_cap_applied=(
+                    _uvm_kv_budget_enforce_enabled()
+                    and available_memory_one_worker < original_available_memory_one_worker
+                ),
             )
         )
 
@@ -1398,6 +1557,9 @@ def get_kv_cache_configs(
         for tensor in kv_cache_config.kv_cache_tensors:
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
+        kv_cache_config.uvm_kv_budget_final_bytes = _kv_cache_config_total_bytes(
+            kv_cache_config
+        )
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)

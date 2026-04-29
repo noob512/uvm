@@ -5,6 +5,9 @@ from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial
+import json
+import os
+import time
 from typing import Literal, cast, get_args, overload
 
 import torch
@@ -95,6 +98,13 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 
 logger = init_logger(__name__)
+
+
+def _env_flag_enabled(env_name: str, default: bool = False) -> bool:
+    env_value = os.environ.get(env_name)
+    if env_value is None:
+        return default
+    return env_value.lower() in ("1", "true", "yes", "on")
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -577,6 +587,14 @@ class FusedMoE(CustomOp):
         self.moe_config_use_flashinfer_cutlass_kernels = (
             self.moe_config.use_flashinfer_cutlass_kernels
         )
+        self.uvm_moe_trace_enabled = _env_flag_enabled(
+            "VLLM_UVM_MOE_ROUTING_TRACE_ENABLE", default=False
+        )
+        self.uvm_moe_trace_file = os.environ.get(
+            "VLLM_UVM_MOE_ROUTING_TRACE_FILE",
+            "vllm_uvm_moe_routing_trace.jsonl",
+        )
+        self._uvm_moe_trace_step = 0
 
         self.quant_config = quant_config
 
@@ -1646,7 +1664,61 @@ class FusedMoE(CustomOp):
             )
         else:
             zero_expert_result = None
+        self._log_uvm_moe_routing_trace(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
         return topk_weights, topk_ids, zero_expert_result
+
+    def _log_uvm_moe_routing_trace(
+        self,
+        *,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> None:
+        if not self.uvm_moe_trace_enabled:
+            return
+        try:
+            ids = topk_ids.detach()
+            valid_ids = ids[ids >= 0].to(dtype=torch.long)
+            counts = torch.bincount(
+                valid_ids.flatten(),
+                minlength=max(int(self.global_num_experts), 0),
+            ).cpu()
+            active = torch.nonzero(counts, as_tuple=False).flatten().tolist()
+            active_counts = {
+                str(int(expert_id)): int(counts[expert_id].item())
+                for expert_id in active
+                if counts[expert_id].item() > 0
+            }
+            record = {
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "layer_name": self.layer_name,
+                "step": self._uvm_moe_trace_step,
+                "num_tokens": int(hidden_states.shape[0])
+                if hidden_states.ndim > 0
+                else 1,
+                "top_k": int(self.top_k),
+                "global_num_experts": int(self.global_num_experts),
+                "logical_num_experts": int(self.logical_num_experts),
+                "local_num_experts": int(self.local_num_experts),
+                "topk_shape": list(topk_ids.shape),
+                "router_logits_shape": list(router_logits.shape),
+                "expert_token_counts": active_counts,
+                "active_experts": [int(expert_id) for expert_id in active],
+                "topk_weight_sum": float(topk_weights.detach().sum().cpu().item()),
+                "enable_eplb": bool(self.enable_eplb),
+            }
+            self._uvm_moe_trace_step += 1
+            with open(self.uvm_moe_trace_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception:
+            logger.debug("Failed to write UVM MoE routing trace", exc_info=True)
 
     def must_reduce_shared_expert_outputs(self) -> bool:
         """

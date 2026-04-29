@@ -36,6 +36,7 @@ Warning:
 
 import ctypes
 import os
+import atexit
 from contextlib import contextmanager
 from typing import Optional
 
@@ -151,7 +152,19 @@ def load_uvm_library() -> ctypes.CDLL:
     lib.uvm_mark_phase_event.restype = None
     lib.uvm_mark_phase_event.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 
+    lib.uvm_close_log.restype = None
+    lib.uvm_close_log.argtypes = []
+
     return lib
+
+
+def _close_uvm_log_at_exit() -> None:
+    if _uvm_lib is None:
+        return
+    try:
+        _uvm_lib.uvm_close_log()
+    except Exception:
+        logger.debug("Failed to close UVM allocator log", exc_info=True)
 
 
 def enable_uvm_allocator(
@@ -204,6 +217,7 @@ def enable_uvm_allocator(
         )
         torch.cuda.memory.change_current_allocator(allocator)
         _uvm_enabled = True
+        atexit.register(_close_uvm_log_at_exit)
         logger.info("UVM allocator enabled successfully")
         _set_uvm_phase("enabled")
         mark_uvm_phase_event("allocator_enabled", "enabled")

@@ -56,7 +56,16 @@ UVM_DEVICE_DIRECT_MIN_BYTES="${VLLM_UVM_DEVICE_DIRECT_MIN_BYTES:-4096}"
 UVM_DEVICE_DIRECT_MAX_BYTES="${VLLM_UVM_DEVICE_DIRECT_MAX_BYTES:-1048576}"
 UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES="${VLLM_UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES:-268435456}"
 UVM_DEVICE_DIRECT_BACKEND="${VLLM_UVM_DEVICE_DIRECT_BACKEND:-cuda_malloc}"
+UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD="${VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD:-}"
 UVM_DEVICE_DIRECT_TARGET_PHASES="${VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES:-enabled:attention,enabled:moe,enabled:model_forward}"
+UVM_KV_BUDGET_BYTES="${VLLM_UVM_KV_BUDGET_BYTES:-0}"
+UVM_KV_BUDGET_MODE="${VLLM_UVM_KV_BUDGET_MODE:-trace_only}"
+UVM_WEIGHT_BUDGET_BYTES="${VLLM_UVM_WEIGHT_BUDGET_BYTES:-0}"
+UVM_WEIGHT_BUDGET_MODE="${VLLM_UVM_WEIGHT_BUDGET_MODE:-trace_only}"
+UVM_WEIGHT_MAP_ENABLE="${VLLM_UVM_WEIGHT_MAP_ENABLE:-1}"
+UVM_WEIGHT_MAP_FILE="${VLLM_UVM_WEIGHT_MAP_FILE:-}"
+UVM_MOE_ROUTING_TRACE_ENABLE="${VLLM_UVM_MOE_ROUTING_TRACE_ENABLE:-0}"
+UVM_MOE_ROUTING_TRACE_FILE="${VLLM_UVM_MOE_ROUTING_TRACE_FILE:-}"
 GAP_WATCH_METRICS_SUMMARY_JSON=""
 
 AUTO_GAP_WATCH_ENABLE=0
@@ -158,9 +167,38 @@ Options:
   --uvm-device-direct-backend <backend>
                              Stage C/C2 device-direct backend:
                              cuda_malloc|cuda_malloc_async (default: cuda_malloc)
+  --uvm-device-direct-pool-release-threshold <n>
+                             Configure cuda_malloc_async default CUDA mempool
+                             release threshold. Empty/unset keeps CUDA default;
+                             0 is allowed and means aggressive release.
   --uvm-device-direct-target-phases <csv>
                              Comma-separated phase prefixes allowed for Stage B eligibility
                              (default: enabled:attention,enabled:moe,enabled:model_forward)
+  --uvm-kv-budget-bytes <n>
+                             Stage D KV cache logical budget in bytes.
+                             0 means unlimited telemetry-only budget (default: 0)
+  --uvm-kv-budget-mode <mode>
+                             Stage D KV budget mode: trace_only|enforce.
+                             enforce is allocator-side soft signaling; block-manager
+                             eviction/swap is intentionally not done here (default: trace_only)
+  --uvm-weight-budget-bytes <n>
+                             Stage E model weights logical budget in bytes.
+                             0 means unlimited telemetry-only budget (default: 0)
+  --uvm-weight-budget-mode <mode>
+                             Stage E weight budget mode: trace_only|enforce.
+                             enforce is allocator-side soft signaling; real
+                             weight offload/eviction is intentionally future work
+                             (default: trace_only)
+  --uvm-weight-map-enable <0|1>
+                             Emit Stage E weight tensor semantic address map JSONL
+                             sidecar (default: 1)
+  --uvm-weight-map-file <path>
+                             Stage E weight tensor semantic address map JSONL path
+  --uvm-moe-routing-trace-enable <0|1>
+                             Emit Stage E MoE expert routing aggregate JSONL
+                             during benchmark/runtime phases (default: 0)
+  --uvm-moe-routing-trace-file <path>
+                             Stage E MoE routing aggregate JSONL path
   --gap-watch-metrics-summary-json <path>
                              Optional post-run JSON summary proving whether gap-watch policy hit and succeeded
   --auto-gap-watch-enable <0|1>
@@ -307,6 +345,16 @@ start_server() {
       : > "$ALLOCATOR_TRACE_LOG"
       allocator_env="VLLM_UVM_LOG_FILE='$ALLOCATOR_TRACE_LOG' VLLM_UVM_TRACE_MIN_BYTES='$UVM_TRACE_MIN_BYTES'"
     fi
+    local uvm_stage_e_log_dir="$SCRIPT_DIR"
+    if [ -n "$ALLOCATOR_TRACE_LOG" ]; then
+      uvm_stage_e_log_dir="$(dirname "$ALLOCATOR_TRACE_LOG")"
+    fi
+    if [ -z "$UVM_WEIGHT_MAP_FILE" ]; then
+      UVM_WEIGHT_MAP_FILE="$uvm_stage_e_log_dir/vllm_uvm_weight_regions.jsonl"
+    fi
+    if [ -z "$UVM_MOE_ROUTING_TRACE_FILE" ]; then
+      UVM_MOE_ROUTING_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_moe_routing_trace.jsonl"
+    fi
     policy_env="VLLM_UVM_POLICY_ENABLE='$UVM_POLICY_ENABLE' \
                 VLLM_UVM_POLICY_MODE='$UVM_POLICY_MODE' \
                 VLLM_UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES='$UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES' \
@@ -328,7 +376,16 @@ start_server() {
                 VLLM_UVM_DEVICE_DIRECT_MAX_BYTES='$UVM_DEVICE_DIRECT_MAX_BYTES' \
                 VLLM_UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES='$UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES' \
                 VLLM_UVM_DEVICE_DIRECT_BACKEND='$UVM_DEVICE_DIRECT_BACKEND' \
-                VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES='$UVM_DEVICE_DIRECT_TARGET_PHASES'"
+                VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD='$UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD' \
+                VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES='$UVM_DEVICE_DIRECT_TARGET_PHASES' \
+                VLLM_UVM_KV_BUDGET_BYTES='$UVM_KV_BUDGET_BYTES' \
+                VLLM_UVM_KV_BUDGET_MODE='$UVM_KV_BUDGET_MODE' \
+                VLLM_UVM_WEIGHT_BUDGET_BYTES='$UVM_WEIGHT_BUDGET_BYTES' \
+                VLLM_UVM_WEIGHT_BUDGET_MODE='$UVM_WEIGHT_BUDGET_MODE' \
+                VLLM_UVM_WEIGHT_MAP_ENABLE='$UVM_WEIGHT_MAP_ENABLE' \
+                VLLM_UVM_WEIGHT_MAP_FILE='$UVM_WEIGHT_MAP_FILE' \
+                VLLM_UVM_MOE_ROUTING_TRACE_ENABLE='$UVM_MOE_ROUTING_TRACE_ENABLE' \
+                VLLM_UVM_MOE_ROUTING_TRACE_FILE='$UVM_MOE_ROUTING_TRACE_FILE'"
 
     # 3. 构造服务器启动指令
     local server_cmd
@@ -692,7 +749,16 @@ parse_args() {
       --uvm-device-direct-max-bytes) UVM_DEVICE_DIRECT_MAX_BYTES="$2"; shift 2 ;; # device_direct 候选最大尺寸
       --uvm-device-direct-max-total-bytes) UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES="$2"; shift 2 ;; # device_direct C1 总 live bytes 预算
       --uvm-device-direct-backend) UVM_DEVICE_DIRECT_BACKEND="$2"; shift 2 ;; # device_direct C2 后端 cuda_malloc/cuda_malloc_async
+      --uvm-device-direct-pool-release-threshold) UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD="$2"; shift 2 ;; # cuda_malloc_async 默认 mempool release threshold
       --uvm-device-direct-target-phases) UVM_DEVICE_DIRECT_TARGET_PHASES="$2"; shift 2 ;; # device_direct 候选 phase 前缀 allowlist
+      --uvm-kv-budget-bytes) UVM_KV_BUDGET_BYTES="$2"; shift 2 ;; # Stage D KV cache 独立预算，0 表示不限额
+      --uvm-kv-budget-mode) UVM_KV_BUDGET_MODE="$2"; shift 2 ;; # Stage D KV budget 模式 trace_only/enforce
+      --uvm-weight-budget-bytes) UVM_WEIGHT_BUDGET_BYTES="$2"; shift 2 ;; # Stage E weights 独立预算，0 表示不限额
+      --uvm-weight-budget-mode) UVM_WEIGHT_BUDGET_MODE="$2"; shift 2 ;; # Stage E weight budget 模式 trace_only/enforce
+      --uvm-weight-map-enable) UVM_WEIGHT_MAP_ENABLE="$2"; shift 2 ;; # Stage E weight semantic map 开关
+      --uvm-weight-map-file) UVM_WEIGHT_MAP_FILE="$2"; shift 2 ;; # Stage E weight semantic map JSONL
+      --uvm-moe-routing-trace-enable) UVM_MOE_ROUTING_TRACE_ENABLE="$2"; shift 2 ;; # Stage E MoE routing trace 开关
+      --uvm-moe-routing-trace-file) UVM_MOE_ROUTING_TRACE_FILE="$2"; shift 2 ;; # Stage E MoE routing trace JSONL
       --gap-watch-metrics-summary-json) GAP_WATCH_METRICS_SUMMARY_JSON="$2"; shift 2 ;; # gap watch 命中/动作证明摘要
       --auto-gap-watch-enable) AUTO_GAP_WATCH_ENABLE="$2"; shift 2 ;; # 同进程 probe -> discover -> main 自动流程
       --auto-gap-watch-probe-prompts) AUTO_GAP_WATCH_PROBE_PROMPTS="$2"; shift 2 ;; # 自动流程 probe 阶段的 prompt 数
@@ -795,7 +861,16 @@ validate_inputs() {
     [[ "$UVM_DEVICE_DIRECT_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-device-direct-max-bytes must be a non-negative integer"
     [[ "$UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-device-direct-max-total-bytes must be a non-negative integer"
     [[ "$UVM_DEVICE_DIRECT_BACKEND" =~ ^(cuda_malloc|cuda_malloc_async)$ ]] || die "--uvm-device-direct-backend must be cuda_malloc or cuda_malloc_async"
+    if [ -n "$UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD" ]; then
+      [[ "$UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD" =~ ^[0-9]+$ ]] || die "--uvm-device-direct-pool-release-threshold must be a non-negative integer"
+    fi
     [ -n "$UVM_DEVICE_DIRECT_TARGET_PHASES" ] || die "--uvm-device-direct-target-phases must not be empty"
+    [[ "$UVM_KV_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-kv-budget-bytes must be a non-negative integer"
+    [[ "$UVM_KV_BUDGET_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-kv-budget-mode must be trace_only or enforce"
+    [[ "$UVM_WEIGHT_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-weight-budget-bytes must be a non-negative integer"
+    [[ "$UVM_WEIGHT_BUDGET_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-weight-budget-mode must be trace_only or enforce"
+    [[ "$UVM_WEIGHT_MAP_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-map-enable must be 0 or 1"
+    [[ "$UVM_MOE_ROUTING_TRACE_ENABLE" =~ ^[01]$ ]] || die "--uvm-moe-routing-trace-enable must be 0 or 1"
     [[ "$SERVER_MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]] || die "--server-max-num-seqs must be a positive integer"
     [[ "$SERVER_GPU_MEMORY_UTILIZATION" =~ ^(0\.[0-9]+|1(\.0+)?)$ ]] || die "--server-gpu-memory-utilization must be in (0, 1]"
     [[ "$AUTO_GAP_WATCH_ENABLE" =~ ^[01]$ ]] || die "--auto-gap-watch-enable must be 0 or 1"

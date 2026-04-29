@@ -402,3 +402,15 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
     kv_cache_groups: list[KVCacheGroupSpec]
+    uvm_kv_budget_bytes: int | None = None
+    """Stage D2: per-worker KV budget applied to this config, if any."""
+    uvm_kv_budget_mode: str | None = None
+    """Stage D2: KV budget mode observed while generating this config."""
+    uvm_kv_budget_enforced: bool = False
+    """Stage D2: whether vLLM semantic KV budget enforcement changed this config."""
+    uvm_kv_budget_original_num_blocks: int | None = None
+    """Stage D2: num_blocks before semantic budget enforcement."""
+    uvm_kv_budget_original_bytes: int | None = None
+    """Stage D2: total KV tensor bytes before semantic budget enforcement."""
+    uvm_kv_budget_final_bytes: int | None = None
+    """Stage D2: total KV tensor bytes after semantic budget enforcement."""

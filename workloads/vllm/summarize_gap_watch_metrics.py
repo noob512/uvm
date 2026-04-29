@@ -49,6 +49,22 @@ def parse_kv_fields(line: str) -> dict[str, str]:
     }
 
 
+def optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def optional_bool_from_int(value: object) -> bool | None:
+    parsed = optional_int(value)
+    if parsed is None:
+        return None
+    return bool(parsed)
+
+
 def counter_ratios(counter: Counter[str]) -> dict[str, float]:
     total = sum(counter.values())
     if total <= 0:
@@ -104,6 +120,63 @@ def main() -> int:
     device_direct_max_total_bytes_values: list[int] = []
     device_direct_live_bytes_values: list[int] = []
     device_direct_budget_remaining_values: list[int] = []
+    device_direct_pool_release_threshold_set_values: list[int] = []
+    device_direct_pool_release_threshold_values: list[int] = []
+    device_direct_pool_config_attempted_values: list[int] = []
+    device_direct_pool_config_success_values: list[int] = []
+    device_direct_pool_config_device_values: list[int] = []
+    kv_budget_reason_counter: Counter[str] = Counter()
+    kv_budget_tracked_records = 0
+    kv_budget_over_records = 0
+    kv_budget_bytes_values: list[int] = []
+    kv_live_bytes_values: list[int] = []
+    kv_budget_remaining_values: list[int] = []
+    kv_budget_mode_values: list[str] = []
+    weight_budget_reason_counter: Counter[str] = Counter()
+    weight_budget_tracked_records = 0
+    weight_budget_over_records = 0
+    weight_budget_bytes_values: list[int] = []
+    weight_live_bytes_values: list[int] = []
+    weight_budget_remaining_values: list[int] = []
+    weight_budget_mode_values: list[str] = []
+
+    def record_kv_budget_fields(kv_fields: dict[str, str]) -> None:
+        nonlocal kv_budget_tracked_records, kv_budget_over_records
+        if kv_fields.get("kv_budget_tracked") != "1":
+            return
+        kv_budget_tracked_records += 1
+        if kv_fields.get("kv_budget_over_budget") == "1":
+            kv_budget_over_records += 1
+        kv_budget_reason_counter[kv_fields.get("kv_budget_reason", "not_recorded")] += 1
+        if "kv_budget_bytes" in kv_fields:
+            kv_budget_bytes_values.append(int(kv_fields["kv_budget_bytes"]))
+        if "kv_live_bytes" in kv_fields:
+            kv_live_bytes_values.append(int(kv_fields["kv_live_bytes"]))
+        if "kv_budget_remaining" in kv_fields:
+            kv_budget_remaining_values.append(int(kv_fields["kv_budget_remaining"]))
+        if "kv_budget_mode" in kv_fields:
+            kv_budget_mode_values.append(kv_fields["kv_budget_mode"])
+
+    def record_weight_budget_fields(kv_fields: dict[str, str]) -> None:
+        nonlocal weight_budget_tracked_records, weight_budget_over_records
+        if kv_fields.get("weight_budget_tracked") != "1":
+            return
+        weight_budget_tracked_records += 1
+        if kv_fields.get("weight_budget_over_budget") == "1":
+            weight_budget_over_records += 1
+        weight_budget_reason_counter[
+            kv_fields.get("weight_budget_reason", "not_recorded")
+        ] += 1
+        if "weight_budget_bytes" in kv_fields:
+            weight_budget_bytes_values.append(int(kv_fields["weight_budget_bytes"]))
+        if "weight_live_bytes" in kv_fields:
+            weight_live_bytes_values.append(int(kv_fields["weight_live_bytes"]))
+        if "weight_budget_remaining" in kv_fields:
+            weight_budget_remaining_values.append(
+                int(kv_fields["weight_budget_remaining"])
+            )
+        if "weight_budget_mode" in kv_fields:
+            weight_budget_mode_values.append(kv_fields["weight_budget_mode"])
 
     with allocator_log.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -120,12 +193,16 @@ def main() -> int:
 
             policy_match = TRACE_POLICY_RE.search(line)
             if policy_match is not None:
+                kv_fields = parse_kv_fields(line)
+                record_kv_budget_fields(kv_fields)
+                record_weight_budget_fields(kv_fields)
                 policy_records += 1
                 continue
 
             gap_alloc_match = TRACE_GAP_ALLOC_RE.search(line)
             if gap_alloc_match is not None:
                 kv_fields = parse_kv_fields(line)
+                record_weight_budget_fields(kv_fields)
                 gap_overlap_records += 1
                 overlap_bytes = int(gap_alloc_match.group("overlap_bytes"))
                 gap_overlap_bytes += overlap_bytes
@@ -164,6 +241,26 @@ def main() -> int:
                 if "device_direct_budget_remaining" in kv_fields:
                     device_direct_budget_remaining_values.append(
                         int(kv_fields["device_direct_budget_remaining"])
+                    )
+                if "device_direct_pool_release_threshold_set" in kv_fields:
+                    device_direct_pool_release_threshold_set_values.append(
+                        int(kv_fields["device_direct_pool_release_threshold_set"])
+                    )
+                if "device_direct_pool_release_threshold" in kv_fields:
+                    device_direct_pool_release_threshold_values.append(
+                        int(kv_fields["device_direct_pool_release_threshold"])
+                    )
+                if "device_direct_pool_config_attempted" in kv_fields:
+                    device_direct_pool_config_attempted_values.append(
+                        int(kv_fields["device_direct_pool_config_attempted"])
+                    )
+                if "device_direct_pool_config_success" in kv_fields:
+                    device_direct_pool_config_success_values.append(
+                        int(kv_fields["device_direct_pool_config_success"])
+                    )
+                if "device_direct_pool_config_device" in kv_fields:
+                    device_direct_pool_config_device_values.append(
+                        int(kv_fields["device_direct_pool_config_device"])
                     )
                 if class_match:
                     class_match_records += 1
@@ -229,6 +326,122 @@ def main() -> int:
             if device_direct_budget_remaining_values
             else None
         ),
+        "device_direct_pool_release_threshold_set": (
+            bool(device_direct_pool_release_threshold_set_values[-1])
+            if device_direct_pool_release_threshold_set_values
+            else optional_bool_from_int(
+                session_summary.get("Device-direct pool release threshold set")
+            )
+        ),
+        "device_direct_pool_release_threshold": (
+            device_direct_pool_release_threshold_values[-1]
+            if device_direct_pool_release_threshold_values
+            else optional_int(
+                session_summary.get("Device-direct pool release threshold")
+            )
+        ),
+        "device_direct_pool_config_attempted": session_summary.get(
+            "Device-direct pool config attempted"
+        ),
+        "device_direct_pool_config_success": session_summary.get(
+            "Device-direct pool config success"
+        ),
+        "device_direct_pool_config_device": session_summary.get(
+            "Device-direct pool config device"
+        ),
+        "device_direct_pool_config_error": session_summary.get(
+            "Device-direct pool config error"
+        ),
+        "kv_budget_bytes": (
+            kv_budget_bytes_values[-1]
+            if kv_budget_bytes_values
+            else optional_int(session_summary.get("KV budget bytes"))
+        ),
+        "kv_budget_mode": (
+            kv_budget_mode_values[-1]
+            if kv_budget_mode_values
+            else session_summary.get("KV budget mode")
+        ),
+        "kv_trace_allocations": (
+            kv_budget_tracked_records
+            if kv_budget_tracked_records
+            else optional_int(session_summary.get("KV trace allocations"))
+        ),
+        "kv_requested_bytes": optional_int(
+            session_summary.get("KV requested bytes")
+        ),
+        "kv_live_bytes": (
+            kv_live_bytes_values[-1]
+            if kv_live_bytes_values
+            else optional_int(session_summary.get("KV live bytes"))
+        ),
+        "kv_peak_live_bytes_observed": (
+            max(kv_live_bytes_values)
+            if kv_live_bytes_values
+            else optional_int(session_summary.get("KV peak live bytes"))
+        ),
+        "kv_min_budget_remaining_observed": (
+            min(kv_budget_remaining_values)
+            if kv_budget_remaining_values
+            else optional_int(session_summary.get("KV budget remaining"))
+        ),
+        "kv_budget_over_records": (
+            kv_budget_over_records
+            if kv_budget_tracked_records
+            else optional_int(session_summary.get("KV budget over allocations"))
+        ),
+        "kv_budget_reject_records": (
+            kv_budget_reason_counter.get("kv_budget_exceeded_soft_enforce", 0)
+            if kv_budget_tracked_records
+            else optional_int(session_summary.get("KV budget reject allocations"))
+        ),
+        "kv_budget_reason_counts": dict(kv_budget_reason_counter),
+        "weight_budget_bytes": (
+            weight_budget_bytes_values[-1]
+            if weight_budget_bytes_values
+            else optional_int(session_summary.get("Weight budget bytes"))
+        ),
+        "weight_budget_mode": (
+            weight_budget_mode_values[-1]
+            if weight_budget_mode_values
+            else session_summary.get("Weight budget mode")
+        ),
+        "weight_trace_allocations": (
+            weight_budget_tracked_records
+            if weight_budget_tracked_records
+            else optional_int(session_summary.get("Weight trace allocations"))
+        ),
+        "weight_requested_bytes": optional_int(
+            session_summary.get("Weight requested bytes")
+        ),
+        "weight_live_bytes": (
+            weight_live_bytes_values[-1]
+            if weight_live_bytes_values
+            else optional_int(session_summary.get("Weight live bytes"))
+        ),
+        "weight_peak_live_bytes_observed": (
+            max(weight_live_bytes_values)
+            if weight_live_bytes_values
+            else optional_int(session_summary.get("Weight peak live bytes"))
+        ),
+        "weight_min_budget_remaining_observed": (
+            min(weight_budget_remaining_values)
+            if weight_budget_remaining_values
+            else optional_int(session_summary.get("Weight budget remaining"))
+        ),
+        "weight_budget_over_records": (
+            weight_budget_over_records
+            if weight_budget_tracked_records
+            else optional_int(session_summary.get("Weight budget over allocations"))
+        ),
+        "weight_budget_reject_records": (
+            weight_budget_reason_counter.get(
+                "weight_budget_exceeded_soft_enforce", 0
+            )
+            if weight_budget_tracked_records
+            else optional_int(session_summary.get("Weight budget reject allocations"))
+        ),
+        "weight_budget_reason_counts": dict(weight_budget_reason_counter),
         "hot_gap_match_records": hot_gap_match_records,
         "median_lifetime_s": (
             sorted(lifetime_values)[len(lifetime_values) // 2]
@@ -237,6 +450,34 @@ def main() -> int:
         ),
         "session_summary": session_summary,
     }
+
+    summary["device_direct_pool_config_attempted"] = (
+        optional_int(summary["device_direct_pool_config_attempted"])
+        if summary["device_direct_pool_config_attempted"] is not None
+        else (
+            device_direct_pool_config_attempted_values[-1]
+            if device_direct_pool_config_attempted_values
+            else None
+        )
+    )
+    summary["device_direct_pool_config_success"] = (
+        optional_int(summary["device_direct_pool_config_success"])
+        if summary["device_direct_pool_config_success"] is not None
+        else (
+            device_direct_pool_config_success_values[-1]
+            if device_direct_pool_config_success_values
+            else None
+        )
+    )
+    summary["device_direct_pool_config_device"] = (
+        optional_int(summary["device_direct_pool_config_device"])
+        if summary["device_direct_pool_config_device"] is not None
+        else (
+            device_direct_pool_config_device_values[-1]
+            if device_direct_pool_config_device_values
+            else None
+        )
+    )
 
     if args.summary_json:
         with Path(args.summary_json).open("w", encoding="utf-8") as handle:
@@ -263,6 +504,29 @@ def main() -> int:
     print(f"- device_direct_max_total_bytes={summary['device_direct_max_total_bytes']}")
     print(f"- device_direct_peak_live_bytes_observed={summary['device_direct_peak_live_bytes_observed']}")
     print(f"- device_direct_min_budget_remaining_observed={summary['device_direct_min_budget_remaining_observed']}")
+    print(f"- device_direct_pool_release_threshold_set={summary['device_direct_pool_release_threshold_set']}")
+    print(f"- device_direct_pool_release_threshold={summary['device_direct_pool_release_threshold']}")
+    print(f"- device_direct_pool_config_attempted={summary['device_direct_pool_config_attempted']}")
+    print(f"- device_direct_pool_config_success={summary['device_direct_pool_config_success']}")
+    print(f"- device_direct_pool_config_error={summary['device_direct_pool_config_error']}")
+    print(f"- kv_budget_bytes={summary['kv_budget_bytes']}")
+    print(f"- kv_budget_mode={summary['kv_budget_mode']}")
+    print(f"- kv_trace_allocations={summary['kv_trace_allocations']}")
+    print(f"- kv_live_bytes={summary['kv_live_bytes']}")
+    print(f"- kv_peak_live_bytes_observed={summary['kv_peak_live_bytes_observed']}")
+    print(f"- kv_min_budget_remaining_observed={summary['kv_min_budget_remaining_observed']}")
+    print(f"- kv_budget_over_records={summary['kv_budget_over_records']}")
+    print(f"- kv_budget_reject_records={summary['kv_budget_reject_records']}")
+    print(f"- kv_budget_reason_counts={summary['kv_budget_reason_counts']}")
+    print(f"- weight_budget_bytes={summary['weight_budget_bytes']}")
+    print(f"- weight_budget_mode={summary['weight_budget_mode']}")
+    print(f"- weight_trace_allocations={summary['weight_trace_allocations']}")
+    print(f"- weight_live_bytes={summary['weight_live_bytes']}")
+    print(f"- weight_peak_live_bytes_observed={summary['weight_peak_live_bytes_observed']}")
+    print(f"- weight_min_budget_remaining_observed={summary['weight_min_budget_remaining_observed']}")
+    print(f"- weight_budget_over_records={summary['weight_budget_over_records']}")
+    print(f"- weight_budget_reject_records={summary['weight_budget_reject_records']}")
+    print(f"- weight_budget_reason_counts={summary['weight_budget_reason_counts']}")
     print(f"- hot_gap_match_records={hot_gap_match_records}")
     print(f"- median_lifetime_s={summary['median_lifetime_s']}")
     return 0

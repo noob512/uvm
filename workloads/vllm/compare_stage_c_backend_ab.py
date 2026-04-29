@@ -109,7 +109,33 @@ def compact_run(report: dict[str, Any]) -> dict[str, Any]:
             "device_direct_min_budget_remaining_observed"
         ),
         "device_direct_backend_counts": metrics.get("device_direct_backend_counts"),
+        "device_direct_pool_release_threshold_set": metrics.get(
+            "device_direct_pool_release_threshold_set"
+        ),
+        "device_direct_pool_release_threshold": metrics.get(
+            "device_direct_pool_release_threshold"
+        ),
+        "device_direct_pool_config_attempted": metrics.get(
+            "device_direct_pool_config_attempted"
+        ),
+        "device_direct_pool_config_success": metrics.get(
+            "device_direct_pool_config_success"
+        ),
+        "device_direct_pool_config_error": metrics.get(
+            "device_direct_pool_config_error"
+        ),
         "device_direct_reason_counts": metrics.get("device_direct_reason_counts"),
+        "kv_budget_bytes": metrics.get("kv_budget_bytes"),
+        "kv_budget_mode": metrics.get("kv_budget_mode"),
+        "kv_trace_allocations": metrics.get("kv_trace_allocations"),
+        "kv_live_bytes": metrics.get("kv_live_bytes"),
+        "kv_peak_live_bytes_observed": metrics.get("kv_peak_live_bytes_observed"),
+        "kv_min_budget_remaining_observed": metrics.get(
+            "kv_min_budget_remaining_observed"
+        ),
+        "kv_budget_over_records": metrics.get("kv_budget_over_records"),
+        "kv_budget_reject_records": metrics.get("kv_budget_reject_records"),
+        "kv_budget_reason_counts": metrics.get("kv_budget_reason_counts"),
         "placement_backend_counts": metrics.get("placement_backend_counts"),
         "gap_policy_fail": metrics.get("gap_policy_fail"),
         "dominant_phase": metrics.get("dominant_phase"),
@@ -150,6 +176,15 @@ def build_comparison(sync_report: dict[str, Any], async_report: dict[str, Any]) 
         "async_no_failed_requests": async_run.get("failed_requests") == 0,
         "sync_gap_policy_fail_zero": sync_run.get("gap_policy_fail") == 0,
         "async_gap_policy_fail_zero": async_run.get("gap_policy_fail") == 0,
+        "async_pool_config_ok_if_requested": (
+            not async_run.get("device_direct_pool_release_threshold_set")
+            or (
+                async_run.get("device_direct_pool_config_attempted") == 1
+                and async_run.get("device_direct_pool_config_success") == 1
+                and async_run.get("device_direct_pool_config_error")
+                in (None, "none")
+            )
+        ),
         "async_gap_faults_not_higher_than_sync": (
             async_gap_faults is not None
             and sync_gap_faults is not None
@@ -208,6 +243,7 @@ def build_comparison(sync_report: dict[str, Any], async_report: dict[str, Any]) 
                     "async_no_failed_requests",
                     "sync_gap_policy_fail_zero",
                     "async_gap_policy_fail_zero",
+                    "async_pool_config_ok_if_requested",
                 )
             ),
             "async_effectiveness_signal": (
@@ -285,6 +321,18 @@ def main() -> None:
         f"{sync_run.get('device_direct_budget_reject_records')} "
         f"async_budget_rejects={async_run.get('device_direct_budget_reject_records')} "
         f"delta={cmp.get('budget_reject_delta_async_minus_sync')}"
+    )
+    print(
+        "- async_pool_release_threshold_set="
+        f"{async_run.get('device_direct_pool_release_threshold_set')} "
+        "threshold="
+        f"{async_run.get('device_direct_pool_release_threshold')} "
+        "config_attempted="
+        f"{async_run.get('device_direct_pool_config_attempted')} "
+        "config_success="
+        f"{async_run.get('device_direct_pool_config_success')} "
+        "config_error="
+        f"{async_run.get('device_direct_pool_config_error')}"
     )
     print(
         "- correctness_signal="

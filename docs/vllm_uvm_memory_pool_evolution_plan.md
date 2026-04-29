@@ -19,7 +19,10 @@
 3. allocator 已支持 `device_direct_trace` 和 `device_direct` action。
 4. Stage B strict gating 已经支持 `gap_hot_runtime_scratch`。
 5. Stage C attention-only 已经实现真实 `device_direct` backend，并由 `--uvm-device-direct-enable 0/1` 控制。
-6. 细粒度 phase marker 已经能区分：
+6. Stage C2 已经实现 `cuda_malloc_async` backend 和可选 CUDA mempool release threshold。
+7. Stage D0/D1 已经实现 allocator-side KV budget telemetry + soft enforce signal，不在 allocator 层执行 KV eviction。
+8. Stage D2 已经实现 vLLM semantic KV budget enforcement：`enforce` 模式下在生成 `KVCacheConfig` 前 cap KV planning memory，并在最终 config 上保证 KV tensor bytes 不超过预算。
+9. 细粒度 phase marker 已经能区分：
 
 ```text
 enabled:attention
@@ -451,7 +454,7 @@ vllm_stage_c1_budget_sweep_p<PROMPTS>.json
 
 ## 5. 阶段 C2：`cudaMallocAsync` / CUDA Memory Pool
 
-当前项目已实现 C2 的第一步：可切换 `cudaMallocAsync/cudaFreeAsync` backend。默认仍保持 C1 的 `cuda_malloc` 路径，只有显式设置 backend 时才启用 async 路径。
+当前项目已实现 C2 的核心框架：可切换 `cudaMallocAsync/cudaFreeAsync` backend，并支持显式配置默认 CUDA memory pool release threshold。默认仍保持 C1 的 `cuda_malloc` 路径，只有显式设置 backend 时才启用 async 路径，只有显式设置 threshold 时才修改 CUDA mempool 属性。
 
 实现文档：
 
@@ -481,12 +484,14 @@ cudaMemPool
 ```bash
 --uvm-device-direct-backend cuda_malloc
 --uvm-device-direct-backend cuda_malloc_async
+--uvm-device-direct-pool-release-threshold <bytes>
 ```
 
 对应环境变量：
 
 ```text
 VLLM_UVM_DEVICE_DIRECT_BACKEND=cuda_malloc|cuda_malloc_async
+VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD=<bytes>
 ```
 
 默认：
@@ -505,17 +510,15 @@ cuda_malloc_async
 
 ```bash
 DEVICE_DIRECT_BACKEND=cuda_malloc_async ./run_stage_c_attention_p20_ab.sh
+DEVICE_DIRECT_POOL_RELEASE_THRESHOLD=1048576 DEVICE_DIRECT_BACKEND=cuda_malloc_async ./run_stage_c_attention_p20_ab.sh
 ```
 
 ### 5.3 allocator 设计
 
-新增 enum：
+当前实现使用字符串 backend 选择：
 
 ```cpp
-enum class DeviceDirectBackend {
-    CudaMalloc,
-    CudaMallocAsync,
-};
+static std::string device_direct_backend = "cuda_malloc";
 ```
 
 分配：
@@ -546,13 +549,18 @@ cudaFreeAsync(ptr, stream);
 5. C1 总预算逻辑完全保留：先 CAS reserve budget，再执行 CUDA allocation；失败或 cleanup 成功时释放预算；正常 free 成功后释放 live budget。
 6. `TRACE_POLICY` 和 `TRACE_GAP_WATCH_ALLOC/FREE` 会输出 `device_direct_backend=<backend>`。
 7. `summarize_gap_watch_metrics.py` 会输出 `device_direct_backend_counts`。
+8. 如果设置 `VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD`，allocator 会在 `cuda_malloc_async` 第一次真实分配前调用 `cudaDeviceGetDefaultMemPool` 和 `cudaMemPoolSetAttribute(cudaMemPoolAttrReleaseThreshold, threshold)`。
+9. pool 配置失败时，本次 device-direct 保守 fallback managed，并记录 `device_direct_reason=device_direct_pool_config_failed`。
 
 ### 5.4 CUDA memory pool 调优
 
-可选新增：
+已新增：
 
 ```text
 VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD
+--uvm-device-direct-pool-release-threshold
+DEVICE_DIRECT_POOL_RELEASE_THRESHOLD
+ASYNC_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD
 ```
 
 对应 CUDA API：
@@ -568,6 +576,16 @@ cudaMemPoolAttrReleaseThreshold
 1. 减少频繁向 driver 申请/归还。
 2. 降低分配延迟。
 3. 控制 pool 常驻大小。
+
+观测字段：
+
+```text
+device_direct_pool_release_threshold_set
+device_direct_pool_release_threshold
+device_direct_pool_config_attempted
+device_direct_pool_config_success
+device_direct_pool_config_error
+```
 
 ### 5.5 C2 成功标准
 
@@ -590,6 +608,32 @@ DEVICE_DIRECT_BACKEND=cuda_malloc_async \
 ./run_stage_c_attention_p20_ab.sh
 ```
 
+带 pool release threshold 的 C2 验证命令：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
+
+PROMPTS=10 \
+DEVICE_DIRECT_MAX_TOTAL_BYTES=1048576 \
+DEVICE_DIRECT_BACKEND=cuda_malloc_async \
+DEVICE_DIRECT_POOL_RELEASE_THRESHOLD=1048576 \
+./run_stage_c_attention_p20_ab.sh
+```
+
+自动成功检查脚本：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
+
+./check_stage_c2_success.py
+```
+
+该脚本默认运行小规模 C1 vs C2 backend A/B，检查 `cuda_malloc_async` backend、device-direct 实际记录、budget 上限、pool release threshold 配置、无 failed requests、无 gap policy failure，以及 C2 相对 trace-only baseline 的 effectiveness signal。它不会默认要求 async 优于 C1 sync；如需将 C1 vs C2 不退化作为硬门槛，可加：
+
+```bash
+./check_stage_c2_success.py --require-not-worse-than-sync
+```
+
 重点看：
 
 ```text
@@ -599,6 +643,7 @@ device_peak_live_within_budget=True
 device_direct_backend_counts 中出现 cuda_malloc_async
 device_direct_actual_records > 0
 device_direct_budget_reject_records 可存在
+device_direct_pool_config_success=1  # 显式设置 threshold 时
 gap_policy_fail=0
 Failed requests=0
 ```
@@ -610,6 +655,12 @@ PROMPTS=10 DEVICE_DIRECT_MAX_TOTAL_BYTES=1048576 DEVICE_DIRECT_BACKEND=cuda_mall
 PROMPTS=10 DEVICE_DIRECT_MAX_TOTAL_BYTES=1048576 DEVICE_DIRECT_BACKEND=cuda_malloc_async ./run_stage_c_attention_p20_ab.sh
 ```
 
+或者使用一键 backend A/B，并给 async run 配置 pool threshold：
+
+```bash
+PROMPTS=10 DEVICE_DIRECT_MAX_TOTAL_BYTES=1048576 ASYNC_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD=1048576 ./run_stage_c_attention_backend_ab.sh
+```
+
 如果 async backend 稳定，再扩展到 p20：
 
 ```bash
@@ -617,6 +668,30 @@ PROMPTS=20 DEVICE_DIRECT_MAX_TOTAL_BYTES=1048576 DEVICE_DIRECT_BACKEND=cuda_mall
 ```
 
 ## 6. 阶段 D：KV 独立预算
+
+当前项目已实现 Stage D0/D1 和 D2：
+
+1. D0/D1：KV cache 独立预算遥测与软预算信号。
+2. D2：vLLM semantic KV budget enforcement，在分配 KV cache tensor 前减少 KV blocks，使实际 KV live bytes 不超过预算。
+
+详细实现文档：
+
+```text
+/home/ubuntu/nvidia-uvm-gpu/docs/vllm_uvm_stage_d_kv_budget_telemetry_implementation.md
+```
+
+实现位置包括：
+
+1. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/vllm/uvm_test/uvm_allocator.cpp`
+2. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/vllm/vllm/device_allocator/uvm.py`
+3. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/run_kv_fault_ratio.sh`
+4. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/summarize_gap_watch_metrics.py`
+5. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/check_stage_d_success.py`
+6. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/run_stage_d_kv_budget_check.sh`
+7. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/vllm/vllm/v1/core/kv_cache_utils.py`
+8. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/vllm/vllm/v1/kv_cache_interface.py`
+9. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/check_stage_d2_success.py`
+10. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/run_stage_d2_kv_budget_check.sh`
 
 ### 6.1 为什么不能只在 allocator 层做 KV eviction
 
@@ -630,7 +705,7 @@ KV cache 有 vLLM 语义：
 
 allocator 只知道地址和 size，不知道请求语义。因此 allocator 不能单独决定驱逐哪个 KV block。
 
-### 6.2 D 阶段目标
+### 6.2 D 阶段目标与当前落地状态
 
 建立 KV 逻辑预算，防止 KV cache 与 runtime scratch、weights resident pool 互相抢占。
 
@@ -642,6 +717,30 @@ KV budget 不足时，只由 vLLM block manager 处理 KV swap/evict/recompute
 runtime scratch 不得挤占 KV reserve
 weights 不得挤占 KV reserve
 ```
+
+当前已落地的 D0/D1：
+
+1. 识别 `initialize_kv_cache` 阶段的 `kv_persistent` allocation。
+2. 输出 KV requested/live/peak bytes。
+3. 输出 KV budget bytes、budget mode、remaining bytes。
+4. 超预算时输出 `kv_budget_exceeded_trace_only` 或 `kv_budget_exceeded_soft_enforce`。
+5. `trace_only` 模式只观测，不改变分配结果。
+6. allocator 在 `enforce` 模式下仍只输出 soft signal，不返回 NULL、不驱逐 KV；真正的预算收敛由 D2 的 vLLM KV config 层完成。
+
+当前已落地的 D2：
+
+1. `VLLM_UVM_KV_BUDGET_MODE=enforce` 时启用 vLLM 语义层预算。
+2. 在 `get_kv_cache_configs()` 生成 `KVCacheConfig` 前，将每个 worker 的 KV planning memory cap 到 `VLLM_UVM_KV_BUDGET_BYTES`。
+3. 在每个 worker 的 `KVCacheConfig` 生成后再次检查 `sum(KVCacheTensor.size)`。
+4. 如果 `num_gpu_blocks_override` 或 alignment 导致实际 tensor bytes 超预算，则按每 block 字节数缩小 `num_blocks`。
+5. 如果预算小到连一个 KV block 都放不下，初始化阶段明确失败。
+6. 最终由 allocator telemetry 验证 `kv_peak_live_bytes_observed <= VLLM_UVM_KV_BUDGET_BYTES`。
+
+仍未落地的运行时语义层能力：
+
+1. scheduler-aware eviction。
+2. runtime swap/recompute。
+3. prefix cache/block table 的运行时动态更新。
 
 ### 6.3 需要接入的 vLLM 模块
 
@@ -659,10 +758,23 @@ vllm/config/cache.py
 
 ### 6.4 参数设计
 
-建议新增：
+当前已新增：
 
 ```bash
 --uvm-kv-budget-bytes <n>
+--uvm-kv-budget-mode trace_only|enforce
+```
+
+对应环境变量：
+
+```text
+VLLM_UVM_KV_BUDGET_BYTES
+VLLM_UVM_KV_BUDGET_MODE
+```
+
+计划在后续 block-manager enforcement 中再新增：
+
+```bash
 --uvm-kv-swap-enable <0|1>
 --uvm-kv-eviction-policy lru|scheduler_aware
 ```
@@ -670,7 +782,6 @@ vllm/config/cache.py
 环境变量：
 
 ```text
-VLLM_UVM_KV_BUDGET_BYTES
 VLLM_UVM_KV_SWAP_ENABLE
 VLLM_UVM_KV_EVICTION_POLICY
 ```
@@ -703,24 +814,190 @@ vLLM block manager 做：
 
 ### 6.7 D 阶段验证
 
+当前 D0/D1 验证命令：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
+./check_stage_d_success.py
+```
+
+或：
+
+```bash
+KV_BUDGET_BYTES=1048576 KV_BUDGET_MODE=trace_only ./run_stage_d_kv_budget_check.sh
+```
+
+D2 验证命令：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
+./check_stage_d2_success.py
+```
+
+或：
+
+```bash
+KV_BUDGET_BYTES=2147483648 ./run_stage_d2_kv_budget_check.sh
+```
+
 观察：
 
 1. KV cache allocation bytes。
-2. KV budget hit rate。
-3. KV eviction count。
-4. KV swap in/out bytes。
+2. KV live / peak bytes。
+3. KV budget over count。
+4. KV soft reject count。
 5. request latency。
 6. failed requests。
 7. gap2 runtime scratch 是否仍稳定。
 
 成功标准：
 
+1. `kv_trace_allocations > 0`。
+2. `kv_peak_live_bytes_observed > 0`。
+3. `kv_budget_bytes` 与配置一致。
+4. `kv_budget_mode` 与配置一致。
+5. 非 0 budget 且 peak 超预算时，`kv_budget_over_records > 0`。
+6. `trace_only` 模式下 `kv_budget_reject_records == 0`。
+7. `enforce` 模式下如果超预算，`kv_budget_reject_records > 0`，但当前仍是 soft signal。
+8. 没有请求级正确性问题。
+
+D2 成功标准：
+
+1. `VLLM_UVM_KV_BUDGET_MODE=enforce`。
+2. `kv_trace_allocations > 0`。
+3. `kv_peak_live_bytes_observed > 0`。
+4. `kv_peak_live_bytes_observed <= VLLM_UVM_KV_BUDGET_BYTES`。
+5. server 初始化无半初始化错误。
+6. 如果启用 benchmark，则 `Failed requests = 0`。
+
+后续 D3 成功标准才包括：
+
 1. scratch device-direct 不再导致 KV OOM。
 2. KV eviction 只发生在 KV pool。
-3. 没有请求级正确性问题。
-4. 性能退化可解释、可控。
+3. block table 更新正确。
+4. swap/recompute 性能退化可解释、可控。
 
-## 7. 阶段 E：Weights Hot/Cold 分类与 MoE Expert 预取
+## 7. 阶段 E：Weights 初始化分区与后续 Hot/Cold 分类
+
+当前项目已实现 Stage E0/E1/E2/E3：
+
+1. E0/E1：weights 初始化期独立预算遥测与 soft budget signal。
+2. E2：weight tensor semantic address map，将权重地址范围关联到 tensor name、layer、expert、role、dtype、shape。
+3. E3：可选 MoE expert routing trace，按 layer/step 聚合 expert token counts。
+4. 当前不做 weights runtime eviction/offload/prefetch，不在 allocator 中硬失败模型加载。
+
+详细实现文档：
+
+```text
+/home/ubuntu/nvidia-uvm-gpu/docs/vllm_uvm_stage_e_weights_budget_telemetry_implementation.md
+```
+
+实现位置包括：
+
+1. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/vllm/uvm_test/uvm_allocator.cpp`
+2. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/run_kv_fault_ratio.sh`
+3. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/summarize_gap_watch_metrics.py`
+4. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/check_stage_e_success.py`
+5. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/run_stage_e_weights_budget_check.sh`
+6. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/summarize_stage_e_weight_map.py`
+7. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/vllm/vllm/v1/worker/gpu_model_runner.py`
+8. `/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/vllm/vllm/model_executor/layers/fused_moe/layer.py`
+
+### 7.0 当前 Stage E0/E1/E2/E3 落地状态
+
+当前实现新增：
+
+```bash
+--uvm-weight-budget-bytes <n>
+--uvm-weight-budget-mode trace_only|enforce
+```
+
+对应环境变量：
+
+```text
+VLLM_UVM_WEIGHT_BUDGET_BYTES
+VLLM_UVM_WEIGHT_BUDGET_MODE
+```
+
+allocator 会把 `load_model` phase 识别为：
+
+```text
+weight_persistent
+```
+
+并输出：
+
+```text
+weight_trace_allocations
+weight_requested_bytes
+weight_live_bytes
+weight_peak_live_bytes_observed
+weight_budget_bytes
+weight_budget_mode
+weight_min_budget_remaining_observed
+weight_budget_over_records
+weight_budget_reject_records
+weight_budget_reason_counts
+```
+
+E2 额外输出 weight map JSONL：
+
+```text
+VLLM_UVM_WEIGHT_MAP_ENABLE=1
+VLLM_UVM_WEIGHT_MAP_FILE=<path>
+```
+
+字段包括：
+
+```text
+name, start, end, size_bytes, dtype, shape, layer_id, expert_id, role, shard_id, is_moe_expert
+```
+
+E3 可选输出 MoE routing JSONL：
+
+```text
+VLLM_UVM_MOE_ROUTING_TRACE_ENABLE=1
+VLLM_UVM_MOE_ROUTING_TRACE_FILE=<path>
+```
+
+字段包括：
+
+```text
+layer_name, step, num_tokens, top_k, expert_token_counts, active_experts
+```
+
+Stage E0/E1/E2/E3 成功标准：
+
+1. `weight_trace_allocations > 0`。
+2. `weight_peak_live_bytes_observed > 0`。
+3. `weight_budget_bytes` 与配置一致。
+4. `weight_budget_mode` 与配置一致。
+5. 非 0 budget 且 peak 超预算时，`weight_budget_over_records > 0`。
+6. `trace_only` 模式下 `weight_budget_reject_records == 0`。
+7. `enforce` 模式下如果超预算，`weight_budget_reject_records > 0`，但当前仍是 soft signal。
+8. `weight_map_records > 0`，证明 weight semantic map 已生成。
+9. 如要求 MoE routing trace，则 `moe_routing_records > 0`。
+
+验证命令：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
+./check_stage_e_success.py
+```
+
+或：
+
+```bash
+WEIGHT_BUDGET_BYTES=1048576 WEIGHT_BUDGET_MODE=trace_only ./run_stage_e_weights_budget_check.sh
+```
+
+验证 MoE routing trace：
+
+```bash
+./check_stage_e_success.py --run-bench --enable-moe-routing-trace --require-moe-routing-trace
+```
+
+这一步回答的是“weights pool 是否已经能被独立识别、度量，并关联到权重语义和 MoE expert 热度”。它还不回答“weights 超载时是否已经能只驱逐 weights”，因为后者还需要运行时安全点、offload/prefetch 执行器和 admission control。
 
 ### 7.1 为什么不要先做完整 weights offload
 
