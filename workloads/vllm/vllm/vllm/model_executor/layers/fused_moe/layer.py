@@ -18,7 +18,10 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
-from vllm.device_allocator.uvm import uvm_enabled_allocation_phase
+from vllm.device_allocator.uvm import (
+    prefetch_range_to_device,
+    uvm_enabled_allocation_phase,
+)
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -105,6 +108,17 @@ def _env_flag_enabled(env_name: str, default: bool = False) -> bool:
     if env_value is None:
         return default
     return env_value.lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(env_name: str, default: int) -> int:
+    env_value = os.environ.get(env_name)
+    if env_value is None:
+        return default
+    try:
+        return int(env_value)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%s; using %s", env_name, env_value, default)
+        return default
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -595,6 +609,42 @@ class FusedMoE(CustomOp):
             "vllm_uvm_moe_routing_trace.jsonl",
         )
         self._uvm_moe_trace_step = 0
+        self.uvm_weight_prefetch_enabled = _env_flag_enabled(
+            "VLLM_UVM_WEIGHT_PREFETCH_ENABLE", default=False
+        )
+        self.uvm_weight_prefetch_mode = os.environ.get(
+            "VLLM_UVM_WEIGHT_PREFETCH_MODE", "trace_only"
+        )
+        if self.uvm_weight_prefetch_mode not in ("trace_only", "prefetch"):
+            logger.warning(
+                "Unknown VLLM_UVM_WEIGHT_PREFETCH_MODE=%s; using trace_only",
+                self.uvm_weight_prefetch_mode,
+            )
+            self.uvm_weight_prefetch_mode = "trace_only"
+        self.uvm_weight_prefetch_trace_file = os.environ.get(
+            "VLLM_UVM_WEIGHT_PREFETCH_TRACE_FILE",
+            "vllm_uvm_weight_prefetch_stage_i.jsonl",
+        )
+        self.uvm_weight_prefetch_max_bytes_per_step = _env_int(
+            "VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP",
+            default=64 * 1024 * 1024,
+        )
+        self.uvm_weight_prefetch_max_experts_per_layer = _env_int(
+            "VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER",
+            default=2,
+        )
+        self.uvm_weight_prefetch_target_roles = {
+            role.strip()
+            for role in os.environ.get(
+                "VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES",
+                "moe_gate_up,moe_down",
+            ).split(",")
+            if role.strip()
+        }
+        self.uvm_weight_prefetch_device = _env_int(
+            "VLLM_UVM_WEIGHT_PREFETCH_DEVICE",
+            default=-1,
+        )
 
         self.quant_config = quant_config
 
@@ -1670,6 +1720,7 @@ class FusedMoE(CustomOp):
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
+        self._maybe_prefetch_uvm_expert_weights(topk_ids)
         return topk_weights, topk_ids, zero_expert_result
 
     def _log_uvm_moe_routing_trace(
@@ -1719,6 +1770,156 @@ class FusedMoE(CustomOp):
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
         except Exception:
             logger.debug("Failed to write UVM MoE routing trace", exc_info=True)
+
+    def _uvm_active_local_experts(self, topk_ids: torch.Tensor) -> list[int]:
+        ids = topk_ids.detach()
+        valid_ids = ids[ids >= 0].to(dtype=torch.long)
+        if valid_ids.numel() == 0:
+            return []
+        unique_ids = torch.unique(valid_ids).cpu().tolist()
+        local_experts: list[int] = []
+        for expert_id in unique_ids:
+            global_expert_id = int(expert_id)
+            if self.expert_map is None:
+                local_expert_id = global_expert_id
+            elif 0 <= global_expert_id < int(self.expert_map.numel()):
+                local_expert_id = int(self.expert_map[global_expert_id].item())
+            else:
+                local_expert_id = -1
+            if 0 <= local_expert_id < int(self.local_num_experts):
+                local_experts.append(local_expert_id)
+        return sorted(set(local_experts))
+
+    def _uvm_expert_weight_slices(
+        self,
+        local_expert_id: int,
+    ) -> list[tuple[str, int, int]]:
+        slices: list[tuple[str, int, int]] = []
+        for attr_name, role in (
+            ("w13_weight", "moe_gate_up"),
+            ("w2_weight", "moe_down"),
+        ):
+            if role not in self.uvm_weight_prefetch_target_roles:
+                continue
+            tensor = getattr(self, attr_name, None)
+            if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+                continue
+            if tensor.ndim == 0 or local_expert_id >= int(tensor.shape[0]):
+                continue
+            total_bytes = tensor.numel() * tensor.element_size()
+            if int(tensor.shape[0]) <= 0 or total_bytes <= 0:
+                continue
+            slice_bytes = total_bytes // int(tensor.shape[0])
+            if slice_bytes <= 0:
+                continue
+            ptr = tensor.data_ptr() + local_expert_id * slice_bytes
+            slices.append((role, ptr, slice_bytes))
+        return slices
+
+    def _append_uvm_weight_prefetch_trace(self, record: dict[str, object]) -> None:
+        try:
+            with open(self.uvm_weight_prefetch_trace_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            logger.debug("Failed to write UVM weight prefetch trace", exc_info=True)
+
+    def _maybe_prefetch_uvm_expert_weights(self, topk_ids: torch.Tensor) -> None:
+        if not self.uvm_weight_prefetch_enabled:
+            return
+        try:
+            local_experts = self._uvm_active_local_experts(topk_ids)
+            if self.uvm_weight_prefetch_max_experts_per_layer > 0:
+                local_experts = local_experts[
+                    : self.uvm_weight_prefetch_max_experts_per_layer
+                ]
+
+            issued_records = 0
+            attempted_bytes = 0
+            issued_bytes = 0
+            rejected_records = 0
+            device = (
+                int(torch.cuda.current_device())
+                if self.uvm_weight_prefetch_device < 0
+                else self.uvm_weight_prefetch_device
+            )
+
+            for local_expert_id in local_experts:
+                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                    local_expert_id
+                ):
+                    attempted_bytes += size_bytes
+                    if (
+                        self.uvm_weight_prefetch_max_bytes_per_step > 0
+                        and issued_bytes + size_bytes
+                        > self.uvm_weight_prefetch_max_bytes_per_step
+                    ):
+                        rejected_records += 1
+                        self._append_uvm_weight_prefetch_trace(
+                            {
+                                "timestamp": time.time(),
+                                "pid": os.getpid(),
+                                "layer_name": self.layer_name,
+                                "step": self._uvm_moe_trace_step,
+                                "mode": self.uvm_weight_prefetch_mode,
+                                "action": "budget_reject",
+                                "role": role,
+                                "local_expert_id": local_expert_id,
+                                "ptr": f"0x{ptr:x}",
+                                "bytes": size_bytes,
+                                "issued_bytes_before": issued_bytes,
+                                "max_bytes_per_step": (
+                                    self.uvm_weight_prefetch_max_bytes_per_step
+                                ),
+                            }
+                        )
+                        continue
+
+                    action = "trace_prefetch_candidate"
+                    success = False
+                    if self.uvm_weight_prefetch_mode == "prefetch":
+                        success = prefetch_range_to_device(ptr, size_bytes, device)
+                        action = "prefetch_issued" if success else "prefetch_skipped"
+
+                    issued_records += 1
+                    issued_bytes += size_bytes
+                    self._append_uvm_weight_prefetch_trace(
+                        {
+                            "timestamp": time.time(),
+                            "pid": os.getpid(),
+                            "layer_name": self.layer_name,
+                            "step": self._uvm_moe_trace_step,
+                            "mode": self.uvm_weight_prefetch_mode,
+                            "action": action,
+                            "role": role,
+                            "local_expert_id": local_expert_id,
+                            "ptr": f"0x{ptr:x}",
+                            "bytes": size_bytes,
+                            "device": device,
+                            "success": success,
+                        }
+                    )
+
+            if issued_records or rejected_records:
+                self._append_uvm_weight_prefetch_trace(
+                    {
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "layer_name": self.layer_name,
+                        "step": self._uvm_moe_trace_step,
+                        "mode": self.uvm_weight_prefetch_mode,
+                        "action": "step_summary",
+                        "active_local_experts": local_experts,
+                        "issued_records": issued_records,
+                        "issued_bytes": issued_bytes,
+                        "attempted_bytes": attempted_bytes,
+                        "budget_reject_records": rejected_records,
+                        "max_bytes_per_step": (
+                            self.uvm_weight_prefetch_max_bytes_per_step
+                        ),
+                    }
+                )
+        except Exception:
+            logger.debug("Failed to run UVM expert prefetch", exc_info=True)
 
     def must_reduce_shared_expert_outputs(self) -> bool:
         """

@@ -66,6 +66,18 @@ UVM_WEIGHT_MAP_ENABLE="${VLLM_UVM_WEIGHT_MAP_ENABLE:-1}"
 UVM_WEIGHT_MAP_FILE="${VLLM_UVM_WEIGHT_MAP_FILE:-}"
 UVM_MOE_ROUTING_TRACE_ENABLE="${VLLM_UVM_MOE_ROUTING_TRACE_ENABLE:-0}"
 UVM_MOE_ROUTING_TRACE_FILE="${VLLM_UVM_MOE_ROUTING_TRACE_FILE:-}"
+UVM_WEIGHT_PREFETCH_ENABLE="${VLLM_UVM_WEIGHT_PREFETCH_ENABLE:-0}"
+UVM_WEIGHT_PREFETCH_MODE="${VLLM_UVM_WEIGHT_PREFETCH_MODE:-trace_only}"
+UVM_WEIGHT_PREFETCH_TRACE_FILE="${VLLM_UVM_WEIGHT_PREFETCH_TRACE_FILE:-}"
+UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="${VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP:-67108864}"
+UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER:-2}"
+UVM_WEIGHT_PREFETCH_TARGET_ROLES="${VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES:-moe_gate_up,moe_down}"
+UVM_WEIGHT_PREFETCH_DEVICE="${VLLM_UVM_WEIGHT_PREFETCH_DEVICE:--1}"
+UVM_POOL_REGISTRY_ENABLE="${VLLM_UVM_POOL_REGISTRY_ENABLE:-0}"
+UVM_SCRATCH_POOL_ENABLE="${VLLM_UVM_SCRATCH_POOL_ENABLE:-0}"
+UVM_SCRATCH_POOL_BUDGET_BYTES="${VLLM_UVM_SCRATCH_POOL_BUDGET_BYTES:-1048576}"
+UVM_SCRATCH_POOL_MODE="${VLLM_UVM_SCRATCH_POOL_MODE:-trace_only}"
+UVM_SCRATCH_POOL_TARGET_PHASES="${VLLM_UVM_SCRATCH_POOL_TARGET_PHASES:-enabled:attention}"
 GAP_WATCH_METRICS_SUMMARY_JSON=""
 
 AUTO_GAP_WATCH_ENABLE=0
@@ -199,6 +211,40 @@ Options:
                              during benchmark/runtime phases (default: 0)
   --uvm-moe-routing-trace-file <path>
                              Stage E MoE routing aggregate JSONL path
+  --uvm-weight-prefetch-enable <0|1>
+                             Stage I expert weight prefetch gate. Default 0.
+  --uvm-weight-prefetch-mode <mode>
+                             Stage I mode: trace_only|prefetch. prefetch issues
+                             cudaMemPrefetchAsync on active expert weight slices.
+  --uvm-weight-prefetch-trace-file <path>
+                             Stage I expert prefetch JSONL trace path
+  --uvm-weight-prefetch-max-bytes-per-step <n>
+                             Max expert weight bytes prefetched per MoE layer call
+  --uvm-weight-prefetch-max-experts-per-layer <n>
+                             Max active experts considered per MoE layer call
+  --uvm-weight-prefetch-target-roles <csv>
+                             Expert weight roles to prefetch (default: moe_gate_up,moe_down)
+  --uvm-weight-prefetch-device <n>
+                             Target CUDA device for prefetch. -1 means current device.
+  --uvm-pool-registry-enable <0|1>
+                             Stage F unified pool registry telemetry.
+                             Records kv_cache/weights/runtime_scratch objects
+                             without changing allocation policy (default: 0)
+  --uvm-scratch-pool-enable <0|1>
+                             Stage G runtime scratch pool admission control.
+                             Budgeted device-direct fast path with managed
+                             fallback, no eviction (default: 0)
+  --uvm-scratch-pool-budget-bytes <n>
+                             Stage G scratch pool device-direct live byte budget.
+                             0 means unlimited (default: 1048576)
+  --uvm-scratch-pool-mode <mode>
+                             Stage G scratch pool mode: trace_only|enforce.
+                             trace_only records over-budget but allows fast path;
+                             enforce falls back managed when over budget
+                             (default: trace_only)
+  --uvm-scratch-pool-target-phases <csv>
+                             Comma-separated phase prefixes allowed for Stage G
+                             scratch pool admission (default: enabled:attention)
   --gap-watch-metrics-summary-json <path>
                              Optional post-run JSON summary proving whether gap-watch policy hit and succeeded
   --auto-gap-watch-enable <0|1>
@@ -355,6 +401,9 @@ start_server() {
     if [ -z "$UVM_MOE_ROUTING_TRACE_FILE" ]; then
       UVM_MOE_ROUTING_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_moe_routing_trace.jsonl"
     fi
+    if [ -z "$UVM_WEIGHT_PREFETCH_TRACE_FILE" ]; then
+      UVM_WEIGHT_PREFETCH_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_weight_prefetch_stage_i.jsonl"
+    fi
     policy_env="VLLM_UVM_POLICY_ENABLE='$UVM_POLICY_ENABLE' \
                 VLLM_UVM_POLICY_MODE='$UVM_POLICY_MODE' \
                 VLLM_UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES='$UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES' \
@@ -385,7 +434,19 @@ start_server() {
                 VLLM_UVM_WEIGHT_MAP_ENABLE='$UVM_WEIGHT_MAP_ENABLE' \
                 VLLM_UVM_WEIGHT_MAP_FILE='$UVM_WEIGHT_MAP_FILE' \
                 VLLM_UVM_MOE_ROUTING_TRACE_ENABLE='$UVM_MOE_ROUTING_TRACE_ENABLE' \
-                VLLM_UVM_MOE_ROUTING_TRACE_FILE='$UVM_MOE_ROUTING_TRACE_FILE'"
+                VLLM_UVM_MOE_ROUTING_TRACE_FILE='$UVM_MOE_ROUTING_TRACE_FILE' \
+                VLLM_UVM_WEIGHT_PREFETCH_ENABLE='$UVM_WEIGHT_PREFETCH_ENABLE' \
+                VLLM_UVM_WEIGHT_PREFETCH_MODE='$UVM_WEIGHT_PREFETCH_MODE' \
+                VLLM_UVM_WEIGHT_PREFETCH_TRACE_FILE='$UVM_WEIGHT_PREFETCH_TRACE_FILE' \
+                VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP='$UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP' \
+                VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER='$UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER' \
+                VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES='$UVM_WEIGHT_PREFETCH_TARGET_ROLES' \
+                VLLM_UVM_WEIGHT_PREFETCH_DEVICE='$UVM_WEIGHT_PREFETCH_DEVICE' \
+                VLLM_UVM_POOL_REGISTRY_ENABLE='$UVM_POOL_REGISTRY_ENABLE' \
+                VLLM_UVM_SCRATCH_POOL_ENABLE='$UVM_SCRATCH_POOL_ENABLE' \
+                VLLM_UVM_SCRATCH_POOL_BUDGET_BYTES='$UVM_SCRATCH_POOL_BUDGET_BYTES' \
+                VLLM_UVM_SCRATCH_POOL_MODE='$UVM_SCRATCH_POOL_MODE' \
+                VLLM_UVM_SCRATCH_POOL_TARGET_PHASES='$UVM_SCRATCH_POOL_TARGET_PHASES'"
 
     # 3. 构造服务器启动指令
     local server_cmd
@@ -759,6 +820,18 @@ parse_args() {
       --uvm-weight-map-file) UVM_WEIGHT_MAP_FILE="$2"; shift 2 ;; # Stage E weight semantic map JSONL
       --uvm-moe-routing-trace-enable) UVM_MOE_ROUTING_TRACE_ENABLE="$2"; shift 2 ;; # Stage E MoE routing trace 开关
       --uvm-moe-routing-trace-file) UVM_MOE_ROUTING_TRACE_FILE="$2"; shift 2 ;; # Stage E MoE routing trace JSONL
+      --uvm-weight-prefetch-enable) UVM_WEIGHT_PREFETCH_ENABLE="$2"; shift 2 ;; # Stage I expert weight prefetch 开关
+      --uvm-weight-prefetch-mode) UVM_WEIGHT_PREFETCH_MODE="$2"; shift 2 ;; # Stage I mode trace_only/prefetch
+      --uvm-weight-prefetch-trace-file) UVM_WEIGHT_PREFETCH_TRACE_FILE="$2"; shift 2 ;; # Stage I prefetch trace JSONL
+      --uvm-weight-prefetch-max-bytes-per-step) UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="$2"; shift 2 ;; # Stage I 每层调用 prefetch 字节预算
+      --uvm-weight-prefetch-max-experts-per-layer) UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage I 每层最多 active experts
+      --uvm-weight-prefetch-target-roles) UVM_WEIGHT_PREFETCH_TARGET_ROLES="$2"; shift 2 ;; # Stage I prefetch roles
+      --uvm-weight-prefetch-device) UVM_WEIGHT_PREFETCH_DEVICE="$2"; shift 2 ;; # Stage I target device
+      --uvm-pool-registry-enable) UVM_POOL_REGISTRY_ENABLE="$2"; shift 2 ;; # Stage F unified pool registry telemetry
+      --uvm-scratch-pool-enable) UVM_SCRATCH_POOL_ENABLE="$2"; shift 2 ;; # Stage G scratch pool admission control
+      --uvm-scratch-pool-budget-bytes) UVM_SCRATCH_POOL_BUDGET_BYTES="$2"; shift 2 ;; # Stage G scratch pool device-direct live bytes budget
+      --uvm-scratch-pool-mode) UVM_SCRATCH_POOL_MODE="$2"; shift 2 ;; # Stage G scratch pool mode trace_only/enforce
+      --uvm-scratch-pool-target-phases) UVM_SCRATCH_POOL_TARGET_PHASES="$2"; shift 2 ;; # Stage G scratch pool phase allowlist
       --gap-watch-metrics-summary-json) GAP_WATCH_METRICS_SUMMARY_JSON="$2"; shift 2 ;; # gap watch 命中/动作证明摘要
       --auto-gap-watch-enable) AUTO_GAP_WATCH_ENABLE="$2"; shift 2 ;; # 同进程 probe -> discover -> main 自动流程
       --auto-gap-watch-probe-prompts) AUTO_GAP_WATCH_PROBE_PROMPTS="$2"; shift 2 ;; # 自动流程 probe 阶段的 prompt 数
@@ -870,6 +943,17 @@ validate_inputs() {
     [[ "$UVM_WEIGHT_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-weight-budget-bytes must be a non-negative integer"
     [[ "$UVM_WEIGHT_BUDGET_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-weight-budget-mode must be trace_only or enforce"
     [[ "$UVM_WEIGHT_MAP_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-map-enable must be 0 or 1"
+    [[ "$UVM_WEIGHT_PREFETCH_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-prefetch-enable must be 0 or 1"
+    [[ "$UVM_WEIGHT_PREFETCH_MODE" =~ ^(trace_only|prefetch)$ ]] || die "--uvm-weight-prefetch-mode must be trace_only or prefetch"
+    [[ "$UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-weight-prefetch-max-bytes-per-step must be a non-negative integer"
+    [[ "$UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-weight-prefetch-max-experts-per-layer must be a non-negative integer"
+    [ -n "$UVM_WEIGHT_PREFETCH_TARGET_ROLES" ] || die "--uvm-weight-prefetch-target-roles must not be empty"
+    [[ "$UVM_WEIGHT_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-weight-prefetch-device must be an integer"
+    [[ "$UVM_POOL_REGISTRY_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-registry-enable must be 0 or 1"
+    [[ "$UVM_SCRATCH_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-scratch-pool-enable must be 0 or 1"
+    [[ "$UVM_SCRATCH_POOL_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-budget-bytes must be a non-negative integer"
+    [[ "$UVM_SCRATCH_POOL_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-scratch-pool-mode must be trace_only or enforce"
+    [ -n "$UVM_SCRATCH_POOL_TARGET_PHASES" ] || die "--uvm-scratch-pool-target-phases must not be empty"
     [[ "$UVM_MOE_ROUTING_TRACE_ENABLE" =~ ^[01]$ ]] || die "--uvm-moe-routing-trace-enable must be 0 or 1"
     [[ "$SERVER_MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]] || die "--server-max-num-seqs must be a positive integer"
     [[ "$SERVER_GPU_MEMORY_UTILIZATION" =~ ^(0\.[0-9]+|1(\.0+)?)$ ]] || die "--server-gpu-memory-utilization must be in (0, 1]"

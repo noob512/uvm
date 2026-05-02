@@ -152,6 +152,22 @@ def load_uvm_library() -> ctypes.CDLL:
     lib.uvm_mark_phase_event.restype = None
     lib.uvm_mark_phase_event.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 
+    lib.uvm_prefetch.restype = None
+    lib.uvm_prefetch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+
+    lib.uvm_advise.restype = None
+    lib.uvm_advise.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+
     lib.uvm_close_log.restype = None
     lib.uvm_close_log.argtypes = []
 
@@ -359,16 +375,31 @@ def prefetch_to_device(tensor: torch.Tensor, device: int = 0) -> None:
 
     # Use cudaMemPrefetchAsync via the library
     if _uvm_lib is not None:
-        import ctypes
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
-        stream = torch.cuda.current_stream().cuda_stream
-        _uvm_lib.uvm_prefetch(
-            ctypes.c_void_p(ptr),
-            ctypes.c_size_t(size),
-            ctypes.c_int(device),
-            ctypes.c_void_p(stream)
-        )
+        prefetch_range_to_device(ptr, size, device)
+
+
+def prefetch_range_to_device(ptr: int, size: int, device: int = 0) -> bool:
+    """
+    Prefetch a raw UVM address range to the specified GPU device.
+
+    Returns True when a prefetch call was issued. This is intentionally a thin
+    wrapper around the allocator .so so higher-level policies can prefetch
+    logical tensor slices without constructing tensor views.
+    """
+    if not _uvm_enabled or _uvm_lib is None:
+        return False
+    if ptr <= 0 or size <= 0:
+        return False
+    stream = torch.cuda.current_stream().cuda_stream
+    _uvm_lib.uvm_prefetch(
+        ctypes.c_void_p(ptr),
+        ctypes.c_size_t(size),
+        ctypes.c_int(device),
+        ctypes.c_void_p(stream),
+    )
+    return True
 
 
 def set_preferred_location(tensor: torch.Tensor, device: int) -> None:

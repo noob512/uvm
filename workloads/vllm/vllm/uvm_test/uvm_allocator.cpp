@@ -72,6 +72,11 @@ static size_t kv_budget_bytes = 0;
 static std::string kv_budget_mode = "trace_only";
 static size_t weight_budget_bytes = 0;
 static std::string weight_budget_mode = "trace_only";
+static int pool_registry_enabled = 0;
+static int scratch_pool_enable = 0;
+static size_t scratch_pool_budget_bytes = 1 * 1024 * 1024;
+static std::string scratch_pool_mode = "trace_only";
+static std::string scratch_pool_target_phases = "enabled:attention";
 static bool gap_watch_control_seen = false;
 static uint64_t gap_watch_control_mtime_ns = 0;
 static off_t gap_watch_control_size = -1;
@@ -210,6 +215,66 @@ static std::atomic<size_t> weight_budget_reject_allocs{0};
 /// @brief Stage E：模型权重分配在 free 阶段成功释放的次数。
 static std::atomic<size_t> weight_free_success_allocs{0};
 
+/// @brief Stage F：统一 Pool Registry 记录到对象索引的分配次数。
+static std::atomic<size_t> pool_registry_tracked_allocs{0};
+
+/// @brief Stage F：统一 Pool Registry 已成功闭环释放的对象次数。
+static std::atomic<size_t> pool_registry_free_success_allocs{0};
+
+/// @brief Stage F：统一 Pool Registry 当前存活对象数。
+static std::atomic<size_t> pool_registry_live_objects{0};
+
+/// @brief Stage F：统一 Pool Registry 存活对象数高水位。
+static std::atomic<size_t> pool_registry_peak_live_objects{0};
+
+/// @brief Stage F：KV pool 分配次数。
+static std::atomic<size_t> pool_kv_allocs{0};
+static std::atomic<size_t> pool_kv_requested_bytes{0};
+static std::atomic<size_t> pool_kv_live_bytes{0};
+static std::atomic<size_t> pool_kv_peak_live_bytes{0};
+static std::atomic<size_t> pool_kv_free_success_allocs{0};
+
+/// @brief Stage F：Weights pool 分配次数。
+static std::atomic<size_t> pool_weight_allocs{0};
+static std::atomic<size_t> pool_weight_requested_bytes{0};
+static std::atomic<size_t> pool_weight_live_bytes{0};
+static std::atomic<size_t> pool_weight_peak_live_bytes{0};
+static std::atomic<size_t> pool_weight_free_success_allocs{0};
+
+/// @brief Stage F：Runtime scratch/workspace pool 分配次数。
+static std::atomic<size_t> pool_runtime_scratch_allocs{0};
+static std::atomic<size_t> pool_runtime_scratch_requested_bytes{0};
+static std::atomic<size_t> pool_runtime_scratch_live_bytes{0};
+static std::atomic<size_t> pool_runtime_scratch_peak_live_bytes{0};
+static std::atomic<size_t> pool_runtime_scratch_free_success_allocs{0};
+
+/// @brief Stage G：runtime scratch pool 准入控制参与评估的分配次数。
+static std::atomic<size_t> scratch_pool_trace_allocs{0};
+
+/// @brief Stage G：runtime scratch pool 满足独立准入条件的分配次数。
+static std::atomic<size_t> scratch_pool_eligible_allocs{0};
+
+/// @brief Stage G：runtime scratch pool 实际进入 device-direct backend 的分配次数。
+static std::atomic<size_t> scratch_pool_device_direct_allocs{0};
+
+/// @brief Stage G：runtime scratch pool 实际进入 device-direct backend 的累计字节数。
+static std::atomic<size_t> scratch_pool_device_direct_bytes{0};
+
+/// @brief Stage G：runtime scratch pool device-direct 当前存活字节数。
+static std::atomic<size_t> scratch_pool_device_direct_live_bytes{0};
+
+/// @brief Stage G：runtime scratch pool device-direct 存活字节高水位。
+static std::atomic<size_t> scratch_pool_device_direct_peak_live_bytes{0};
+
+/// @brief Stage G：runtime scratch pool 准入预算超限记录数。
+static std::atomic<size_t> scratch_pool_budget_over_allocs{0};
+
+/// @brief Stage G：enforce 模式下因 scratch pool 预算拒绝 device-direct 的次数。
+static std::atomic<size_t> scratch_pool_budget_reject_allocs{0};
+
+/// @brief Stage G：runtime scratch pool device-direct free 成功次数。
+static std::atomic<size_t> scratch_pool_device_direct_free_success_allocs{0};
+
 /**
  * @struct AllocationInfo
  * @brief UVM 显存分配的元数据生命周期快照 (Metadata Lifecycle Snapshot)
@@ -269,6 +334,14 @@ struct AllocationInfo {
     bool weight_budget_tracked;      ///< Stage E：此分配是否纳入 weights 独立预算遥测。
     bool weight_budget_over_budget;  ///< Stage E：记录分配完成后 weight live bytes 是否超过预算。
     std::string weight_budget_reason;///< Stage E：weight budget 判定原因。
+    bool pool_registry_tracked;      ///< Stage F：此分配是否纳入统一 pool registry。
+    std::string pool_kind_name;      ///< Stage F：统一 pool 名称，如 kv_cache/weights/runtime_scratch。
+    std::string pool_object_state;   ///< Stage F：对象状态，当前仅 telemetry active/freed。
+    bool scratch_pool_tracked;       ///< Stage G：此分配是否参与 scratch pool admission。
+    bool scratch_pool_eligible;      ///< Stage G：是否满足 scratch pool 独立准入。
+    bool scratch_pool_device_direct; ///< Stage G：是否实际进入 scratch pool device-direct。
+    bool scratch_pool_budget_over_budget; ///< Stage G：准入时是否超过 scratch pool 预算。
+    std::string scratch_pool_reason; ///< Stage G：scratch pool 准入/回退原因。
 };
 static std::unordered_map<void*, AllocationInfo> active_allocations;
 
@@ -311,7 +384,7 @@ enum class AllocationClass {
     /**
      * 6. 未知托管内存 (Unknown Managed)
      * 特点：未能命中任何启发式规则的分配请求。
-     * 策略：作为兜底类别。如果日志中大量出现此类别，说明现有的 classify_allocation 
+     * 策略：作为兜底类别。如果日志中大量出现此类别，说明现有的 classify_allocation
      * 匹配规则（如 Phase 名称、Size 阈值）需要更新。
      */
     UnknownManaged,
@@ -326,6 +399,15 @@ enum class PolicyAction {
 };
 
 static const char* allocation_class_to_string(AllocationClass alloc_class);
+
+enum class PoolKind {
+    KvCache,
+    Weights,
+    RuntimeScratch,
+    OtherManaged,
+};
+
+static const char* pool_kind_to_string(PoolKind pool_kind);
 
 /**
  * Get current timestamp string
@@ -493,6 +575,14 @@ static std::string normalize_weight_budget_mode(const std::string& value) {
     return "trace_only";
 }
 
+static std::string normalize_scratch_pool_mode(const std::string& value) {
+    std::string lowered = lower_copy(trim_copy(value));
+    if (lowered == "enforce" || lowered == "soft_enforce") {
+        return "enforce";
+    }
+    return "trace_only";
+}
+
 static bool configure_device_direct_async_pool_if_needed(int device) {
     if (!device_direct_pool_release_threshold_set ||
         device_direct_backend != "cuda_malloc_async") {
@@ -561,6 +651,10 @@ static bool comma_list_contains_phase_prefix(const std::string& csv,
 
 static bool is_device_direct_target_phase(const std::string& phase) {
     return comma_list_contains_phase_prefix(device_direct_target_phases, phase);
+}
+
+static bool is_scratch_pool_target_phase(const std::string& phase) {
+    return comma_list_contains_phase_prefix(scratch_pool_target_phases, phase);
 }
 
 static bool parse_bool_string(const std::string& value, bool* out) {
@@ -704,6 +798,55 @@ static bool is_kv_allocation(AllocationClass alloc_class) {
 
 static bool is_weight_allocation(AllocationClass alloc_class) {
     return alloc_class == AllocationClass::WeightPersistent;
+}
+
+static bool is_runtime_scratch_pool_allocation(AllocationClass alloc_class) {
+    return alloc_class == AllocationClass::RuntimeScratch ||
+           alloc_class == AllocationClass::RuntimeWorkspace ||
+           alloc_class == AllocationClass::WarmupWorkspace;
+}
+
+static PoolKind pool_kind_for_allocation(AllocationClass alloc_class) {
+    switch (alloc_class) {
+        case AllocationClass::KvPersistent:
+            return PoolKind::KvCache;
+        case AllocationClass::WeightPersistent:
+            return PoolKind::Weights;
+        case AllocationClass::RuntimeScratch:
+        case AllocationClass::RuntimeWorkspace:
+        case AllocationClass::WarmupWorkspace:
+            return PoolKind::RuntimeScratch;
+        case AllocationClass::UnknownManaged:
+        default:
+            return PoolKind::OtherManaged;
+    }
+}
+
+static const char* pool_kind_to_string(PoolKind pool_kind) {
+    switch (pool_kind) {
+        case PoolKind::KvCache:
+            return "kv_cache";
+        case PoolKind::Weights:
+            return "weights";
+        case PoolKind::RuntimeScratch:
+            return "runtime_scratch";
+        case PoolKind::OtherManaged:
+        default:
+            return "other_managed";
+    }
+}
+
+static PoolKind pool_kind_from_string(const std::string& value) {
+    if (value == "kv_cache") {
+        return PoolKind::KvCache;
+    }
+    if (value == "weights") {
+        return PoolKind::Weights;
+    }
+    if (value == "runtime_scratch") {
+        return PoolKind::RuntimeScratch;
+    }
+    return PoolKind::OtherManaged;
 }
 
 static void update_device_direct_peak_live(size_t current_live) {
@@ -877,6 +1020,159 @@ static void release_weight_budget(size_t size) {
             return;
         }
     }
+}
+
+static void update_pool_peak_live(std::atomic<size_t>& peak_counter,
+                                  size_t current_live) {
+    size_t peak = peak_counter.load();
+    while (current_live > peak) {
+        if (peak_counter.compare_exchange_weak(peak, current_live)) {
+            break;
+        }
+    }
+}
+
+static void release_pool_live_bytes(std::atomic<size_t>& live_counter,
+                                    size_t size) {
+    size_t live = live_counter.load();
+    while (true) {
+        size_t next_live = live >= size ? live - size : 0;
+        if (live_counter.compare_exchange_weak(live, next_live)) {
+            return;
+        }
+    }
+}
+
+static void record_pool_registry_allocation(PoolKind pool_kind, size_t size) {
+    pool_registry_tracked_allocs.fetch_add(1);
+    size_t live_objects = pool_registry_live_objects.fetch_add(1) + 1;
+    update_pool_peak_live(pool_registry_peak_live_objects, live_objects);
+
+    switch (pool_kind) {
+        case PoolKind::KvCache: {
+            pool_kv_allocs.fetch_add(1);
+            pool_kv_requested_bytes.fetch_add(size);
+            size_t current_live = pool_kv_live_bytes.fetch_add(size) + size;
+            update_pool_peak_live(pool_kv_peak_live_bytes, current_live);
+            break;
+        }
+        case PoolKind::Weights: {
+            pool_weight_allocs.fetch_add(1);
+            pool_weight_requested_bytes.fetch_add(size);
+            size_t current_live = pool_weight_live_bytes.fetch_add(size) + size;
+            update_pool_peak_live(pool_weight_peak_live_bytes, current_live);
+            break;
+        }
+        case PoolKind::RuntimeScratch: {
+            pool_runtime_scratch_allocs.fetch_add(1);
+            pool_runtime_scratch_requested_bytes.fetch_add(size);
+            size_t current_live =
+                pool_runtime_scratch_live_bytes.fetch_add(size) + size;
+            update_pool_peak_live(
+                pool_runtime_scratch_peak_live_bytes,
+                current_live
+            );
+            break;
+        }
+        case PoolKind::OtherManaged:
+        default:
+            break;
+    }
+}
+
+static void release_pool_registry_allocation(PoolKind pool_kind, size_t size) {
+    size_t live_objects = pool_registry_live_objects.load();
+    while (true) {
+        size_t next_live = live_objects > 0 ? live_objects - 1 : 0;
+        if (pool_registry_live_objects.compare_exchange_weak(
+                live_objects,
+                next_live
+            )) {
+            break;
+        }
+    }
+    pool_registry_free_success_allocs.fetch_add(1);
+
+    switch (pool_kind) {
+        case PoolKind::KvCache:
+            release_pool_live_bytes(pool_kv_live_bytes, size);
+            pool_kv_free_success_allocs.fetch_add(1);
+            break;
+        case PoolKind::Weights:
+            release_pool_live_bytes(pool_weight_live_bytes, size);
+            pool_weight_free_success_allocs.fetch_add(1);
+            break;
+        case PoolKind::RuntimeScratch:
+            release_pool_live_bytes(pool_runtime_scratch_live_bytes, size);
+            pool_runtime_scratch_free_success_allocs.fetch_add(1);
+            break;
+        case PoolKind::OtherManaged:
+        default:
+            break;
+    }
+}
+
+static void update_scratch_pool_device_direct_peak_live(size_t current_live) {
+    size_t peak = scratch_pool_device_direct_peak_live_bytes.load();
+    while (current_live > peak) {
+        if (scratch_pool_device_direct_peak_live_bytes.compare_exchange_weak(
+                peak,
+                current_live
+            )) {
+            break;
+        }
+    }
+}
+
+static bool reserve_scratch_pool_device_direct_budget(size_t size,
+                                                      bool* over_budget_out) {
+    size_t live = scratch_pool_device_direct_live_bytes.load();
+    while (true) {
+        size_t next_live = live + size;
+        if (next_live < live) {
+            if (over_budget_out) {
+                *over_budget_out = true;
+            }
+            return false;
+        }
+        bool over_budget =
+            scratch_pool_budget_bytes > 0 && next_live > scratch_pool_budget_bytes;
+        if (over_budget_out) {
+            *over_budget_out = over_budget;
+        }
+        if (over_budget && scratch_pool_mode == "enforce") {
+            return false;
+        }
+        if (scratch_pool_device_direct_live_bytes.compare_exchange_weak(
+                live,
+                next_live
+            )) {
+            update_scratch_pool_device_direct_peak_live(next_live);
+            return true;
+        }
+    }
+}
+
+static void release_scratch_pool_device_direct_budget(size_t size) {
+    size_t live = scratch_pool_device_direct_live_bytes.load();
+    while (true) {
+        size_t next_live = live >= size ? live - size : 0;
+        if (scratch_pool_device_direct_live_bytes.compare_exchange_weak(
+                live,
+                next_live
+            )) {
+            return;
+        }
+    }
+}
+
+static size_t scratch_pool_budget_remaining_snapshot(size_t live) {
+    if (scratch_pool_budget_bytes == 0) {
+        return 0;
+    }
+    return live >= scratch_pool_budget_bytes
+        ? 0
+        : scratch_pool_budget_bytes - live;
 }
 
 static const char* size_bucket_for(size_t size) {
@@ -1319,7 +1615,7 @@ static AllocationClass classify_allocation(const std::string& phase,
         if (size >= 1 * 1024 * 1024 && size <= 16 * 1024 * 1024) {
             return AllocationClass::RuntimeScratch;
         }
-        
+
         // 4.2 运行时工作空间 (16MB ~ 128MB)
         // 可能是中间层的激活值 (Activations) 或 Logits。
         // 这些内存会在每一轮推理迭代中循环申请和释放。
@@ -1361,7 +1657,7 @@ static PolicyAction choose_policy_action(AllocationClass alloc_class,
     if (alloc_class == AllocationClass::WarmupWorkspace &&
         policy_warmup_prefetch_enabled &&
         size >= policy_warmup_prefetch_min_bytes) {
-        
+
         // 如果满足，下达“预取到 GPU”的指令
         return PolicyAction::ManagedPrefetchGpu;
     }
@@ -1554,6 +1850,24 @@ static void init_log_file() {
                 weight_budget_mode.c_str()
             )
         );
+        pool_registry_enabled =
+            read_bool_from_env("VLLM_UVM_POOL_REGISTRY_ENABLE", false) ? 1 : 0;
+        scratch_pool_enable =
+            read_bool_from_env("VLLM_UVM_SCRATCH_POOL_ENABLE", false) ? 1 : 0;
+        scratch_pool_budget_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_SCRATCH_POOL_BUDGET_BYTES",
+            scratch_pool_budget_bytes
+        );
+        scratch_pool_mode = normalize_scratch_pool_mode(
+            read_string_from_env(
+                "VLLM_UVM_SCRATCH_POOL_MODE",
+                scratch_pool_mode.c_str()
+            )
+        );
+        scratch_pool_target_phases = read_string_from_env(
+            "VLLM_UVM_SCRATCH_POOL_TARGET_PHASES",
+            scratch_pool_target_phases.c_str()
+        );
         uintptr_t parsed_gap_start = 0;
         uintptr_t parsed_gap_end = 0;
         if (read_hex_u64_from_env("VLLM_UVM_GAP_WATCH_START", &parsed_gap_start) &&
@@ -1604,7 +1918,10 @@ static void init_log_file() {
                 "device_direct_pool_release_threshold=%zu "
                 "device_direct_target_phases=%s "
                 "kv_budget_bytes=%zu kv_budget_mode=%s "
-                "weight_budget_bytes=%zu weight_budget_mode=%s\n",
+                "weight_budget_bytes=%zu weight_budget_mode=%s "
+                "pool_registry_enabled=%d "
+                "scratch_pool_enable=%d scratch_pool_budget_bytes=%zu "
+                "scratch_pool_mode=%s scratch_pool_target_phases=%s\n",
                 timestamp, policy_enabled, policy_mode.c_str(),
                 policy_warmup_prefetch_enabled, policy_warmup_prefetch_min_bytes,
                 policy_warmup_advise_gpu,
@@ -1631,7 +1948,12 @@ static void init_log_file() {
                 kv_budget_bytes,
                 kv_budget_mode.c_str(),
                 weight_budget_bytes,
-                weight_budget_mode.c_str()
+                weight_budget_mode.c_str(),
+                pool_registry_enabled,
+                scratch_pool_enable,
+                scratch_pool_budget_bytes,
+                scratch_pool_mode.c_str(),
+                scratch_pool_target_phases.c_str()
             );
             fprintf(log_file, "========================================\n");
 
@@ -1803,6 +2125,11 @@ static void trace_policy_event(void* ptr,
                                bool weight_budget_tracked,
                                bool weight_budget_over_budget,
                                const char* weight_budget_reason,
+                               bool scratch_pool_tracked,
+                               bool scratch_pool_eligible,
+                               bool scratch_pool_device_direct,
+                               bool scratch_pool_budget_over_budget,
+                               const char* scratch_pool_reason,
                                bool hot_gap_match,
                                bool action_success,
                                const char* action_error) {
@@ -1824,6 +2151,10 @@ static void trace_policy_event(void* ptr,
     size_t weight_live_snapshot = weight_live_bytes.load();
     size_t weight_budget_remaining =
         weight_budget_remaining_snapshot(weight_live_snapshot);
+    size_t scratch_pool_live_snapshot =
+        scratch_pool_device_direct_live_bytes.load();
+    size_t scratch_pool_budget_remaining =
+        scratch_pool_budget_remaining_snapshot(scratch_pool_live_snapshot);
     int pool_config_attempted_snapshot = 0;
     int pool_config_success_snapshot = 0;
     int pool_config_device_snapshot = -1;
@@ -1859,6 +2190,11 @@ static void trace_policy_event(void* ptr,
         "weight_budget_reason=%s weight_live_bytes=%zu "
         "weight_budget_bytes=%zu weight_budget_remaining=%zu "
         "weight_budget_mode=%s "
+        "scratch_pool_tracked=%d scratch_pool_eligible=%d "
+        "scratch_pool_device_direct=%d scratch_pool_over_budget=%d "
+        "scratch_pool_reason=%s scratch_pool_live_bytes=%zu "
+        "scratch_pool_budget_bytes=%zu scratch_pool_budget_remaining=%zu "
+        "scratch_pool_mode=%s scratch_pool_enable=%d "
         "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
@@ -1902,8 +2238,150 @@ static void trace_policy_event(void* ptr,
         weight_budget_bytes,
         weight_budget_remaining,
         weight_budget_mode.c_str(),
+        scratch_pool_tracked ? 1 : 0,
+        scratch_pool_eligible ? 1 : 0,
+        scratch_pool_device_direct ? 1 : 0,
+        scratch_pool_budget_over_budget ? 1 : 0,
+        scratch_pool_reason ? scratch_pool_reason : "not_scratch_pool",
+        scratch_pool_live_snapshot,
+        scratch_pool_budget_bytes,
+        scratch_pool_budget_remaining,
+        scratch_pool_mode.c_str(),
+        scratch_pool_enable,
         cpu_access_risk ? cpu_access_risk : "unknown",
         hot_gap_match ? 1 : 0
+    );
+    fflush(log_file);
+}
+
+static void trace_pool_alloc_event(void* ptr,
+                                   size_t size,
+                                   size_t alloc_num,
+                                   int device,
+                                   const std::string& phase,
+                                   AllocationClass alloc_class,
+                                   PoolKind pool_kind,
+                                   const char* size_bucket,
+                                   const char* placement_backend,
+                                   const char* device_direct_backend_used,
+                                   bool scratch_pool_tracked,
+                                   bool scratch_pool_eligible,
+                                   bool scratch_pool_device_direct,
+                                   bool scratch_pool_budget_over_budget,
+                                   const char* scratch_pool_reason,
+                                   const char* pool_object_state) {
+    if (!log_file || !pool_registry_enabled ||
+        pool_kind == PoolKind::OtherManaged) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    double elapsed = get_elapsed_seconds();
+    uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t end = region_end_for(start, size);
+
+    fprintf(
+        log_file,
+        "[%s] [+%.3fs] TRACE_POOL_ALLOC alloc_id=%zu ptr=0x%llx "
+        "end=0x%llx size_bytes=%zu size_bucket=%s device=%d phase=%s "
+        "predicted_class=%s pool_kind=%s pool_object_state=%s "
+        "pool_registry_enabled=%d placement_backend=%s "
+        "device_direct_backend=%s "
+        "scratch_pool_tracked=%d scratch_pool_eligible=%d "
+        "scratch_pool_device_direct=%d scratch_pool_over_budget=%d "
+        "scratch_pool_reason=%s "
+        "pool_registry_live_objects=%zu pool_registry_peak_live_objects=%zu "
+        "pool_kv_live_bytes=%zu pool_weight_live_bytes=%zu "
+        "pool_runtime_scratch_live_bytes=%zu\n",
+        timestamp,
+        elapsed,
+        alloc_num,
+        static_cast<unsigned long long>(start),
+        static_cast<unsigned long long>(end),
+        size,
+        size_bucket,
+        device,
+        phase.c_str(),
+        allocation_class_to_string(alloc_class),
+        pool_kind_to_string(pool_kind),
+        (pool_object_state && pool_object_state[0] != '\0')
+            ? pool_object_state
+            : "active",
+        pool_registry_enabled,
+        placement_backend ? placement_backend : "managed",
+        device_direct_backend_used ? device_direct_backend_used : "none",
+        scratch_pool_tracked ? 1 : 0,
+        scratch_pool_eligible ? 1 : 0,
+        scratch_pool_device_direct ? 1 : 0,
+        scratch_pool_budget_over_budget ? 1 : 0,
+        scratch_pool_reason ? scratch_pool_reason : "not_scratch_pool",
+        pool_registry_live_objects.load(),
+        pool_registry_peak_live_objects.load(),
+        pool_kv_live_bytes.load(),
+        pool_weight_live_bytes.load(),
+        pool_runtime_scratch_live_bytes.load()
+    );
+    fflush(log_file);
+}
+
+static void trace_pool_free_event(void* ptr,
+                                  size_t size,
+                                  size_t free_num,
+                                  int device,
+                                  const AllocationInfo* info,
+                                  const std::string& current_phase_snapshot) {
+    if (!log_file || !pool_registry_enabled || !info ||
+        !info->pool_registry_tracked) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    double elapsed = get_elapsed_seconds();
+    uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t end = region_end_for(start, size);
+    double lifetime_seconds = elapsed - info->alloc_elapsed_seconds;
+
+    fprintf(
+        log_file,
+        "[%s] [+%.3fs] TRACE_POOL_FREE free_id=%zu ptr=0x%llx "
+        "end=0x%llx size_bytes=%zu device=%d phase=%s alloc_id=%zu "
+        "alloc_phase=%s lifetime_s=%.6f predicted_class=%s pool_kind=%s "
+        "pool_object_state=freed placement_backend=%s "
+        "device_direct_backend=%s pool_registry_live_objects=%zu "
+        "pool_registry_peak_live_objects=%zu pool_kv_live_bytes=%zu "
+        "pool_weight_live_bytes=%zu pool_runtime_scratch_live_bytes=%zu "
+        "scratch_pool_tracked=%d scratch_pool_eligible=%d "
+        "scratch_pool_device_direct=%d scratch_pool_reason=%s\n",
+        timestamp,
+        elapsed,
+        free_num,
+        static_cast<unsigned long long>(start),
+        static_cast<unsigned long long>(end),
+        size,
+        device,
+        current_phase_snapshot.c_str(),
+        info->alloc_id,
+        info->phase.c_str(),
+        lifetime_seconds,
+        info->alloc_class_name.c_str(),
+        info->pool_kind_name.c_str(),
+        info->placement_backend_name.c_str(),
+        info->device_direct_backend_name.c_str(),
+        pool_registry_live_objects.load(),
+        pool_registry_peak_live_objects.load(),
+        pool_kv_live_bytes.load(),
+        pool_weight_live_bytes.load(),
+        pool_runtime_scratch_live_bytes.load(),
+        info->scratch_pool_tracked ? 1 : 0,
+        info->scratch_pool_eligible ? 1 : 0,
+        info->scratch_pool_device_direct ? 1 : 0,
+        info->scratch_pool_reason.c_str()
     );
     fflush(log_file);
 }
@@ -1982,6 +2460,11 @@ static void trace_gap_watch_alloc_event(void* ptr,
                                         bool weight_budget_tracked,
                                         bool weight_budget_over_budget,
                                         const char* weight_budget_reason,
+                                        bool scratch_pool_tracked,
+                                        bool scratch_pool_eligible,
+                                        bool scratch_pool_device_direct,
+                                        bool scratch_pool_budget_over_budget,
+                                        const char* scratch_pool_reason,
                                         bool hot_gap_match) {
     if (!log_file) return;
 
@@ -2008,6 +2491,10 @@ static void trace_gap_watch_alloc_event(void* ptr,
     size_t weight_live_snapshot = weight_live_bytes.load();
     size_t weight_budget_remaining =
         weight_budget_remaining_snapshot(weight_live_snapshot);
+    size_t scratch_pool_live_snapshot =
+        scratch_pool_device_direct_live_bytes.load();
+    size_t scratch_pool_budget_remaining =
+        scratch_pool_budget_remaining_snapshot(scratch_pool_live_snapshot);
     int pool_config_attempted_snapshot = 0;
     int pool_config_success_snapshot = 0;
     int pool_config_device_snapshot = -1;
@@ -2043,6 +2530,11 @@ static void trace_gap_watch_alloc_event(void* ptr,
         "weight_budget_reason=%s weight_live_bytes=%zu "
         "weight_budget_bytes=%zu weight_budget_remaining=%zu "
         "weight_budget_mode=%s "
+        "scratch_pool_tracked=%d scratch_pool_eligible=%d "
+        "scratch_pool_device_direct=%d scratch_pool_over_budget=%d "
+        "scratch_pool_reason=%s scratch_pool_live_bytes=%zu "
+        "scratch_pool_budget_bytes=%zu scratch_pool_budget_remaining=%zu "
+        "scratch_pool_mode=%s scratch_pool_enable=%d "
         "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
@@ -2090,6 +2582,16 @@ static void trace_gap_watch_alloc_event(void* ptr,
         weight_budget_bytes,
         weight_budget_remaining,
         weight_budget_mode.c_str(),
+        scratch_pool_tracked ? 1 : 0,
+        scratch_pool_eligible ? 1 : 0,
+        scratch_pool_device_direct ? 1 : 0,
+        scratch_pool_budget_over_budget ? 1 : 0,
+        scratch_pool_reason ? scratch_pool_reason : "not_scratch_pool",
+        scratch_pool_live_snapshot,
+        scratch_pool_budget_bytes,
+        scratch_pool_budget_remaining,
+        scratch_pool_mode.c_str(),
+        scratch_pool_enable,
         cpu_access_risk ? cpu_access_risk : "unknown",
         hot_gap_match ? 1 : 0
     );
@@ -2136,6 +2638,8 @@ static void trace_gap_watch_free_event(void* ptr,
         "kv_budget_tracked=%d kv_budget_over_budget=%d kv_budget_reason=%s "
         "weight_budget_tracked=%d weight_budget_over_budget=%d "
         "weight_budget_reason=%s "
+        "scratch_pool_tracked=%d scratch_pool_eligible=%d "
+        "scratch_pool_device_direct=%d scratch_pool_reason=%s "
         "cpu_access_risk=%s hot_gap_match=%d\n",
         timestamp,
         elapsed,
@@ -2171,6 +2675,10 @@ static void trace_gap_watch_free_event(void* ptr,
         info->weight_budget_tracked ? 1 : 0,
         info->weight_budget_over_budget ? 1 : 0,
         info->weight_budget_reason.c_str(),
+        info->scratch_pool_tracked ? 1 : 0,
+        info->scratch_pool_eligible ? 1 : 0,
+        info->scratch_pool_device_direct ? 1 : 0,
+        info->scratch_pool_reason.c_str(),
         info->cpu_access_risk.c_str(),
         info->hot_gap_match ? 1 : 0
     );
@@ -2270,7 +2778,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
 
     std::string phase_snapshot;
     double alloc_elapsed = get_elapsed_seconds();
-    
+
     // 5. 捕获当前 phase 快照
     {
         std::lock_guard<std::mutex> lock(log_mutex);
@@ -2303,11 +2811,24 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         device
     );
 
+    /* ============================================================================
+    * 第一阶段：动态配置加载与地址空间重叠分析 (Gap-Watch Detection)
+    * ============================================================================ */
+
+    // 1.1 动态同步监控策略：
+    // 从外部控制文件（通常是 JSON）刷新热点地址区间（Gap）。
+    // 这允许我们在不重启 vLLM 进程的情况下，通过外部工具动态修正要优化的内存地址段。
     refresh_gap_watch_from_control_file_if_needed(false);
-    
+
     const char* policy_action_error = "none";
     bool policy_action_success = true;
+
+    // 1.2 尺寸分桶：将字节大小转换为可读标签（如 "1MB-4MB"），便于日志聚合分析。
     const char* size_bucket = size_bucket_for(static_cast<size_t>(size));
+
+    // 1.3 核心逻辑：计算地址重叠 (Compute Overlap)
+    // 检查当前分配的 UVM 地址 (ptr) 及其范围是否落在了我们标记为“频繁缺页中断”的 Hot Gap 区间内。
+    // 如果重叠，gap_overlap_bytes 将记录具体命中的字节数，这是 Stage C 优化的物理前提。
     uintptr_t gap_overlap_start = 0;
     uintptr_t gap_overlap_end = 0;
     size_t gap_overlap_bytes = 0;
@@ -2320,40 +2841,58 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         &gap_overlap_end,
         &gap_overlap_bytes
     );
-    bool log_unknown_detail = should_trace_unknown_detail(
-        alloc_class,
-        static_cast<size_t>(size)
-    );
-    bool log_gap_watch = should_trace_gap_watch(
-        alloc_class,
-        static_cast<size_t>(size),
-        gap_overlap_bytes
-    );
+
+    /* ============================================================================
+    * 第二阶段：策略仲裁与追踪配置 (Policy Arbitration)
+    * ============================================================================ */
+
+    // 2.1 追踪详情判定：决定是否记录该次分配的原始细节（用于诊断未知内存块）。
+    bool log_unknown_detail = should_trace_unknown_detail(alloc_class, static_cast<size_t>(size));
+    bool log_gap_watch = should_trace_gap_watch(alloc_class, static_cast<size_t>(size), gap_overlap_bytes);
+
+    // 2.2 获取针对 Gap 区间的特定策略：
+    // 比如：如果命中 Gap，且类别是 runtime_scratch，则策略可能是 PolicyAction::DeviceDirect。
     bool gap_watch_class_match = false;
     const char* policy_source = "base_policy";
     PolicyAction gap_watch_policy_action = choose_gap_watch_policy_action(
-        alloc_class,
-        phase_snapshot,
-        static_cast<size_t>(size),
-        device,
-        gap_overlap_bytes,
-        &gap_watch_class_match,
-        &policy_source
+        alloc_class, phase_snapshot, static_cast<size_t>(size), device,
+        gap_overlap_bytes, &gap_watch_class_match, &policy_source
     );
+
+    // 2.3 策略覆盖：
+    // 优先级：Gap-Watch 策略 > 基础启发式策略。
+    // 如果 Gap-Watch 返回了有效动作，则覆盖默认行为，实现“精确打击”。
     PolicyAction policy_action =
         (gap_watch_policy_action != PolicyAction::ManagedDefault)
             ? gap_watch_policy_action
             : base_policy_action;
+
+    /* ============================================================================
+    * 第三阶段：安全边界检查与预算审计 (Safety & Budgeting)
+    * ============================================================================ */
+
+    // 3.1 基础状态标志位：标记是否命中热点区间、是否请求了直连模式、当前执行相位是否匹配。
     bool hot_gap_match = gap_watch_enabled && gap_overlap_bytes > 0;
     bool device_direct_requested = is_device_direct_action(policy_action);
     bool device_direct_phase_match = is_device_direct_target_phase(phase_snapshot);
+
+    // 3.2 初始环境回显：记录后端默认为 managed。
     const char* placement_backend = "managed";
     const char* device_direct_backend_used = "none";
+
+    // 3.3 CPU 访问风险评估：
+    // 如果在允许的计算相位（如 attention）开启直连，CPU 触碰风险极低。
+    // 反之，若在未知相位强开直连，则存在被 CPU 访问导致 Segment Fault 的风险。
     const char* cpu_access_risk = device_direct_phase_match
         ? "low_no_cpu_access_evidence_runtime_phase"
         : "unknown";
+
     const char* device_direct_reason = "not_requested";
     bool device_direct_eligible = false;
+
+    // 3.4 核心组件显存记账 (KV & Weights)：
+    // 这里的 record_* 调用会进行原子加减，确保我们永远知道 KV Cache 和模型权重占用了多少“真显存”。
+    // 这是 Stage E 成功的关键——对每一字节权重进行身份追踪。
     bool kv_budget_tracked = is_kv_allocation(alloc_class);
     bool kv_budget_over_budget = false;
     const char* kv_budget_reason = "not_kv";
@@ -2362,35 +2901,107 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     const char* weight_budget_reason = "not_weight";
 
     if (kv_budget_tracked) {
-        record_kv_allocation(
-            static_cast<size_t>(size),
-            &kv_budget_over_budget,
-            &kv_budget_reason
-        );
+        record_kv_allocation(static_cast<size_t>(size), &kv_budget_over_budget, &kv_budget_reason);
     }
     if (weight_budget_tracked) {
-        record_weight_allocation(
-            static_cast<size_t>(size),
-            &weight_budget_over_budget,
-            &weight_budget_reason
-        );
+        record_weight_allocation(static_cast<size_t>(size), &weight_budget_over_budget, &weight_budget_reason);
     }
 
+    PoolKind pool_kind = pool_kind_for_allocation(alloc_class);
+    bool pool_registry_tracked =
+        pool_registry_enabled &&
+        pool_kind != PoolKind::OtherManaged &&
+        device >= 0;
+    const char* pool_object_state =
+        pool_registry_tracked ? "active" : "untracked";
+    if (pool_registry_tracked) {
+        record_pool_registry_allocation(pool_kind, static_cast<size_t>(size));
+    }
+
+    bool scratch_pool_tracked =
+        scratch_pool_enable &&
+        is_runtime_scratch_pool_allocation(alloc_class) &&
+        device >= 0;
+    bool scratch_pool_phase_match = is_scratch_pool_target_phase(phase_snapshot);
+    bool scratch_pool_eligible = false;
+    bool scratch_pool_device_direct = false;
+    bool scratch_pool_budget_over_budget = false;
+    bool scratch_pool_budget_reserved = false;
+    const char* scratch_pool_reason = scratch_pool_tracked
+        ? "scratch_pool_not_evaluated"
+        : "not_scratch_pool";
+
+    if (scratch_pool_tracked) {
+        scratch_pool_trace_allocs.fetch_add(1);
+        if (!scratch_pool_phase_match) {
+            scratch_pool_reason = "scratch_pool_phase_not_allowed";
+        } else if (static_cast<size_t>(size) < device_direct_min_bytes) {
+            scratch_pool_reason = "scratch_pool_below_min_bytes";
+        } else if (static_cast<size_t>(size) > device_direct_max_bytes) {
+            scratch_pool_reason = "scratch_pool_above_max_bytes";
+        } else if (!device_direct_enable) {
+            scratch_pool_reason = "scratch_pool_device_direct_disabled";
+        } else {
+            scratch_pool_eligible = true;
+            scratch_pool_eligible_allocs.fetch_add(1);
+            bool over_budget = false;
+            scratch_pool_budget_reserved =
+                reserve_scratch_pool_device_direct_budget(
+                    static_cast<size_t>(size),
+                    &over_budget
+                );
+            scratch_pool_budget_over_budget = over_budget;
+            if (over_budget) {
+                scratch_pool_budget_over_allocs.fetch_add(1);
+            }
+            if (!scratch_pool_budget_reserved) {
+                scratch_pool_budget_reject_allocs.fetch_add(1);
+                scratch_pool_reason = "scratch_pool_budget_exceeded_fallback_managed";
+            } else if (over_budget) {
+                scratch_pool_reason = "scratch_pool_trace_only_over_budget_device_direct";
+            } else {
+                scratch_pool_reason = "scratch_pool_device_direct_enabled";
+            }
+        }
+    }
+
+    if (scratch_pool_eligible && scratch_pool_budget_reserved) {
+        policy_action = PolicyAction::DeviceDirect;
+        policy_source = "scratch_pool_policy";
+        device_direct_requested = true;
+        device_direct_reason = scratch_pool_reason;
+    }
+
+    /* ============================================================================
+    * 第四阶段：Stage C 准入八要素检查 (Gatekeeping)
+    * ============================================================================ */
+
+    // 4.1 深度过滤：即使策略引擎想要开启 Device-Direct，也必须通过以下所有物理约束：
     if (device_direct_requested) {
         if (device < 0) {
             device_direct_reason = "invalid_device";
+        } else if (scratch_pool_budget_reserved) {
+            device_direct_eligible = true;
         } else if (!hot_gap_match) {
+            // 约束 1：必须在监测到的热点 Gap 区间内（防止盲目加速）。
             device_direct_reason = "no_hot_gap_match";
         } else if (!gap_watch_class_match) {
+            // 约束 2：内存类别必须匹配目标（如 runtime_scratch）。
             device_direct_reason = "target_class_mismatch";
         } else if (!device_direct_phase_match) {
+            // 约束 3：执行相位必须在白名单内（如 enabled:attention）。
             device_direct_reason = "phase_not_allowed";
         } else if (static_cast<size_t>(size) < device_direct_min_bytes) {
+            // 约束 4：申请尺寸不能太小（避免碎块显存池碎片化）。
             device_direct_reason = "below_min_bytes";
         } else if (static_cast<size_t>(size) > device_direct_max_bytes) {
+            // 约束 5：申请尺寸不能太大（防止单块内存瞬间耗尽显存预算）。
             device_direct_reason = "above_max_bytes";
         } else {
+            // 最终准入：通过物理边界检查，具备进入 Device-Direct 路径的资格。
             device_direct_eligible = true;
+
+            // 判定具体开启模式：是真实迁移还是仅在基准测试阶段做追踪 (Trace)。
             if (policy_action == PolicyAction::DeviceDirect && device_direct_enable) {
                 device_direct_reason = "device_direct_enabled";
             } else if (policy_action == PolicyAction::DeviceDirectTrace) {
@@ -2399,6 +3010,8 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
                 device_direct_reason = "trace_only_not_enabled";
             }
         }
+
+        // 4.2 统计更新：记录该次请求的踪迹、请求的总字节数以及最终符合条件的合规计数。
         device_direct_trace_allocs.fetch_add(1);
         device_direct_requested_bytes.fetch_add(static_cast<size_t>(size));
         if (device_direct_eligible) {
@@ -2406,80 +3019,175 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
+    /* ============================================================================
+    * 第五阶段：执行物理分配替换 (Actual Device-Direct Allocation & Swap)
+    * ============================================================================ */
+
+    // 5.1 终极准入检查：
+    // 只有同时满足：1. 符合八要素准入；2. 策略动作为真实分配；3. 全局开关开启；4. 初始 UVM 指针有效。
     if (device_direct_eligible &&
-        policy_action == PolicyAction::DeviceDirect &&
-        device_direct_enable &&
-        ptr != NULL) {
+            policy_action == PolicyAction::DeviceDirect &&
+            device_direct_enable &&
+            ptr != NULL) {
+
         void* device_ptr = NULL;
+
+        // 5.2 预算预留 (Stage C1 核心逻辑)：
+        // 在进行任何物理分配前，先尝试在账本中扣除预算（max_total_bytes）。
+        // 这确保了纯显存的占用始终在安全范围内，防止因 Direct 分配导致 GPU 整体 OOM。
         bool budget_reserved = reserve_device_direct_budget(static_cast<size_t>(size));
+
         if (!budget_reserved) {
+            // 如果预算不足，记录原因并增加拒绝计数，随后程序将直接使用原本的 managed (UVM) 指针。
             device_direct_reason = "device_direct_budget_exceeded";
             device_direct_budget_rejects.fetch_add(1);
+            if (scratch_pool_budget_reserved) {
+                release_scratch_pool_device_direct_budget(static_cast<size_t>(size));
+                scratch_pool_budget_reserved = false;
+                scratch_pool_reason = "scratch_pool_global_device_direct_budget_exceeded";
+            }
         } else {
+            // 5.3 准备执行环境：切换 CUDA 设备
             int previous_device = -1;
             cudaError_t get_device_err = cudaGetDevice(&previous_device);
             if (device >= 0) {
                 cudaSetDevice(device);
             }
+
+            // 5.4 后端选择与配置 (Stage C2 核心逻辑)：
+            // 判断是使用同步的 cudaMalloc 还是异步的 cudaMallocAsync。
             bool use_async_backend = device_direct_backend == "cuda_malloc_async";
             bool pool_config_ready = true;
             std::string pool_config_error_snapshot = "none";
+
             if (use_async_backend) {
-                pool_config_ready =
-                    configure_device_direct_async_pool_if_needed(device);
+                // 如果使用异步后端，尝试配置 CUDA 默认内存池（如设置 Release Threshold）。
+                pool_config_ready = configure_device_direct_async_pool_if_needed(device);
                 if (!pool_config_ready) {
+                    // 如果内存池配置失败（可能是 CUDA 版本或硬件不支持），记录错误快照。
                     std::lock_guard<std::mutex> pool_lock(device_direct_pool_mutex);
                     pool_config_error_snapshot = device_direct_pool_config_error;
                 }
             }
+
+            // 5.5 执行物理显存申请：
             cudaError_t device_alloc_err = cudaSuccess;
             if (pool_config_ready) {
+                // 根据 backend 配置，调用对应的 CUDA API 申请纯显存（GPU-only）。
                 device_alloc_err = use_async_backend
                     ? cudaMallocAsync(&device_ptr, static_cast<size_t>(size), stream)
                     : cudaMalloc(&device_ptr, static_cast<size_t>(size));
             } else {
                 device_alloc_err = cudaErrorInvalidValue;
             }
+
+            // 5.6 环境恢复：切回之前的 CUDA 设备
             if (get_device_err == cudaSuccess && previous_device >= 0) {
                 cudaSetDevice(previous_device);
             }
 
+            /* ====================================================================
+            * 第六阶段：指针交换与清理 (The Swap Operation)
+            * ==================================================================== */
+
+            // 判定申请是否成功且获得了有效的纯显存指针
             if (device_alloc_err == cudaSuccess && device_ptr != NULL) {
+
+                // 6.1 撤销原 Managed 内存：
+                // 这是 Stage C 设计最精妙的地方：为了保持内存地址的唯一性，
+                // 必须立刻释放掉最初通过 cudaMallocManaged 申请的“候选”指针。
                 cudaError_t free_candidate_err = cudaFree(ptr);
+
                 if (free_candidate_err == cudaSuccess) {
+                    // 6.2 成功替换：
+                    // 将返回指针 ptr 更新为纯显存指针 device_ptr。
+                    // 自此，vLLM 的计算 Kernel 将直接访问物理显存，完全绕过 UVM 缺页机制。
                     ptr = device_ptr;
                     placement_backend = "device_direct";
                     device_direct_backend_used = device_direct_backend.c_str();
                     policy_action_success = true;
                     policy_action_error = "none";
                     device_direct_reason = "device_direct_enabled";
+                    if (scratch_pool_budget_reserved) {
+                        scratch_pool_device_direct = true;
+                        scratch_pool_reason =
+                            scratch_pool_budget_over_budget
+                                ? "scratch_pool_trace_only_over_budget_device_direct"
+                                : "scratch_pool_device_direct_enabled";
+                        scratch_pool_device_direct_allocs.fetch_add(1);
+                        scratch_pool_device_direct_bytes.fetch_add(
+                            static_cast<size_t>(size)
+                        );
+                    }
+
+                    // 更新统计指标
                     device_direct_actual_allocs.fetch_add(1);
                     device_direct_actual_bytes.fetch_add(static_cast<size_t>(size));
                 } else {
+                    // 6.3 异常分支 A：Managed 内存释放失败
+                    // 这是一个极其罕见的异常。为了防止内存泄露，必须立刻释放刚申请的 device_ptr。
                     cudaError_t cleanup_device_err = use_async_backend
                         ? cudaFreeAsync(device_ptr, stream)
                         : cudaFree(device_ptr);
+
+                    // 释放刚才预留的预算，因为这次替换失败了。
                     if (cleanup_device_err == cudaSuccess) {
                         release_device_direct_budget(static_cast<size_t>(size));
+                        if (scratch_pool_budget_reserved) {
+                            release_scratch_pool_device_direct_budget(
+                                static_cast<size_t>(size)
+                            );
+                            scratch_pool_budget_reserved = false;
+                        }
                     }
                     policy_action_success = false;
                     policy_action_error = cudaGetErrorString(free_candidate_err);
                     device_direct_reason = "managed_candidate_free_failed";
+                    if (scratch_pool_tracked) {
+                        scratch_pool_reason =
+                            "scratch_pool_managed_candidate_free_failed";
+                    }
+
+                    // 回退（Fallback）：程序将继续使用原本的 managed 指针，虽然性能没提升但不会崩。
                     device_direct_fallback_allocs.fetch_add(1);
                 }
             } else {
+                // 6.4 异常分支 B：纯显存申请失败
+                // 如果因为显存不足等原因导致 cudaMalloc(Async) 失败：
+
+                // 释放预留预算
                 release_device_direct_budget(static_cast<size_t>(size));
+                if (scratch_pool_budget_reserved) {
+                    release_scratch_pool_device_direct_budget(
+                        static_cast<size_t>(size)
+                    );
+                    scratch_pool_budget_reserved = false;
+                }
                 policy_action_success = false;
+
+                // 记录详细的失败原因（是 Backend 报错还是池配置报错）
                 policy_action_error = pool_config_ready
                     ? cudaGetErrorString(device_alloc_err)
                     : pool_config_error_snapshot.c_str();
+
                 if (!pool_config_ready) {
                     device_direct_reason = "device_direct_pool_config_failed";
+                    if (scratch_pool_tracked) {
+                        scratch_pool_reason =
+                            "scratch_pool_device_direct_pool_config_failed";
+                    }
                 } else {
                     device_direct_reason = use_async_backend
                         ? "device_malloc_async_failed_fallback_managed"
                         : "device_malloc_failed_fallback_managed";
+                    if (scratch_pool_tracked) {
+                        scratch_pool_reason = use_async_backend
+                            ? "scratch_pool_malloc_async_failed_fallback_managed"
+                            : "scratch_pool_malloc_failed_fallback_managed";
+                    }
                 }
+
+                // 回退（Fallback）：记录回退计数。
                 device_direct_fallback_allocs.fetch_add(1);
             }
         }
@@ -2505,7 +3213,8 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         log_unknown_detail || log_gap_watch ||
         strcmp(placement_backend, "device_direct") == 0 ||
         kv_budget_tracked ||
-        weight_budget_tracked;
+        weight_budget_tracked ||
+        pool_registry_tracked;
 
     // 7.1 记录活跃分配元数据，供 free / gap watch / unknown detail 使用
     if (store_active_info) {
@@ -2541,6 +3250,14 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             weight_budget_tracked,
             weight_budget_over_budget,
             weight_budget_reason,
+            pool_registry_tracked,
+            pool_kind_to_string(pool_kind),
+            pool_object_state,
+            scratch_pool_tracked,
+            scratch_pool_eligible,
+            scratch_pool_device_direct,
+            scratch_pool_budget_over_budget,
+            scratch_pool_reason,
         };
     }
 
@@ -2548,7 +3265,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     if ((policy_action == PolicyAction::ManagedPrefetchGpu ||
          policy_action == PolicyAction::ManagedAdvisePrefetchGpu) &&
         ptr != NULL) {
-        
+
         // 8.1 内存建议 (MemAdvise)：提示 CUDA 驱动该内存的首选物理位置在 GPU 上
         // 这可以在真正发生缺页中断时，降低驱动寻找最佳页存放地的开销。
         bool should_advise =
@@ -2584,12 +3301,23 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
+    /* ============================================================================
+    * 第七阶段：Gap-Watch 策略效能统计 (Policy Effectiveness Tracking)
+    * ============================================================================ */
+
+    // 7.1 判定是否成功应用了针对性优化：
+    // 如果本次分配命中了 Gap 区间，且决策确实来源于 gap_watch_policy，
+    // 并且动作不是默认的 Managed 模式，则进入统计逻辑。
     if (gap_overlap_bytes > 0 &&
-        policy_source != nullptr &&
-        strcmp(policy_source, "gap_watch_policy") == 0 &&
-        policy_action != PolicyAction::ManagedDefault) {
+            policy_source != nullptr &&
+            strcmp(policy_source, "gap_watch_policy") == 0 &&
+            policy_action != PolicyAction::ManagedDefault) {
+
+        // 记录受该策略影响的分配次数及重叠的总字节数
         gap_watch_policy_applied_allocs.fetch_add(1);
         gap_watch_policy_applied_overlap_bytes.fetch_add(gap_overlap_bytes);
+
+        // 细分统计：策略执行是成功（例如成功替换为纯显存）还是失败（由于 OOM 或配置错误回退）
         if (policy_action_success) {
             gap_watch_policy_success_allocs.fetch_add(1);
         } else {
@@ -2597,31 +3325,93 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
+    /* ============================================================================
+    * 第八阶段：更新活跃分配元数据 (Metadata State Synchronization)
+    * ============================================================================ */
+
+    // 8.1 检查是否需要持久化本次分配的信息：
+    // store_active_info 是在函数前期判定的标志位，通常对于大内存、命中 Gap
+    // 或被标记为 KV/Weight 的分配为真。
     if (store_active_info) {
+
+        // 使用互斥锁保护全局 map (active_allocations)，确保多线程环境下元数据写入的安全。
         std::lock_guard<std::mutex> lock(log_mutex);
+
+        // 在映射表中查找刚刚分配成功的指针 (ptr)
         auto it = active_allocations.find(ptr);
         if (it != active_allocations.end()) {
+
+            // --- 核心元数据注入 ---
+
+            // 记录最终采取的策略名称（如 "ManagedPrefetchGpu" 或 "DeviceDirect"）
             it->second.policy_action_name = policy_action_to_string(policy_action);
+            // 记录决策来源（是基础启发式逻辑还是精确的 Gap-Watch 逻辑）
             it->second.policy_source_name = policy_source ? policy_source : "unknown";
+
+            // 记录策略执行的具体结果及错误信息（若有）
             it->second.policy_action_success = policy_action_success;
             it->second.policy_action_error = policy_action_error;
+
+            // --- Stage C 相关记录 ---
+
             it->second.gap_watch_target_class_name = gap_watch_target_class;
             it->second.gap_watch_policy_action_name =
                 policy_action_to_string(gap_watch_policy_action);
+
+            // 标记最终内存驻留的后端（"managed" 或 "device_direct"）
             it->second.placement_backend_name = placement_backend;
+            // 记录具体使用的 Backend API（如 "cuda_malloc_async"）
             it->second.device_direct_backend_name = device_direct_backend_used;
+
+            // 记录 Device-Direct 的准入详情，用于离线分析为何某些分配没能成功提速
             it->second.device_direct_eligible = device_direct_eligible;
             it->second.device_direct_reason = device_direct_reason;
+
+            // 记录风险等级与热点命中状态
             it->second.cpu_access_risk = cpu_access_risk;
+            it->second.hot_gap_match = hot_gap_match;
+
+            // --- Stage E 相关记录：组件预算快照 ---
+
+            // 记录 KV Cache 和模型权重（Weight）的预算追踪状态，
+            // 包括它们是否超预算以及具体的拒绝理由。
             it->second.kv_budget_tracked = kv_budget_tracked;
             it->second.kv_budget_over_budget = kv_budget_over_budget;
             it->second.kv_budget_reason = kv_budget_reason;
+
             it->second.weight_budget_tracked = weight_budget_tracked;
             it->second.weight_budget_over_budget = weight_budget_over_budget;
             it->second.weight_budget_reason = weight_budget_reason;
-            it->second.hot_gap_match = hot_gap_match;
+            it->second.pool_registry_tracked = pool_registry_tracked;
+            it->second.pool_kind_name = pool_kind_to_string(pool_kind);
+            it->second.pool_object_state = pool_object_state;
+            it->second.scratch_pool_tracked = scratch_pool_tracked;
+            it->second.scratch_pool_eligible = scratch_pool_eligible;
+            it->second.scratch_pool_device_direct = scratch_pool_device_direct;
+            it->second.scratch_pool_budget_over_budget =
+                scratch_pool_budget_over_budget;
+            it->second.scratch_pool_reason = scratch_pool_reason;
         }
     }
+
+    trace_pool_alloc_event(
+        ptr,
+        static_cast<size_t>(size),
+        alloc_count,
+        device,
+        phase_snapshot,
+        alloc_class,
+        pool_kind,
+        size_bucket,
+        placement_backend,
+        device_direct_backend_used,
+        scratch_pool_tracked,
+        scratch_pool_eligible,
+        scratch_pool_device_direct,
+        scratch_pool_budget_over_budget,
+        scratch_pool_reason,
+        pool_object_state
+    );
 
     // 记录策略引擎的判定与执行结果
     if (policy_enabled) {
@@ -2643,6 +3433,11 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             weight_budget_tracked,
             weight_budget_over_budget,
             weight_budget_reason,
+            scratch_pool_tracked,
+            scratch_pool_eligible,
+            scratch_pool_device_direct,
+            scratch_pool_budget_over_budget,
+            scratch_pool_reason,
             hot_gap_match,
             policy_action_success, policy_action_error
         );
@@ -2691,6 +3486,11 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             weight_budget_tracked,
             weight_budget_over_budget,
             weight_budget_reason,
+            scratch_pool_tracked,
+            scratch_pool_eligible,
+            scratch_pool_device_direct,
+            scratch_pool_budget_over_budget,
+            scratch_pool_reason,
             hot_gap_match
         );
     }
@@ -2708,68 +3508,124 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
 }
 
 /**
- * Free CUDA managed memory
+ * 释放 CUDA 托管内存或纯显存 (Device-Direct)
  *
- * @param ptr Pointer to memory to free
- * @param size Size of allocation (for statistics)
- * @param device CUDA device ID (unused)
- * @param stream CUDA stream (unused)
+ * @param ptr 指向待释放内存的指针
+ * @param size 分配的大小（用于统计更新）
+ * @param device CUDA 设备 ID（内部追踪使用）
+ * @param stream CUDA 流（用于异步释放）
  */
 void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
     if (ptr != NULL) {
+        // 用于存储从映射表中找出的元数据快照
         AllocationInfo info{};
         bool has_info = false;
         std::string phase_snapshot;
 
+        /* ============================================================================
+         * 第一阶段：元数据检索与状态清理 (Metadata Retrieval)
+         * ============================================================================ */
         {
+            // 使用互斥锁保护全局 active_allocations 映射表
             std::lock_guard<std::mutex> lock(log_mutex);
+
+            // 捕获当前的运行相位（如 "attention"、"prefill" 等）
             phase_snapshot = current_phase.empty() ? "unscoped" : current_phase;
+
+            // 在全局字典中查找该指针的“身世信息”
             auto it = active_allocations.find(ptr);
             if (it != active_allocations.end()) {
-                info = it->second;
+                info = it->second; // 拷贝元数据快照
                 has_info = true;
+
+                // 【关键操作】从活跃表中移除，防止重复释放或过时的统计
                 active_allocations.erase(it);
             }
         }
 
+        /* ============================================================================
+         * 第二阶段：确定释放后端 (Backend Symmetry Selection)
+         * ============================================================================ */
+
+        // 判断这块内存当初是驻留在 UVM (managed) 还是纯显存 (device_direct)
         bool is_device_direct =
             has_info && info.placement_backend_name == "device_direct";
+
+        // 判断是否需要使用异步释放。
+        // 注意：分配与释放必须对称。如果当初是用 cudaMallocAsync 分配的，现在必须用 cudaFreeAsync。
         bool use_async_backend =
             is_device_direct &&
             info.device_direct_backend_name == "cuda_malloc_async";
+
+        // 执行真实的 CUDA 释放操作
         cudaError_t err = use_async_backend
             ? cudaFreeAsync(ptr, stream)
             : cudaFree(ptr);
+
         if (err != cudaSuccess) {
             fprintf(stderr, "[vLLM UVM] %s failed: %s\n",
                     use_async_backend ? "cudaFreeAsync" : "cudaFree",
                     cudaGetErrorString(err));
         }
 
-        // Update statistics
+        /* ============================================================================
+         * 第三阶段：全局统计与预算回收 (Budget Reconciliation)
+         * ============================================================================ */
+
+        // 3.1 更新全局水位线：原子减去当前释放的大小
         size_t current = total_allocated.fetch_sub(size) - size;
+        // 增加释放次数统计
         size_t free_count = num_frees.fetch_add(1) + 1;
 
+        // 3.2 Stage C1 预算回收：
+        // 如果是直连显存，释放后必须归还之前在 reserve_device_direct_budget 中扣除的额度
         if (has_info &&
             info.placement_backend_name == "device_direct" &&
             err == cudaSuccess) {
             release_device_direct_budget(info.size);
             device_direct_free_success_allocs.fetch_add(1);
+            if (info.scratch_pool_device_direct) {
+                release_scratch_pool_device_direct_budget(info.size);
+                scratch_pool_device_direct_free_success_allocs.fetch_add(1);
+            }
         }
+
+        // 3.3 KV Cache 预算回收：
+        // 归还 KV Cache 专用的显存额度，确保下一轮 Prefill 有足够的空间
         if (has_info && info.kv_budget_tracked && err == cudaSuccess) {
             release_kv_budget(info.size);
             kv_free_success_allocs.fetch_add(1);
         }
+
+        // 3.4 模型权重预算回收 (Stage E)：
+        // 如果释放的是模型权重（常见于多模型切换或专家卸载场景），归还权重预算
         if (has_info && info.weight_budget_tracked && err == cudaSuccess) {
             release_weight_budget(info.size);
             weight_free_success_allocs.fetch_add(1);
         }
 
-        // Log large frees (> 100MB) to file
+        // 3.5 Stage F pool registry 回收：
+        // 只更新 telemetry，不触发任何驱逐、迁移或预取动作。
+        if (has_info && info.pool_registry_tracked && err == cudaSuccess) {
+            release_pool_registry_allocation(
+                pool_kind_from_string(info.pool_kind_name),
+                info.size
+            );
+            info.pool_object_state = "freed";
+        }
+
+        /* ============================================================================
+         * 第四阶段：遥测与追踪记录 (Telemetry & Trace)
+         * ============================================================================ */
+
+        // 4.1 大块内存审计：
+        // 对于超过 100MB 的内存释放进行专项文件记录，用于分析显存剧烈波动的诱因
         if (size > 100 * 1024 * 1024) {
             log_free(size, free_count, current, device);
         }
 
+        // 4.2 结构化事件追踪：
+        // 将释放事件记录到 trace log 中。这些日志后续会被分析脚本用来计算“内存生命周期”。
         if (static_cast<size_t>(size) >= trace_min_bytes || has_info) {
             trace_free_event(
                 ptr,
@@ -2781,6 +3637,10 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
                 phase_snapshot
             );
         }
+
+        // 4.3 专项分析事件：
+        // 记录关于“未知内存详情”和“Gap 监控”的释放事件，
+        // 帮助开发者确认之前应用的 Gap 策略是否在释放时能够完美闭环。
         if (has_info) {
             trace_unknown_detail_free_event(
                 ptr,
@@ -2796,6 +3656,14 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
                 static_cast<size_t>(size),
                 free_count,
                 current,
+                device,
+                &info,
+                phase_snapshot
+            );
+            trace_pool_free_event(
+                ptr,
+                static_cast<size_t>(size),
+                free_count,
                 device,
                 &info,
                 phase_snapshot
@@ -2899,6 +3767,34 @@ void uvm_reset_all_stats(void) {
     weight_budget_over_allocs.store(0);
     weight_budget_reject_allocs.store(0);
     weight_free_success_allocs.store(0);
+    pool_registry_tracked_allocs.store(0);
+    pool_registry_free_success_allocs.store(0);
+    pool_registry_live_objects.store(0);
+    pool_registry_peak_live_objects.store(0);
+    pool_kv_allocs.store(0);
+    pool_kv_requested_bytes.store(0);
+    pool_kv_live_bytes.store(0);
+    pool_kv_peak_live_bytes.store(0);
+    pool_kv_free_success_allocs.store(0);
+    pool_weight_allocs.store(0);
+    pool_weight_requested_bytes.store(0);
+    pool_weight_live_bytes.store(0);
+    pool_weight_peak_live_bytes.store(0);
+    pool_weight_free_success_allocs.store(0);
+    pool_runtime_scratch_allocs.store(0);
+    pool_runtime_scratch_requested_bytes.store(0);
+    pool_runtime_scratch_live_bytes.store(0);
+    pool_runtime_scratch_peak_live_bytes.store(0);
+    pool_runtime_scratch_free_success_allocs.store(0);
+    scratch_pool_trace_allocs.store(0);
+    scratch_pool_eligible_allocs.store(0);
+    scratch_pool_device_direct_allocs.store(0);
+    scratch_pool_device_direct_bytes.store(0);
+    scratch_pool_device_direct_live_bytes.store(0);
+    scratch_pool_device_direct_peak_live_bytes.store(0);
+    scratch_pool_budget_over_allocs.store(0);
+    scratch_pool_budget_reject_allocs.store(0);
+    scratch_pool_device_direct_free_success_allocs.store(0);
 }
 
 /**
@@ -2989,6 +3885,72 @@ void uvm_close_log(void) {
     fprintf(log_file, "  Weight budget over allocations: %zu\n", weight_budget_over_allocs.load());
     fprintf(log_file, "  Weight budget reject allocations: %zu\n", weight_budget_reject_allocs.load());
     fprintf(log_file, "  Weight free success: %zu\n", weight_free_success_allocs.load());
+    fprintf(log_file, "  Pool registry enabled: %d\n", pool_registry_enabled);
+    fprintf(log_file, "  Pool registry tracked allocations: %zu\n",
+            pool_registry_tracked_allocs.load());
+    fprintf(log_file, "  Pool registry free success: %zu\n",
+            pool_registry_free_success_allocs.load());
+    fprintf(log_file, "  Pool registry live objects: %zu\n",
+            pool_registry_live_objects.load());
+    fprintf(log_file, "  Pool registry peak live objects: %zu\n",
+            pool_registry_peak_live_objects.load());
+    fprintf(log_file, "  Pool kv allocations: %zu\n", pool_kv_allocs.load());
+    fprintf(log_file, "  Pool kv requested bytes: %zu\n",
+            pool_kv_requested_bytes.load());
+    fprintf(log_file, "  Pool kv live bytes: %zu\n", pool_kv_live_bytes.load());
+    fprintf(log_file, "  Pool kv peak live bytes: %zu\n",
+            pool_kv_peak_live_bytes.load());
+    fprintf(log_file, "  Pool kv free success: %zu\n",
+            pool_kv_free_success_allocs.load());
+    fprintf(log_file, "  Pool weight allocations: %zu\n",
+            pool_weight_allocs.load());
+    fprintf(log_file, "  Pool weight requested bytes: %zu\n",
+            pool_weight_requested_bytes.load());
+    fprintf(log_file, "  Pool weight live bytes: %zu\n",
+            pool_weight_live_bytes.load());
+    fprintf(log_file, "  Pool weight peak live bytes: %zu\n",
+            pool_weight_peak_live_bytes.load());
+    fprintf(log_file, "  Pool weight free success: %zu\n",
+            pool_weight_free_success_allocs.load());
+    fprintf(log_file, "  Pool runtime scratch allocations: %zu\n",
+            pool_runtime_scratch_allocs.load());
+    fprintf(log_file, "  Pool runtime scratch requested bytes: %zu\n",
+            pool_runtime_scratch_requested_bytes.load());
+    fprintf(log_file, "  Pool runtime scratch live bytes: %zu\n",
+            pool_runtime_scratch_live_bytes.load());
+    fprintf(log_file, "  Pool runtime scratch peak live bytes: %zu\n",
+            pool_runtime_scratch_peak_live_bytes.load());
+    fprintf(log_file, "  Pool runtime scratch free success: %zu\n",
+            pool_runtime_scratch_free_success_allocs.load());
+    fprintf(log_file, "  Scratch pool enabled: %d\n", scratch_pool_enable);
+    fprintf(log_file, "  Scratch pool budget bytes: %zu\n",
+            scratch_pool_budget_bytes);
+    fprintf(log_file, "  Scratch pool mode: %s\n",
+            scratch_pool_mode.c_str());
+    fprintf(log_file, "  Scratch pool target phases: %s\n",
+            scratch_pool_target_phases.c_str());
+    fprintf(log_file, "  Scratch pool trace allocations: %zu\n",
+            scratch_pool_trace_allocs.load());
+    fprintf(log_file, "  Scratch pool eligible allocations: %zu\n",
+            scratch_pool_eligible_allocs.load());
+    fprintf(log_file, "  Scratch pool device-direct allocations: %zu\n",
+            scratch_pool_device_direct_allocs.load());
+    fprintf(log_file, "  Scratch pool device-direct bytes: %zu\n",
+            scratch_pool_device_direct_bytes.load());
+    fprintf(log_file, "  Scratch pool device-direct live bytes: %zu\n",
+            scratch_pool_device_direct_live_bytes.load());
+    fprintf(log_file, "  Scratch pool device-direct peak live bytes: %zu\n",
+            scratch_pool_device_direct_peak_live_bytes.load());
+    fprintf(log_file, "  Scratch pool budget remaining: %zu\n",
+            scratch_pool_budget_remaining_snapshot(
+                scratch_pool_device_direct_live_bytes.load()
+            ));
+    fprintf(log_file, "  Scratch pool budget over allocations: %zu\n",
+            scratch_pool_budget_over_allocs.load());
+    fprintf(log_file, "  Scratch pool budget reject allocations: %zu\n",
+            scratch_pool_budget_reject_allocs.load());
+    fprintf(log_file, "  Scratch pool device-direct free success: %zu\n",
+            scratch_pool_device_direct_free_success_allocs.load());
     fprintf(log_file, "========================================\n\n");
 
     fflush(log_file);

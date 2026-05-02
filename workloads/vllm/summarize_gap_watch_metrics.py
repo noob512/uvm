@@ -139,6 +139,62 @@ def main() -> int:
     weight_live_bytes_values: list[int] = []
     weight_budget_remaining_values: list[int] = []
     weight_budget_mode_values: list[str] = []
+    pool_alloc_records = 0
+    pool_registry_enabled_values: list[int] = []
+    pool_free_records = 0
+    pool_kind_counter: Counter[str] = Counter()
+    pool_class_counter: Counter[str] = Counter()
+    pool_phase_counter: Counter[str] = Counter()
+    pool_placement_counter: Counter[str] = Counter()
+    pool_alloc_bytes_counter: Counter[str] = Counter()
+    pool_free_bytes_counter: Counter[str] = Counter()
+    pool_live_object_values: list[int] = []
+    pool_peak_live_object_values: list[int] = []
+    pool_kv_live_values: list[int] = []
+    pool_weight_live_values: list[int] = []
+    pool_runtime_scratch_live_values: list[int] = []
+    scratch_pool_reason_counter: Counter[str] = Counter()
+    scratch_pool_tracked_records = 0
+    scratch_pool_eligible_records = 0
+    scratch_pool_device_direct_records = 0
+    scratch_pool_over_budget_records = 0
+    scratch_pool_enabled_values: list[int] = []
+    scratch_pool_budget_bytes_values: list[int] = []
+    scratch_pool_live_values: list[int] = []
+    scratch_pool_budget_remaining_values: list[int] = []
+    scratch_pool_mode_values: list[str] = []
+
+    def record_scratch_pool_fields(kv_fields: dict[str, str]) -> None:
+        nonlocal scratch_pool_tracked_records
+        nonlocal scratch_pool_eligible_records
+        nonlocal scratch_pool_device_direct_records
+        nonlocal scratch_pool_over_budget_records
+        if kv_fields.get("scratch_pool_tracked") != "1":
+            return
+        scratch_pool_tracked_records += 1
+        if kv_fields.get("scratch_pool_eligible") == "1":
+            scratch_pool_eligible_records += 1
+        if kv_fields.get("scratch_pool_device_direct") == "1":
+            scratch_pool_device_direct_records += 1
+        if kv_fields.get("scratch_pool_over_budget") == "1":
+            scratch_pool_over_budget_records += 1
+        scratch_pool_reason_counter[
+            kv_fields.get("scratch_pool_reason", "not_recorded")
+        ] += 1
+        if "scratch_pool_enable" in kv_fields:
+            scratch_pool_enabled_values.append(int(kv_fields["scratch_pool_enable"]))
+        if "scratch_pool_budget_bytes" in kv_fields:
+            scratch_pool_budget_bytes_values.append(
+                int(kv_fields["scratch_pool_budget_bytes"])
+            )
+        if "scratch_pool_live_bytes" in kv_fields:
+            scratch_pool_live_values.append(int(kv_fields["scratch_pool_live_bytes"]))
+        if "scratch_pool_budget_remaining" in kv_fields:
+            scratch_pool_budget_remaining_values.append(
+                int(kv_fields["scratch_pool_budget_remaining"])
+            )
+        if "scratch_pool_mode" in kv_fields:
+            scratch_pool_mode_values.append(kv_fields["scratch_pool_mode"])
 
     def record_kv_budget_fields(kv_fields: dict[str, str]) -> None:
         nonlocal kv_budget_tracked_records, kv_budget_over_records
@@ -196,6 +252,7 @@ def main() -> int:
                 kv_fields = parse_kv_fields(line)
                 record_kv_budget_fields(kv_fields)
                 record_weight_budget_fields(kv_fields)
+                record_scratch_pool_fields(kv_fields)
                 policy_records += 1
                 continue
 
@@ -203,6 +260,7 @@ def main() -> int:
             if gap_alloc_match is not None:
                 kv_fields = parse_kv_fields(line)
                 record_weight_budget_fields(kv_fields)
+                record_scratch_pool_fields(kv_fields)
                 gap_overlap_records += 1
                 overlap_bytes = int(gap_alloc_match.group("overlap_bytes"))
                 gap_overlap_bytes += overlap_bytes
@@ -279,6 +337,68 @@ def main() -> int:
                 lifetime_s = float(gap_free_match.group("lifetime_s"))
                 if lifetime_s >= 0:
                     lifetime_values.append(lifetime_s)
+
+            if "TRACE_POOL_ALLOC" in line:
+                kv_fields = parse_kv_fields(line)
+                pool_kind = kv_fields.get("pool_kind", "unknown")
+                pool_alloc_records += 1
+                pool_kind_counter[pool_kind] += 1
+                pool_class_counter[kv_fields.get("predicted_class", "unknown")] += 1
+                pool_phase_counter[kv_fields.get("phase", "unknown")] += 1
+                pool_placement_counter[
+                    kv_fields.get("placement_backend", "unknown")
+                ] += 1
+                if "pool_registry_enabled" in kv_fields:
+                    pool_registry_enabled_values.append(
+                        int(kv_fields["pool_registry_enabled"])
+                    )
+                if "size_bytes" in kv_fields:
+                    pool_alloc_bytes_counter[pool_kind] += int(kv_fields["size_bytes"])
+                if "pool_registry_live_objects" in kv_fields:
+                    pool_live_object_values.append(
+                        int(kv_fields["pool_registry_live_objects"])
+                    )
+                if "pool_registry_peak_live_objects" in kv_fields:
+                    pool_peak_live_object_values.append(
+                        int(kv_fields["pool_registry_peak_live_objects"])
+                    )
+                if "pool_kv_live_bytes" in kv_fields:
+                    pool_kv_live_values.append(int(kv_fields["pool_kv_live_bytes"]))
+                if "pool_weight_live_bytes" in kv_fields:
+                    pool_weight_live_values.append(
+                        int(kv_fields["pool_weight_live_bytes"])
+                    )
+                if "pool_runtime_scratch_live_bytes" in kv_fields:
+                    pool_runtime_scratch_live_values.append(
+                        int(kv_fields["pool_runtime_scratch_live_bytes"])
+                    )
+                continue
+
+            if "TRACE_POOL_FREE" in line:
+                kv_fields = parse_kv_fields(line)
+                pool_kind = kv_fields.get("pool_kind", "unknown")
+                pool_free_records += 1
+                if "size_bytes" in kv_fields:
+                    pool_free_bytes_counter[pool_kind] += int(kv_fields["size_bytes"])
+                if "pool_registry_live_objects" in kv_fields:
+                    pool_live_object_values.append(
+                        int(kv_fields["pool_registry_live_objects"])
+                    )
+                if "pool_registry_peak_live_objects" in kv_fields:
+                    pool_peak_live_object_values.append(
+                        int(kv_fields["pool_registry_peak_live_objects"])
+                    )
+                if "pool_kv_live_bytes" in kv_fields:
+                    pool_kv_live_values.append(int(kv_fields["pool_kv_live_bytes"]))
+                if "pool_weight_live_bytes" in kv_fields:
+                    pool_weight_live_values.append(
+                        int(kv_fields["pool_weight_live_bytes"])
+                    )
+                if "pool_runtime_scratch_live_bytes" in kv_fields:
+                    pool_runtime_scratch_live_values.append(
+                        int(kv_fields["pool_runtime_scratch_live_bytes"])
+                    )
+                continue
 
     summary = {
         "allocator_log": str(allocator_log),
@@ -442,6 +562,167 @@ def main() -> int:
             else optional_int(session_summary.get("Weight budget reject allocations"))
         ),
         "weight_budget_reason_counts": dict(weight_budget_reason_counter),
+        "pool_registry_enabled": optional_bool_from_int(
+            pool_registry_enabled_values[-1]
+            if pool_registry_enabled_values
+            else session_summary.get("Pool registry enabled")
+        ),
+        "pool_registry_alloc_records": (
+            pool_alloc_records
+            if pool_alloc_records
+            else optional_int(session_summary.get("Pool registry tracked allocations"))
+        ),
+        "pool_registry_free_records": (
+            pool_free_records
+            if pool_free_records
+            else optional_int(session_summary.get("Pool registry free success"))
+        ),
+        "pool_registry_live_objects": (
+            pool_live_object_values[-1]
+            if pool_live_object_values
+            else optional_int(session_summary.get("Pool registry live objects"))
+        ),
+        "pool_registry_peak_live_objects": (
+            max(pool_peak_live_object_values)
+            if pool_peak_live_object_values
+            else optional_int(session_summary.get("Pool registry peak live objects"))
+        ),
+        "pool_kind_counts": dict(pool_kind_counter),
+        "pool_class_counts": dict(pool_class_counter),
+        "pool_phase_counts": dict(pool_phase_counter),
+        "pool_placement_backend_counts": dict(pool_placement_counter),
+        "pool_alloc_bytes_by_kind": dict(pool_alloc_bytes_counter),
+        "pool_free_bytes_by_kind": dict(pool_free_bytes_counter),
+        "pool_kv_allocations": optional_int(
+            session_summary.get("Pool kv allocations")
+        ),
+        "pool_kv_requested_bytes": optional_int(
+            session_summary.get("Pool kv requested bytes")
+        ),
+        "pool_kv_live_bytes": (
+            pool_kv_live_values[-1]
+            if pool_kv_live_values
+            else optional_int(session_summary.get("Pool kv live bytes"))
+        ),
+        "pool_kv_peak_live_bytes": (
+            max(pool_kv_live_values)
+            if pool_kv_live_values
+            else optional_int(session_summary.get("Pool kv peak live bytes"))
+        ),
+        "pool_kv_free_success": optional_int(
+            session_summary.get("Pool kv free success")
+        ),
+        "pool_weight_allocations": optional_int(
+            session_summary.get("Pool weight allocations")
+        ),
+        "pool_weight_requested_bytes": optional_int(
+            session_summary.get("Pool weight requested bytes")
+        ),
+        "pool_weight_live_bytes": (
+            pool_weight_live_values[-1]
+            if pool_weight_live_values
+            else optional_int(session_summary.get("Pool weight live bytes"))
+        ),
+        "pool_weight_peak_live_bytes": (
+            max(pool_weight_live_values)
+            if pool_weight_live_values
+            else optional_int(session_summary.get("Pool weight peak live bytes"))
+        ),
+        "pool_weight_free_success": optional_int(
+            session_summary.get("Pool weight free success")
+        ),
+        "pool_runtime_scratch_allocations": optional_int(
+            session_summary.get("Pool runtime scratch allocations")
+        ),
+        "pool_runtime_scratch_requested_bytes": optional_int(
+            session_summary.get("Pool runtime scratch requested bytes")
+        ),
+        "pool_runtime_scratch_live_bytes": (
+            pool_runtime_scratch_live_values[-1]
+            if pool_runtime_scratch_live_values
+            else optional_int(session_summary.get("Pool runtime scratch live bytes"))
+        ),
+        "pool_runtime_scratch_peak_live_bytes": (
+            max(pool_runtime_scratch_live_values)
+            if pool_runtime_scratch_live_values
+            else optional_int(
+                session_summary.get("Pool runtime scratch peak live bytes")
+            )
+        ),
+        "pool_runtime_scratch_free_success": optional_int(
+            session_summary.get("Pool runtime scratch free success")
+        ),
+        "scratch_pool_enabled": (
+            optional_bool_from_int(scratch_pool_enabled_values[-1])
+            if scratch_pool_enabled_values
+            else optional_bool_from_int(session_summary.get("Scratch pool enabled"))
+        ),
+        "scratch_pool_budget_bytes": (
+            scratch_pool_budget_bytes_values[-1]
+            if scratch_pool_budget_bytes_values
+            else optional_int(session_summary.get("Scratch pool budget bytes"))
+        ),
+        "scratch_pool_mode": (
+            scratch_pool_mode_values[-1]
+            if scratch_pool_mode_values
+            else session_summary.get("Scratch pool mode")
+        ),
+        "scratch_pool_trace_records": (
+            scratch_pool_tracked_records
+            if scratch_pool_tracked_records
+            else optional_int(session_summary.get("Scratch pool trace allocations"))
+        ),
+        "scratch_pool_eligible_records": (
+            scratch_pool_eligible_records
+            if scratch_pool_tracked_records
+            else optional_int(session_summary.get("Scratch pool eligible allocations"))
+        ),
+        "scratch_pool_device_direct_records": (
+            scratch_pool_device_direct_records
+            if scratch_pool_tracked_records
+            else optional_int(
+                session_summary.get("Scratch pool device-direct allocations")
+            )
+        ),
+        "scratch_pool_device_direct_bytes": optional_int(
+            session_summary.get("Scratch pool device-direct bytes")
+        ),
+        "scratch_pool_live_bytes": (
+            scratch_pool_live_values[-1]
+            if scratch_pool_live_values
+            else optional_int(
+                session_summary.get("Scratch pool device-direct live bytes")
+            )
+        ),
+        "scratch_pool_peak_live_bytes": (
+            max(scratch_pool_live_values)
+            if scratch_pool_live_values
+            else optional_int(
+                session_summary.get("Scratch pool device-direct peak live bytes")
+            )
+        ),
+        "scratch_pool_min_budget_remaining_observed": (
+            min(scratch_pool_budget_remaining_values)
+            if scratch_pool_budget_remaining_values
+            else optional_int(session_summary.get("Scratch pool budget remaining"))
+        ),
+        "scratch_pool_budget_over_records": (
+            scratch_pool_over_budget_records
+            if scratch_pool_tracked_records
+            else optional_int(
+                session_summary.get("Scratch pool budget over allocations")
+            )
+        ),
+        "scratch_pool_budget_reject_records": (
+            scratch_pool_reason_counter.get(
+                "scratch_pool_budget_exceeded_fallback_managed", 0
+            )
+            if scratch_pool_tracked_records
+            else optional_int(
+                session_summary.get("Scratch pool budget reject allocations")
+            )
+        ),
+        "scratch_pool_reason_counts": dict(scratch_pool_reason_counter),
         "hot_gap_match_records": hot_gap_match_records,
         "median_lifetime_s": (
             sorted(lifetime_values)[len(lifetime_values) // 2]
@@ -527,6 +808,27 @@ def main() -> int:
     print(f"- weight_budget_over_records={summary['weight_budget_over_records']}")
     print(f"- weight_budget_reject_records={summary['weight_budget_reject_records']}")
     print(f"- weight_budget_reason_counts={summary['weight_budget_reason_counts']}")
+    print(f"- pool_registry_enabled={summary['pool_registry_enabled']}")
+    print(f"- pool_registry_alloc_records={summary['pool_registry_alloc_records']}")
+    print(f"- pool_registry_free_records={summary['pool_registry_free_records']}")
+    print(f"- pool_registry_live_objects={summary['pool_registry_live_objects']}")
+    print(f"- pool_registry_peak_live_objects={summary['pool_registry_peak_live_objects']}")
+    print(f"- pool_kind_counts={summary['pool_kind_counts']}")
+    print(f"- pool_alloc_bytes_by_kind={summary['pool_alloc_bytes_by_kind']}")
+    print(f"- pool_kv_live_bytes={summary['pool_kv_live_bytes']}")
+    print(f"- pool_weight_live_bytes={summary['pool_weight_live_bytes']}")
+    print(f"- pool_runtime_scratch_live_bytes={summary['pool_runtime_scratch_live_bytes']}")
+    print(f"- scratch_pool_enabled={summary['scratch_pool_enabled']}")
+    print(f"- scratch_pool_budget_bytes={summary['scratch_pool_budget_bytes']}")
+    print(f"- scratch_pool_mode={summary['scratch_pool_mode']}")
+    print(f"- scratch_pool_trace_records={summary['scratch_pool_trace_records']}")
+    print(f"- scratch_pool_eligible_records={summary['scratch_pool_eligible_records']}")
+    print(f"- scratch_pool_device_direct_records={summary['scratch_pool_device_direct_records']}")
+    print(f"- scratch_pool_live_bytes={summary['scratch_pool_live_bytes']}")
+    print(f"- scratch_pool_peak_live_bytes={summary['scratch_pool_peak_live_bytes']}")
+    print(f"- scratch_pool_budget_over_records={summary['scratch_pool_budget_over_records']}")
+    print(f"- scratch_pool_budget_reject_records={summary['scratch_pool_budget_reject_records']}")
+    print(f"- scratch_pool_reason_counts={summary['scratch_pool_reason_counts']}")
     print(f"- hot_gap_match_records={hot_gap_match_records}")
     print(f"- median_lifetime_s={summary['median_lifetime_s']}")
     return 0
