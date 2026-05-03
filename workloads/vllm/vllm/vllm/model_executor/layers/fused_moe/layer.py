@@ -19,9 +19,12 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.device_allocator.uvm import (
+    advise_range_preferred_location,
+    prefetch_range_to_cpu,
     prefetch_range_to_device,
     uvm_enabled_allocation_phase,
 )
+from vllm.device_allocator.uvm_pool_coordinator import request_uvm_pool_action
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -119,6 +122,36 @@ def _env_int(env_name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid integer for %s=%s; using %s", env_name, env_value, default)
         return default
+
+
+def _parse_plan_expert_keys(path: str, plan_key: str) -> set[tuple[int, int]]:
+    if not path:
+        return set()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            plan = json.load(handle)
+    except OSError:
+        logger.warning("Failed to read Stage I plan file: %s", path, exc_info=True)
+        return set()
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse Stage I plan file: %s", path, exc_info=True)
+        return set()
+
+    records = plan.get(plan_key)
+    if not isinstance(records, list):
+        return set()
+
+    keys: set[tuple[int, int]] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        try:
+            layer_id = int(record["layer_id"])
+            expert_id = int(record["expert_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        keys.add((layer_id, expert_id))
+    return keys
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -644,6 +677,63 @@ class FusedMoE(CustomOp):
         self.uvm_weight_prefetch_device = _env_int(
             "VLLM_UVM_WEIGHT_PREFETCH_DEVICE",
             default=-1,
+        )
+        self.uvm_weight_prefetch_plan_file = os.environ.get(
+            "VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE",
+            "",
+        )
+        self.uvm_weight_prefetch_require_plan = _env_flag_enabled(
+            "VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN",
+            default=False,
+        )
+        self.uvm_weight_prefetch_plan_keys = _parse_plan_expert_keys(
+            self.uvm_weight_prefetch_plan_file,
+            "prefetch_plan",
+        )
+        self.uvm_weight_offload_enable = _env_flag_enabled(
+            "VLLM_UVM_WEIGHT_OFFLOAD_ENABLE",
+            default=False,
+        )
+        self.uvm_weight_offload_mode = os.environ.get(
+            "VLLM_UVM_WEIGHT_OFFLOAD_MODE",
+            "trace_only",
+        )
+        if self.uvm_weight_offload_mode not in ("trace_only", "advise_cpu", "prefetch_cpu"):
+            logger.warning(
+                "Unknown VLLM_UVM_WEIGHT_OFFLOAD_MODE=%s; using trace_only",
+                self.uvm_weight_offload_mode,
+            )
+            self.uvm_weight_offload_mode = "trace_only"
+        self.uvm_weight_offload_plan_file = os.environ.get(
+            "VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE",
+            self.uvm_weight_prefetch_plan_file,
+        )
+        self.uvm_weight_offload_max_bytes_per_step = _env_int(
+            "VLLM_UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP",
+            default=64 * 1024 * 1024,
+        )
+        self.uvm_weight_offload_max_experts_per_layer = _env_int(
+            "VLLM_UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER",
+            default=1,
+        )
+        self.uvm_weight_offload_target_roles = {
+            role.strip()
+            for role in os.environ.get(
+                "VLLM_UVM_WEIGHT_OFFLOAD_TARGET_ROLES",
+                ",".join(sorted(self.uvm_weight_prefetch_target_roles)),
+            ).split(",")
+            if role.strip()
+        }
+        self.uvm_weight_offload_plan_keys = _parse_plan_expert_keys(
+            self.uvm_weight_offload_plan_file,
+            "offload_plan",
+        )
+        self._uvm_weight_offload_completed_keys: set[tuple[int, int]] = set()
+        self._uvm_weight_prefetch_plan_loaded = bool(
+            self.uvm_weight_prefetch_plan_keys
+        )
+        self._uvm_weight_offload_plan_loaded = bool(
+            self.uvm_weight_offload_plan_keys
         )
 
         self.quant_config = quant_config
@@ -1721,6 +1811,7 @@ class FusedMoE(CustomOp):
             router_logits=router_logits,
         )
         self._maybe_prefetch_uvm_expert_weights(topk_ids)
+        self._maybe_offload_uvm_cold_expert_weights(topk_ids)
         return topk_weights, topk_ids, zero_expert_result
 
     def _log_uvm_moe_routing_trace(
@@ -1771,35 +1862,98 @@ class FusedMoE(CustomOp):
         except Exception:
             logger.debug("Failed to write UVM MoE routing trace", exc_info=True)
 
-    def _uvm_active_local_experts(self, topk_ids: torch.Tensor) -> list[int]:
+    def _uvm_layer_id(self) -> int | None:
+        parts = self.layer_name.split(".")
+        for index, part in enumerate(parts[:-1]):
+            if part in ("layers", "layer"):
+                try:
+                    return int(parts[index + 1])
+                except ValueError:
+                    return None
+        return None
+
+    def _uvm_global_to_local_expert(self, global_expert_id: int) -> int:
+        if self.expert_map is None:
+            return global_expert_id
+        if 0 <= global_expert_id < int(self.expert_map.numel()):
+            return int(self.expert_map[global_expert_id].item())
+        return -1
+
+    def _uvm_active_expert_pairs(
+        self,
+        topk_ids: torch.Tensor,
+    ) -> list[tuple[int, int]]:
         ids = topk_ids.detach()
         valid_ids = ids[ids >= 0].to(dtype=torch.long)
         if valid_ids.numel() == 0:
             return []
         unique_ids = torch.unique(valid_ids).cpu().tolist()
-        local_experts: list[int] = []
+        expert_pairs: list[tuple[int, int]] = []
         for expert_id in unique_ids:
             global_expert_id = int(expert_id)
-            if self.expert_map is None:
-                local_expert_id = global_expert_id
-            elif 0 <= global_expert_id < int(self.expert_map.numel()):
-                local_expert_id = int(self.expert_map[global_expert_id].item())
-            else:
-                local_expert_id = -1
+            local_expert_id = self._uvm_global_to_local_expert(global_expert_id)
             if 0 <= local_expert_id < int(self.local_num_experts):
-                local_experts.append(local_expert_id)
-        return sorted(set(local_experts))
+                expert_pairs.append((global_expert_id, local_expert_id))
+        return sorted(set(expert_pairs))
+
+    def _uvm_active_local_experts(self, topk_ids: torch.Tensor) -> list[int]:
+        return sorted(
+            {
+                local_expert_id
+                for _, local_expert_id in self._uvm_active_expert_pairs(topk_ids)
+            }
+        )
+
+    def _uvm_plan_local_experts(
+        self,
+        plan_keys: set[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        layer_id = self._uvm_layer_id()
+        if layer_id is None:
+            return []
+        expert_pairs: list[tuple[int, int]] = []
+        for plan_layer_id, global_expert_id in sorted(plan_keys):
+            if plan_layer_id != layer_id:
+                continue
+            local_expert_id = self._uvm_global_to_local_expert(global_expert_id)
+            if 0 <= local_expert_id < int(self.local_num_experts):
+                expert_pairs.append((global_expert_id, local_expert_id))
+        return sorted(set(expert_pairs))
+
+    def _refresh_uvm_weight_action_plans(self) -> None:
+        if (
+            not self._uvm_weight_prefetch_plan_loaded
+            and self.uvm_weight_prefetch_plan_file
+            and os.path.isfile(self.uvm_weight_prefetch_plan_file)
+        ):
+            self.uvm_weight_prefetch_plan_keys = _parse_plan_expert_keys(
+                self.uvm_weight_prefetch_plan_file,
+                "prefetch_plan",
+            )
+            self._uvm_weight_prefetch_plan_loaded = True
+        if (
+            not self._uvm_weight_offload_plan_loaded
+            and self.uvm_weight_offload_plan_file
+            and os.path.isfile(self.uvm_weight_offload_plan_file)
+        ):
+            self.uvm_weight_offload_plan_keys = _parse_plan_expert_keys(
+                self.uvm_weight_offload_plan_file,
+                "offload_plan",
+            )
+            self._uvm_weight_offload_plan_loaded = True
 
     def _uvm_expert_weight_slices(
         self,
         local_expert_id: int,
+        target_roles: set[str] | None = None,
     ) -> list[tuple[str, int, int]]:
         slices: list[tuple[str, int, int]] = []
+        roles = target_roles or self.uvm_weight_prefetch_target_roles
         for attr_name, role in (
             ("w13_weight", "moe_gate_up"),
             ("w2_weight", "moe_down"),
         ):
-            if role not in self.uvm_weight_prefetch_target_roles:
+            if role not in roles:
                 continue
             tensor = getattr(self, attr_name, None)
             if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
@@ -1827,9 +1981,21 @@ class FusedMoE(CustomOp):
         if not self.uvm_weight_prefetch_enabled:
             return
         try:
-            local_experts = self._uvm_active_local_experts(topk_ids)
+            self._refresh_uvm_weight_action_plans()
+            layer_id = self._uvm_layer_id()
+            expert_pairs = self._uvm_active_expert_pairs(topk_ids)
+            if self.uvm_weight_prefetch_plan_keys:
+                expert_pairs = [
+                    (global_expert_id, local_expert_id)
+                    for global_expert_id, local_expert_id in expert_pairs
+                    if layer_id is not None
+                    and (layer_id, global_expert_id)
+                    in self.uvm_weight_prefetch_plan_keys
+                ]
+            elif self.uvm_weight_prefetch_require_plan:
+                expert_pairs = []
             if self.uvm_weight_prefetch_max_experts_per_layer > 0:
-                local_experts = local_experts[
+                expert_pairs = expert_pairs[
                     : self.uvm_weight_prefetch_max_experts_per_layer
                 ]
 
@@ -1843,9 +2009,10 @@ class FusedMoE(CustomOp):
                 else self.uvm_weight_prefetch_device
             )
 
-            for local_expert_id in local_experts:
+            for global_expert_id, local_expert_id in expert_pairs:
                 for role, ptr, size_bytes in self._uvm_expert_weight_slices(
-                    local_expert_id
+                    local_expert_id,
+                    self.uvm_weight_prefetch_target_roles,
                 ):
                     attempted_bytes += size_bytes
                     if (
@@ -1863,6 +2030,7 @@ class FusedMoE(CustomOp):
                                 "mode": self.uvm_weight_prefetch_mode,
                                 "action": "budget_reject",
                                 "role": role,
+                                "global_expert_id": global_expert_id,
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
                                 "bytes": size_bytes,
@@ -1876,6 +2044,41 @@ class FusedMoE(CustomOp):
 
                     action = "trace_prefetch_candidate"
                     success = False
+                    coordinator_decision = request_uvm_pool_action(
+                        pool="weights",
+                        action="expert_prefetch_gpu",
+                        requested_bytes=size_bytes,
+                        scope_key=f"moe_step:{os.getpid()}:{self._uvm_moe_trace_step}",
+                        metadata={
+                            "stage": "stage_i",
+                            "layer_name": self.layer_name,
+                            "role": role,
+                            "global_expert_id": global_expert_id,
+                            "local_expert_id": local_expert_id,
+                            "mode": self.uvm_weight_prefetch_mode,
+                        },
+                    )
+                    if not coordinator_decision.allowed:
+                        rejected_records += 1
+                        self._append_uvm_weight_prefetch_trace(
+                            {
+                                "timestamp": time.time(),
+                                "pid": os.getpid(),
+                                "layer_name": self.layer_name,
+                                "step": self._uvm_moe_trace_step,
+                                "mode": self.uvm_weight_prefetch_mode,
+                                "action": "coordinator_reject",
+                                "role": role,
+                                "global_expert_id": global_expert_id,
+                                "local_expert_id": local_expert_id,
+                                "ptr": f"0x{ptr:x}",
+                                "bytes": size_bytes,
+                                "pool": coordinator_decision.pool,
+                                "coordinator_mode": coordinator_decision.mode,
+                                "coordinator_reason": coordinator_decision.reason,
+                            }
+                        )
+                        continue
                     if self.uvm_weight_prefetch_mode == "prefetch":
                         success = prefetch_range_to_device(ptr, size_bytes, device)
                         action = "prefetch_issued" if success else "prefetch_skipped"
@@ -1891,11 +2094,17 @@ class FusedMoE(CustomOp):
                             "mode": self.uvm_weight_prefetch_mode,
                             "action": action,
                             "role": role,
+                            "global_expert_id": global_expert_id,
                             "local_expert_id": local_expert_id,
                             "ptr": f"0x{ptr:x}",
                             "bytes": size_bytes,
                             "device": device,
                             "success": success,
+                            "coordinator_allowed": coordinator_decision.allowed,
+                            "coordinator_would_deny": (
+                                coordinator_decision.would_deny
+                            ),
+                            "coordinator_reason": coordinator_decision.reason,
                         }
                     )
 
@@ -1908,7 +2117,12 @@ class FusedMoE(CustomOp):
                         "step": self._uvm_moe_trace_step,
                         "mode": self.uvm_weight_prefetch_mode,
                         "action": "step_summary",
-                        "active_local_experts": local_experts,
+                        "active_global_experts": [
+                            global_expert_id for global_expert_id, _ in expert_pairs
+                        ],
+                        "active_local_experts": [
+                            local_expert_id for _, local_expert_id in expert_pairs
+                        ],
                         "issued_records": issued_records,
                         "issued_bytes": issued_bytes,
                         "attempted_bytes": attempted_bytes,
@@ -1920,6 +2134,184 @@ class FusedMoE(CustomOp):
                 )
         except Exception:
             logger.debug("Failed to run UVM expert prefetch", exc_info=True)
+
+    def _maybe_offload_uvm_cold_expert_weights(self, topk_ids: torch.Tensor) -> None:
+        if not self.uvm_weight_offload_enable:
+            return
+        self._refresh_uvm_weight_action_plans()
+        if not self.uvm_weight_offload_plan_keys:
+            return
+        try:
+            layer_id = self._uvm_layer_id()
+            if layer_id is None:
+                return
+            active_global_experts = {
+                global_expert_id
+                for global_expert_id, _ in self._uvm_active_expert_pairs(topk_ids)
+            }
+            expert_pairs = [
+                (global_expert_id, local_expert_id)
+                for global_expert_id, local_expert_id in self._uvm_plan_local_experts(
+                    self.uvm_weight_offload_plan_keys
+                )
+                if (layer_id, global_expert_id)
+                not in self._uvm_weight_offload_completed_keys
+                and global_expert_id not in active_global_experts
+            ]
+            if self.uvm_weight_offload_max_experts_per_layer > 0:
+                expert_pairs = expert_pairs[
+                    : self.uvm_weight_offload_max_experts_per_layer
+                ]
+            if not expert_pairs:
+                return
+
+            issued_records = 0
+            attempted_bytes = 0
+            issued_bytes = 0
+            rejected_records = 0
+
+            for global_expert_id, local_expert_id in expert_pairs:
+                expert_issued = False
+                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                    local_expert_id,
+                    self.uvm_weight_offload_target_roles,
+                ):
+                    attempted_bytes += size_bytes
+                    if (
+                        self.uvm_weight_offload_max_bytes_per_step > 0
+                        and issued_bytes + size_bytes
+                        > self.uvm_weight_offload_max_bytes_per_step
+                    ):
+                        rejected_records += 1
+                        self._append_uvm_weight_prefetch_trace(
+                            {
+                                "timestamp": time.time(),
+                                "pid": os.getpid(),
+                                "layer_name": self.layer_name,
+                                "step": self._uvm_moe_trace_step,
+                                "mode": self.uvm_weight_offload_mode,
+                                "action": "offload_budget_reject",
+                                "role": role,
+                                "global_expert_id": global_expert_id,
+                                "local_expert_id": local_expert_id,
+                                "ptr": f"0x{ptr:x}",
+                                "bytes": size_bytes,
+                                "issued_bytes_before": issued_bytes,
+                                "max_bytes_per_step": (
+                                    self.uvm_weight_offload_max_bytes_per_step
+                                ),
+                            }
+                        )
+                        continue
+
+                    action = "trace_offload_candidate"
+                    success = False
+                    coordinator_decision = request_uvm_pool_action(
+                        pool="weights",
+                        action=f"expert_{self.uvm_weight_offload_mode}",
+                        requested_bytes=size_bytes,
+                        scope_key=f"moe_step:{os.getpid()}:{self._uvm_moe_trace_step}",
+                        metadata={
+                            "stage": "stage_i",
+                            "layer_name": self.layer_name,
+                            "role": role,
+                            "global_expert_id": global_expert_id,
+                            "local_expert_id": local_expert_id,
+                            "mode": self.uvm_weight_offload_mode,
+                        },
+                    )
+                    if not coordinator_decision.allowed:
+                        rejected_records += 1
+                        self._append_uvm_weight_prefetch_trace(
+                            {
+                                "timestamp": time.time(),
+                                "pid": os.getpid(),
+                                "layer_name": self.layer_name,
+                                "step": self._uvm_moe_trace_step,
+                                "mode": self.uvm_weight_offload_mode,
+                                "action": "offload_coordinator_reject",
+                                "role": role,
+                                "global_expert_id": global_expert_id,
+                                "local_expert_id": local_expert_id,
+                                "ptr": f"0x{ptr:x}",
+                                "bytes": size_bytes,
+                                "pool": coordinator_decision.pool,
+                                "coordinator_mode": coordinator_decision.mode,
+                                "coordinator_reason": coordinator_decision.reason,
+                            }
+                        )
+                        continue
+                    if self.uvm_weight_offload_mode == "advise_cpu":
+                        success = advise_range_preferred_location(ptr, size_bytes, -1)
+                        action = (
+                            "offload_advise_cpu_issued"
+                            if success
+                            else "offload_skipped"
+                        )
+                    elif self.uvm_weight_offload_mode == "prefetch_cpu":
+                        success = prefetch_range_to_cpu(ptr, size_bytes)
+                        action = (
+                            "offload_prefetch_cpu_issued"
+                            if success
+                            else "offload_skipped"
+                        )
+
+                    issued_records += 1
+                    issued_bytes += size_bytes
+                    expert_issued = True
+                    self._append_uvm_weight_prefetch_trace(
+                        {
+                            "timestamp": time.time(),
+                            "pid": os.getpid(),
+                            "layer_name": self.layer_name,
+                            "step": self._uvm_moe_trace_step,
+                            "mode": self.uvm_weight_offload_mode,
+                            "action": action,
+                            "role": role,
+                            "global_expert_id": global_expert_id,
+                            "local_expert_id": local_expert_id,
+                            "ptr": f"0x{ptr:x}",
+                            "bytes": size_bytes,
+                            "device": -1,
+                            "success": success,
+                            "coordinator_allowed": coordinator_decision.allowed,
+                            "coordinator_would_deny": (
+                                coordinator_decision.would_deny
+                            ),
+                            "coordinator_reason": coordinator_decision.reason,
+                        }
+                    )
+                if expert_issued:
+                    self._uvm_weight_offload_completed_keys.add(
+                        (layer_id, global_expert_id)
+                    )
+
+            if issued_records or rejected_records:
+                self._append_uvm_weight_prefetch_trace(
+                    {
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "layer_name": self.layer_name,
+                        "step": self._uvm_moe_trace_step,
+                        "mode": self.uvm_weight_offload_mode,
+                        "action": "offload_step_summary",
+                        "offload_global_experts": [
+                            global_expert_id for global_expert_id, _ in expert_pairs
+                        ],
+                        "offload_local_experts": [
+                            local_expert_id for _, local_expert_id in expert_pairs
+                        ],
+                        "issued_records": issued_records,
+                        "issued_bytes": issued_bytes,
+                        "attempted_bytes": attempted_bytes,
+                        "budget_reject_records": rejected_records,
+                        "max_bytes_per_step": (
+                            self.uvm_weight_offload_max_bytes_per_step
+                        ),
+                    }
+                )
+        except Exception:
+            logger.debug("Failed to run UVM expert offload", exc_info=True)
 
     def must_reduce_shared_expert_outputs(self) -> bool:
         """

@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from math import lcm
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
@@ -39,6 +40,7 @@ class KVCacheCoordinator(ABC):
         dcp_world_size: int,
         pcp_world_size: int,
         hash_block_size: int,
+        uvm_kv_runtime_policy: UvmKvRuntimePolicy | None = None,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -49,6 +51,7 @@ class KVCacheCoordinator(ABC):
             enable_caching,
             hash_block_size,
             enable_kv_cache_events,
+            uvm_kv_runtime_policy=uvm_kv_runtime_policy,
         )
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
@@ -228,6 +231,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         dcp_world_size: int,
         pcp_world_size: int,
         hash_block_size: int,
+        uvm_kv_runtime_policy: UvmKvRuntimePolicy | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -238,6 +242,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
+            uvm_kv_runtime_policy=uvm_kv_runtime_policy,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -272,6 +277,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         dcp_world_size: int,
         pcp_world_size: int,
         hash_block_size: int,
+        uvm_kv_runtime_policy: UvmKvRuntimePolicy | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -282,6 +288,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
+            uvm_kv_runtime_policy=uvm_kv_runtime_policy,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -338,6 +345,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         dcp_world_size: int,
         pcp_world_size: int,
         hash_block_size: int,
+        uvm_kv_runtime_policy: UvmKvRuntimePolicy | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -348,6 +356,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
+            uvm_kv_runtime_policy=uvm_kv_runtime_policy,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -523,6 +532,7 @@ def get_kv_cache_coordinator(
     dcp_world_size: int,
     pcp_world_size: int,
     hash_block_size: int,
+    uvm_kv_runtime_policy: UvmKvRuntimePolicy | None = None,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -533,6 +543,7 @@ def get_kv_cache_coordinator(
             dcp_world_size,
             pcp_world_size,
             hash_block_size,
+            uvm_kv_runtime_policy=uvm_kv_runtime_policy,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -544,6 +555,7 @@ def get_kv_cache_coordinator(
             dcp_world_size,
             pcp_world_size,
             hash_block_size,
+            uvm_kv_runtime_policy=uvm_kv_runtime_policy,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -554,4 +566,5 @@ def get_kv_cache_coordinator(
         dcp_world_size,
         pcp_world_size,
         hash_block_size,
+        uvm_kv_runtime_policy=uvm_kv_runtime_policy,
     )

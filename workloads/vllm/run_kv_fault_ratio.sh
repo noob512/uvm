@@ -60,6 +60,15 @@ UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD="${VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_
 UVM_DEVICE_DIRECT_TARGET_PHASES="${VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES:-enabled:attention,enabled:moe,enabled:model_forward}"
 UVM_KV_BUDGET_BYTES="${VLLM_UVM_KV_BUDGET_BYTES:-0}"
 UVM_KV_BUDGET_MODE="${VLLM_UVM_KV_BUDGET_MODE:-trace_only}"
+UVM_KV_RUNTIME_ENABLE="${VLLM_UVM_KV_RUNTIME_ENABLE:-0}"
+UVM_KV_RUNTIME_MODE="${VLLM_UVM_KV_RUNTIME_MODE:-trace_only}"
+UVM_KV_RUNTIME_BUDGET_BYTES="${VLLM_UVM_KV_RUNTIME_BUDGET_BYTES:-0}"
+UVM_KV_RUNTIME_BUDGET_BLOCKS="${VLLM_UVM_KV_RUNTIME_BUDGET_BLOCKS:-0}"
+UVM_KV_RUNTIME_TRACE_FILE="${VLLM_UVM_KV_RUNTIME_TRACE_FILE:-}"
+UVM_KV_RUNTIME_EVICTION_POLICY="${VLLM_UVM_KV_RUNTIME_EVICTION_POLICY:-lru_prefix_cache}"
+UVM_KV_RUNTIME_CANDIDATE_LIMIT="${VLLM_UVM_KV_RUNTIME_CANDIDATE_LIMIT:-16}"
+UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE="${VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE:-0}"
+UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS="${VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS:-0}"
 UVM_WEIGHT_BUDGET_BYTES="${VLLM_UVM_WEIGHT_BUDGET_BYTES:-0}"
 UVM_WEIGHT_BUDGET_MODE="${VLLM_UVM_WEIGHT_BUDGET_MODE:-trace_only}"
 UVM_WEIGHT_MAP_ENABLE="${VLLM_UVM_WEIGHT_MAP_ENABLE:-1}"
@@ -73,6 +82,22 @@ UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="${VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER
 UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER:-2}"
 UVM_WEIGHT_PREFETCH_TARGET_ROLES="${VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES:-moe_gate_up,moe_down}"
 UVM_WEIGHT_PREFETCH_DEVICE="${VLLM_UVM_WEIGHT_PREFETCH_DEVICE:--1}"
+UVM_WEIGHT_PREFETCH_PLAN_FILE="${VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE:-}"
+UVM_WEIGHT_PREFETCH_REQUIRE_PLAN="${VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN:-0}"
+UVM_WEIGHT_OFFLOAD_ENABLE="${VLLM_UVM_WEIGHT_OFFLOAD_ENABLE:-0}"
+UVM_WEIGHT_OFFLOAD_MODE="${VLLM_UVM_WEIGHT_OFFLOAD_MODE:-trace_only}"
+UVM_WEIGHT_OFFLOAD_PLAN_FILE="${VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE:-}"
+UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP="${VLLM_UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP:-67108864}"
+UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER:-1}"
+UVM_WEIGHT_OFFLOAD_TARGET_ROLES="${VLLM_UVM_WEIGHT_OFFLOAD_TARGET_ROLES:-moe_gate_up,moe_down}"
+UVM_POOL_COORDINATOR_ENABLE="${VLLM_UVM_POOL_COORDINATOR_ENABLE:-0}"
+UVM_POOL_COORDINATOR_MODE="${VLLM_UVM_POOL_COORDINATOR_MODE:-trace_only}"
+UVM_POOL_COORDINATOR_TRACE_FILE="${VLLM_UVM_POOL_COORDINATOR_TRACE_FILE:-}"
+UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP="${VLLM_UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP:-0}"
+UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP="${VLLM_UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP:-0}"
+UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP="${VLLM_UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP:-0}"
+UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP="${VLLM_UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP:-0}"
+UVM_POOL_COORDINATOR_PRIORITY="${VLLM_UVM_POOL_COORDINATOR_PRIORITY:-kv,weights,scratch}"
 UVM_POOL_REGISTRY_ENABLE="${VLLM_UVM_POOL_REGISTRY_ENABLE:-0}"
 UVM_SCRATCH_POOL_ENABLE="${VLLM_UVM_SCRATCH_POOL_ENABLE:-0}"
 UVM_SCRATCH_POOL_BUDGET_BYTES="${VLLM_UVM_SCRATCH_POOL_BUDGET_BYTES:-1048576}"
@@ -193,6 +218,33 @@ Options:
                              Stage D KV budget mode: trace_only|enforce.
                              enforce is allocator-side soft signaling; block-manager
                              eviction/swap is intentionally not done here (default: trace_only)
+  --uvm-kv-runtime-enable <0|1>
+                             Stage J runtime KV pressure policy gate. This is
+                             block-manager-side, not allocator-side eviction.
+  --uvm-kv-runtime-mode <mode>
+                             Stage J mode: trace_only|enforce. trace_only emits
+                             would-evict/would-deny records; enforce denies new
+                             block admission over runtime budget.
+  --uvm-kv-runtime-budget-bytes <n>
+                             Stage J runtime KV block budget in bytes. Converted
+                             to blocks using KV config bytes-per-block.
+  --uvm-kv-runtime-budget-blocks <n>
+                             Stage J runtime KV block budget override. 0 means
+                             derive from bytes or disable budget pressure.
+  --uvm-kv-runtime-trace-file <path>
+                             Stage J JSONL trace file.
+  --uvm-kv-runtime-eviction-policy <name>
+                             Stage J policy name: lru_prefix_cache|scheduler_aware.
+                             Both are safety-gated to free/ref_cnt==0 candidates
+                             in this prototype.
+  --uvm-kv-runtime-candidate-limit <n>
+                             Max free-queue candidates emitted per pressure event.
+  --uvm-kv-runtime-prefix-evict-enable <0|1>
+                             Enable Stage J executor that clears prefix-cache
+                             metadata only from free/ref_cnt==0 KV blocks.
+  --uvm-kv-runtime-prefix-evict-max-blocks <n>
+                             Max prefix-cache free blocks to evict per pressure
+                             event. 0 means use pressure_blocks.
   --uvm-weight-budget-bytes <n>
                              Stage E model weights logical budget in bytes.
                              0 means unlimited telemetry-only budget (default: 0)
@@ -226,6 +278,45 @@ Options:
                              Expert weight roles to prefetch (default: moe_gate_up,moe_down)
   --uvm-weight-prefetch-device <n>
                              Target CUDA device for prefetch. -1 means current device.
+  --uvm-weight-prefetch-plan-file <path>
+                             Optional Stage H plan JSON. When present, Stage I
+                             prefetch only acts on hot experts in prefetch_plan.
+  --uvm-weight-prefetch-require-plan <0|1>
+                             Require a Stage H prefetch plan before issuing
+                             active-expert prefetch actions (default: 0).
+  --uvm-weight-offload-enable <0|1>
+                             Stage I optional cold expert offload/advise gate.
+  --uvm-weight-offload-mode <mode>
+                             Stage I cold expert mode:
+                             trace_only|advise_cpu|prefetch_cpu.
+  --uvm-weight-offload-plan-file <path>
+                             Stage H plan JSON containing offload_plan.
+  --uvm-weight-offload-max-bytes-per-step <n>
+                             Max cold expert weight bytes offloaded per MoE layer call.
+  --uvm-weight-offload-max-experts-per-layer <n>
+                             Max cold experts processed per MoE layer call.
+  --uvm-weight-offload-target-roles <csv>
+                             Expert weight roles eligible for cold offload.
+  --uvm-pool-coordinator-enable <0|1>
+                             Stage K global action coordinator gate.
+                             Coordinates high-level safe-point actions only.
+  --uvm-pool-coordinator-mode <mode>
+                             Stage K mode: trace_only|enforce. trace_only
+                             records would-deny but does not skip actions.
+  --uvm-pool-coordinator-trace-file <path>
+                             Stage K unified coordinator JSONL trace path.
+  --uvm-pool-coordinator-global-bytes-per-step <n>
+                             Global action budget per coordinator scope.
+                             0 means unlimited.
+  --uvm-pool-coordinator-weight-bytes-per-step <n>
+                             Stage I weights action budget per scope.
+  --uvm-pool-coordinator-kv-bytes-per-step <n>
+                             Stage J KV action budget per scope.
+  --uvm-pool-coordinator-scratch-bytes-per-step <n>
+                             Stage G scratch action budget placeholder.
+  --uvm-pool-coordinator-priority <csv>
+                             Pool priority label for reports
+                             (default: kv,weights,scratch)
   --uvm-pool-registry-enable <0|1>
                              Stage F unified pool registry telemetry.
                              Records kv_cache/weights/runtime_scratch objects
@@ -404,6 +495,12 @@ start_server() {
     if [ -z "$UVM_WEIGHT_PREFETCH_TRACE_FILE" ]; then
       UVM_WEIGHT_PREFETCH_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_weight_prefetch_stage_i.jsonl"
     fi
+    if [ -z "$UVM_KV_RUNTIME_TRACE_FILE" ]; then
+      UVM_KV_RUNTIME_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_kv_runtime_stage_j.jsonl"
+    fi
+    if [ -z "$UVM_POOL_COORDINATOR_TRACE_FILE" ]; then
+      UVM_POOL_COORDINATOR_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_pool_coordinator_stage_k.jsonl"
+    fi
     policy_env="VLLM_UVM_POLICY_ENABLE='$UVM_POLICY_ENABLE' \
                 VLLM_UVM_POLICY_MODE='$UVM_POLICY_MODE' \
                 VLLM_UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES='$UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES' \
@@ -429,6 +526,15 @@ start_server() {
                 VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES='$UVM_DEVICE_DIRECT_TARGET_PHASES' \
                 VLLM_UVM_KV_BUDGET_BYTES='$UVM_KV_BUDGET_BYTES' \
                 VLLM_UVM_KV_BUDGET_MODE='$UVM_KV_BUDGET_MODE' \
+                VLLM_UVM_KV_RUNTIME_ENABLE='$UVM_KV_RUNTIME_ENABLE' \
+                VLLM_UVM_KV_RUNTIME_MODE='$UVM_KV_RUNTIME_MODE' \
+                VLLM_UVM_KV_RUNTIME_BUDGET_BYTES='$UVM_KV_RUNTIME_BUDGET_BYTES' \
+                VLLM_UVM_KV_RUNTIME_BUDGET_BLOCKS='$UVM_KV_RUNTIME_BUDGET_BLOCKS' \
+                VLLM_UVM_KV_RUNTIME_TRACE_FILE='$UVM_KV_RUNTIME_TRACE_FILE' \
+                VLLM_UVM_KV_RUNTIME_EVICTION_POLICY='$UVM_KV_RUNTIME_EVICTION_POLICY' \
+                VLLM_UVM_KV_RUNTIME_CANDIDATE_LIMIT='$UVM_KV_RUNTIME_CANDIDATE_LIMIT' \
+                VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE='$UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE' \
+                VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS='$UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS' \
                 VLLM_UVM_WEIGHT_BUDGET_BYTES='$UVM_WEIGHT_BUDGET_BYTES' \
                 VLLM_UVM_WEIGHT_BUDGET_MODE='$UVM_WEIGHT_BUDGET_MODE' \
                 VLLM_UVM_WEIGHT_MAP_ENABLE='$UVM_WEIGHT_MAP_ENABLE' \
@@ -442,6 +548,22 @@ start_server() {
                 VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER='$UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER' \
                 VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES='$UVM_WEIGHT_PREFETCH_TARGET_ROLES' \
                 VLLM_UVM_WEIGHT_PREFETCH_DEVICE='$UVM_WEIGHT_PREFETCH_DEVICE' \
+                VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE='$UVM_WEIGHT_PREFETCH_PLAN_FILE' \
+                VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN='$UVM_WEIGHT_PREFETCH_REQUIRE_PLAN' \
+                VLLM_UVM_WEIGHT_OFFLOAD_ENABLE='$UVM_WEIGHT_OFFLOAD_ENABLE' \
+                VLLM_UVM_WEIGHT_OFFLOAD_MODE='$UVM_WEIGHT_OFFLOAD_MODE' \
+                VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE='$UVM_WEIGHT_OFFLOAD_PLAN_FILE' \
+                VLLM_UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP='$UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP' \
+                VLLM_UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER='$UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER' \
+                VLLM_UVM_WEIGHT_OFFLOAD_TARGET_ROLES='$UVM_WEIGHT_OFFLOAD_TARGET_ROLES' \
+                VLLM_UVM_POOL_COORDINATOR_ENABLE='$UVM_POOL_COORDINATOR_ENABLE' \
+                VLLM_UVM_POOL_COORDINATOR_MODE='$UVM_POOL_COORDINATOR_MODE' \
+                VLLM_UVM_POOL_COORDINATOR_TRACE_FILE='$UVM_POOL_COORDINATOR_TRACE_FILE' \
+                VLLM_UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP='$UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP' \
+                VLLM_UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP='$UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP' \
+                VLLM_UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP='$UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP' \
+                VLLM_UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP='$UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP' \
+                VLLM_UVM_POOL_COORDINATOR_PRIORITY='$UVM_POOL_COORDINATOR_PRIORITY' \
                 VLLM_UVM_POOL_REGISTRY_ENABLE='$UVM_POOL_REGISTRY_ENABLE' \
                 VLLM_UVM_SCRATCH_POOL_ENABLE='$UVM_SCRATCH_POOL_ENABLE' \
                 VLLM_UVM_SCRATCH_POOL_BUDGET_BYTES='$UVM_SCRATCH_POOL_BUDGET_BYTES' \
@@ -814,6 +936,15 @@ parse_args() {
       --uvm-device-direct-target-phases) UVM_DEVICE_DIRECT_TARGET_PHASES="$2"; shift 2 ;; # device_direct 候选 phase 前缀 allowlist
       --uvm-kv-budget-bytes) UVM_KV_BUDGET_BYTES="$2"; shift 2 ;; # Stage D KV cache 独立预算，0 表示不限额
       --uvm-kv-budget-mode) UVM_KV_BUDGET_MODE="$2"; shift 2 ;; # Stage D KV budget 模式 trace_only/enforce
+      --uvm-kv-runtime-enable) UVM_KV_RUNTIME_ENABLE="$2"; shift 2 ;; # Stage J runtime KV pressure policy 开关
+      --uvm-kv-runtime-mode) UVM_KV_RUNTIME_MODE="$2"; shift 2 ;; # Stage J mode trace_only/enforce
+      --uvm-kv-runtime-budget-bytes) UVM_KV_RUNTIME_BUDGET_BYTES="$2"; shift 2 ;; # Stage J runtime KV bytes budget
+      --uvm-kv-runtime-budget-blocks) UVM_KV_RUNTIME_BUDGET_BLOCKS="$2"; shift 2 ;; # Stage J runtime KV block budget
+      --uvm-kv-runtime-trace-file) UVM_KV_RUNTIME_TRACE_FILE="$2"; shift 2 ;; # Stage J runtime JSONL trace
+      --uvm-kv-runtime-eviction-policy) UVM_KV_RUNTIME_EVICTION_POLICY="$2"; shift 2 ;; # Stage J runtime policy
+      --uvm-kv-runtime-candidate-limit) UVM_KV_RUNTIME_CANDIDATE_LIMIT="$2"; shift 2 ;; # Stage J candidate trace cap
+      --uvm-kv-runtime-prefix-evict-enable) UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE="$2"; shift 2 ;; # Stage J prefix-cache executor gate
+      --uvm-kv-runtime-prefix-evict-max-blocks) UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS="$2"; shift 2 ;; # Stage J prefix-cache max evict blocks
       --uvm-weight-budget-bytes) UVM_WEIGHT_BUDGET_BYTES="$2"; shift 2 ;; # Stage E weights 独立预算，0 表示不限额
       --uvm-weight-budget-mode) UVM_WEIGHT_BUDGET_MODE="$2"; shift 2 ;; # Stage E weight budget 模式 trace_only/enforce
       --uvm-weight-map-enable) UVM_WEIGHT_MAP_ENABLE="$2"; shift 2 ;; # Stage E weight semantic map 开关
@@ -827,6 +958,22 @@ parse_args() {
       --uvm-weight-prefetch-max-experts-per-layer) UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage I 每层最多 active experts
       --uvm-weight-prefetch-target-roles) UVM_WEIGHT_PREFETCH_TARGET_ROLES="$2"; shift 2 ;; # Stage I prefetch roles
       --uvm-weight-prefetch-device) UVM_WEIGHT_PREFETCH_DEVICE="$2"; shift 2 ;; # Stage I target device
+      --uvm-weight-prefetch-plan-file) UVM_WEIGHT_PREFETCH_PLAN_FILE="$2"; shift 2 ;; # Stage I Stage H prefetch plan JSON
+      --uvm-weight-prefetch-require-plan) UVM_WEIGHT_PREFETCH_REQUIRE_PLAN="$2"; shift 2 ;; # Stage I 是否要求 prefetch_plan 命中
+      --uvm-weight-offload-enable) UVM_WEIGHT_OFFLOAD_ENABLE="$2"; shift 2 ;; # Stage I cold expert offload/advise 开关
+      --uvm-weight-offload-mode) UVM_WEIGHT_OFFLOAD_MODE="$2"; shift 2 ;; # Stage I cold expert mode trace_only/advise_cpu/prefetch_cpu
+      --uvm-weight-offload-plan-file) UVM_WEIGHT_OFFLOAD_PLAN_FILE="$2"; shift 2 ;; # Stage I Stage H offload plan JSON
+      --uvm-weight-offload-max-bytes-per-step) UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP="$2"; shift 2 ;; # Stage I 每层 cold offload 字节预算
+      --uvm-weight-offload-max-experts-per-layer) UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage I 每层最多 cold experts
+      --uvm-weight-offload-target-roles) UVM_WEIGHT_OFFLOAD_TARGET_ROLES="$2"; shift 2 ;; # Stage I cold offload roles
+      --uvm-pool-coordinator-enable) UVM_POOL_COORDINATOR_ENABLE="$2"; shift 2 ;; # Stage K global coordinator gate
+      --uvm-pool-coordinator-mode) UVM_POOL_COORDINATOR_MODE="$2"; shift 2 ;; # Stage K mode trace_only/enforce
+      --uvm-pool-coordinator-trace-file) UVM_POOL_COORDINATOR_TRACE_FILE="$2"; shift 2 ;; # Stage K JSONL trace
+      --uvm-pool-coordinator-global-bytes-per-step) UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP="$2"; shift 2 ;; # Stage K global action budget
+      --uvm-pool-coordinator-weight-bytes-per-step) UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP="$2"; shift 2 ;; # Stage K weights action budget
+      --uvm-pool-coordinator-kv-bytes-per-step) UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP="$2"; shift 2 ;; # Stage K KV action budget
+      --uvm-pool-coordinator-scratch-bytes-per-step) UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP="$2"; shift 2 ;; # Stage K scratch action budget
+      --uvm-pool-coordinator-priority) UVM_POOL_COORDINATOR_PRIORITY="$2"; shift 2 ;; # Stage K report priority label
       --uvm-pool-registry-enable) UVM_POOL_REGISTRY_ENABLE="$2"; shift 2 ;; # Stage F unified pool registry telemetry
       --uvm-scratch-pool-enable) UVM_SCRATCH_POOL_ENABLE="$2"; shift 2 ;; # Stage G scratch pool admission control
       --uvm-scratch-pool-budget-bytes) UVM_SCRATCH_POOL_BUDGET_BYTES="$2"; shift 2 ;; # Stage G scratch pool device-direct live bytes budget
@@ -940,6 +1087,14 @@ validate_inputs() {
     [ -n "$UVM_DEVICE_DIRECT_TARGET_PHASES" ] || die "--uvm-device-direct-target-phases must not be empty"
     [[ "$UVM_KV_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-kv-budget-bytes must be a non-negative integer"
     [[ "$UVM_KV_BUDGET_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-kv-budget-mode must be trace_only or enforce"
+    [[ "$UVM_KV_RUNTIME_ENABLE" =~ ^[01]$ ]] || die "--uvm-kv-runtime-enable must be 0 or 1"
+    [[ "$UVM_KV_RUNTIME_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-kv-runtime-mode must be trace_only or enforce"
+    [[ "$UVM_KV_RUNTIME_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-kv-runtime-budget-bytes must be a non-negative integer"
+    [[ "$UVM_KV_RUNTIME_BUDGET_BLOCKS" =~ ^[0-9]+$ ]] || die "--uvm-kv-runtime-budget-blocks must be a non-negative integer"
+    [[ "$UVM_KV_RUNTIME_EVICTION_POLICY" =~ ^(lru_prefix_cache|scheduler_aware)$ ]] || die "--uvm-kv-runtime-eviction-policy must be lru_prefix_cache or scheduler_aware"
+    [[ "$UVM_KV_RUNTIME_CANDIDATE_LIMIT" =~ ^[0-9]+$ ]] || die "--uvm-kv-runtime-candidate-limit must be a non-negative integer"
+    [[ "$UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE" =~ ^[01]$ ]] || die "--uvm-kv-runtime-prefix-evict-enable must be 0 or 1"
+    [[ "$UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS" =~ ^[0-9]+$ ]] || die "--uvm-kv-runtime-prefix-evict-max-blocks must be a non-negative integer"
     [[ "$UVM_WEIGHT_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-weight-budget-bytes must be a non-negative integer"
     [[ "$UVM_WEIGHT_BUDGET_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-weight-budget-mode must be trace_only or enforce"
     [[ "$UVM_WEIGHT_MAP_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-map-enable must be 0 or 1"
@@ -949,6 +1104,19 @@ validate_inputs() {
     [[ "$UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-weight-prefetch-max-experts-per-layer must be a non-negative integer"
     [ -n "$UVM_WEIGHT_PREFETCH_TARGET_ROLES" ] || die "--uvm-weight-prefetch-target-roles must not be empty"
     [[ "$UVM_WEIGHT_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-weight-prefetch-device must be an integer"
+    [[ "$UVM_WEIGHT_PREFETCH_REQUIRE_PLAN" =~ ^[01]$ ]] || die "--uvm-weight-prefetch-require-plan must be 0 or 1"
+    [[ "$UVM_WEIGHT_OFFLOAD_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-offload-enable must be 0 or 1"
+    [[ "$UVM_WEIGHT_OFFLOAD_MODE" =~ ^(trace_only|advise_cpu|prefetch_cpu)$ ]] || die "--uvm-weight-offload-mode must be trace_only, advise_cpu, or prefetch_cpu"
+    [[ "$UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-weight-offload-max-bytes-per-step must be a non-negative integer"
+    [[ "$UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-weight-offload-max-experts-per-layer must be a non-negative integer"
+    [ -n "$UVM_WEIGHT_OFFLOAD_TARGET_ROLES" ] || die "--uvm-weight-offload-target-roles must not be empty"
+    [[ "$UVM_POOL_COORDINATOR_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-coordinator-enable must be 0 or 1"
+    [[ "$UVM_POOL_COORDINATOR_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-pool-coordinator-mode must be trace_only or enforce"
+    [[ "$UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-pool-coordinator-global-bytes-per-step must be a non-negative integer"
+    [[ "$UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-pool-coordinator-weight-bytes-per-step must be a non-negative integer"
+    [[ "$UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-pool-coordinator-kv-bytes-per-step must be a non-negative integer"
+    [[ "$UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-pool-coordinator-scratch-bytes-per-step must be a non-negative integer"
+    [ -n "$UVM_POOL_COORDINATOR_PRIORITY" ] || die "--uvm-pool-coordinator-priority must not be empty"
     [[ "$UVM_POOL_REGISTRY_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-registry-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-scratch-pool-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-budget-bytes must be a non-negative integer"

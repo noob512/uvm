@@ -10,6 +10,7 @@ from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -113,6 +114,9 @@ class KVCacheManager:
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
 
+        self.uvm_kv_runtime_policy = UvmKvRuntimePolicy(kv_cache_config)
+        self.uvm_kv_runtime_policy.record_config()
+
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -122,6 +126,7 @@ class KVCacheManager:
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
+            uvm_kv_runtime_policy=self.uvm_kv_runtime_policy,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -277,7 +282,19 @@ class KVCacheManager:
             num_encoder_tokens=num_encoder_tokens,
         )
 
+        if not self.uvm_kv_runtime_policy.should_allow_allocation(
+            request_id=request.request_id,
+            num_blocks_to_allocate=num_blocks_to_allocate,
+            block_pool=self.block_pool,
+        ):
+            return None
+
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            self.uvm_kv_runtime_policy.record_reuse_failure(
+                request_id=request.request_id,
+                num_blocks_to_allocate=num_blocks_to_allocate,
+                block_pool=self.block_pool,
+            )
             # Cannot allocate new blocks
             return None
 

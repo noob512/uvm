@@ -11,6 +11,7 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
@@ -148,6 +149,7 @@ class BlockPool:
         enable_caching: bool,
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
+        uvm_kv_runtime_policy: UvmKvRuntimePolicy | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -173,6 +175,7 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+        self.uvm_kv_runtime_policy = uvm_kv_runtime_policy
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -335,6 +338,12 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        if self.uvm_kv_runtime_policy is not None:
+            self.uvm_kv_runtime_policy.record_prefix_cache_eviction(
+                block=block,
+                block_hash=block_hash,
+            )
+
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -349,6 +358,26 @@ class BlockPool:
                 )
             )
         return True
+
+    def evict_cached_free_blocks(self, max_blocks: int) -> int:
+        """Evict prefix-cache metadata from free blocks in LRU order.
+
+        This is Stage J's conservative runtime eviction executor. It only
+        touches blocks that are already in the free queue (`ref_cnt == 0`), so
+        active request block tables are not modified.
+        """
+        if max_blocks <= 0 or not self.enable_caching:
+            return 0
+
+        evicted = 0
+        for block in self.free_block_queue.get_all_free_blocks():
+            if evicted >= max_blocks:
+                break
+            if block.is_null or block.ref_cnt != 0 or block.block_hash is None:
+                continue
+            if self._maybe_evict_cached_block(block):
+                evicted += 1
+        return evicted
 
     def touch(self, blocks: tuple[Sequence[KVCacheBlock], ...]) -> None:
         """Touch a block increases its reference count by 1, and may remove

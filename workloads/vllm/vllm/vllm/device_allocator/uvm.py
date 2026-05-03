@@ -402,6 +402,32 @@ def prefetch_range_to_device(ptr: int, size: int, device: int = 0) -> bool:
     return True
 
 
+def prefetch_range_to_cpu(ptr: int, size: int) -> bool:
+    """Prefetch a raw UVM address range to CPU memory."""
+    return prefetch_range_to_device(ptr, size, device=-1)
+
+
+def advise_range_preferred_location(ptr: int, size: int, device: int) -> bool:
+    """
+    Set cudaMemAdviseSetPreferredLocation for a raw UVM address range.
+
+    Returns True when the advise call was issued. The allocator shim currently
+    logs CUDA errors internally instead of returning them, so benchmark health
+    and Stage I trace records are used for end-to-end validation.
+    """
+    if not _uvm_enabled or _uvm_lib is None:
+        return False
+    if ptr <= 0 or size <= 0:
+        return False
+    _uvm_lib.uvm_advise(
+        ctypes.c_void_p(ptr),
+        ctypes.c_size_t(size),
+        ctypes.c_int(2),  # cudaMemAdviseSetPreferredLocation
+        ctypes.c_int(device),
+    )
+    return True
+
+
 def set_preferred_location(tensor: torch.Tensor, device: int) -> None:
     """
     Set the preferred location for a UVM tensor.
@@ -418,12 +444,7 @@ def set_preferred_location(tensor: torch.Tensor, device: int) -> None:
 
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
-    _uvm_lib.uvm_advise(
-        ctypes.c_void_p(ptr),
-        ctypes.c_size_t(size),
-        ctypes.c_int(2),  # cudaMemAdviseSetPreferredLocation
-        ctypes.c_int(device)
-    )
+    advise_range_preferred_location(ptr, size, device)
 
 
 @contextmanager

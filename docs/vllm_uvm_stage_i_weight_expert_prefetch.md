@@ -1,8 +1,11 @@
-# vLLM UVM Stage I Weights Expert Prefetch 实现说明
+# vLLM UVM Stage I MoE Expert Weight Prefetch/Offload 执行实现说明
 
-本文档记录 Stage I 的最小安全实现：在 Stage H 已经证明 expert hot/cold trace-only plan 可生成后，把 MoE routing 输出接入真实 `cudaMemPrefetchAsync`，对当前 layer 即将访问的 active expert weight slice 做小范围 GPU prefetch。
+本文档记录 Stage I 的完整实现：在 Stage H 已经能生成 expert hot/cold trace-only plan 后，Stage I 在 MoE layer 的安全点上执行两类 opt-in 动作：
 
-Stage I 当前只实现 prefetch，不实现 offload。
+1. 对 hot active expert weight slice 发起 GPU prefetch。
+2. 对 Stage H 计划中的 cold expert weight slice 发起可选 CPU preferred-location advise 或 CPU prefetch。
+
+Stage I 的目标不是默认提升性能，而是证明“基于 MoE 语义的权重迁移动作可以安全接入运行时路径，并且有预算、trace 和一键验收闭环”。
 
 ## 1. 目标
 
@@ -10,30 +13,43 @@ Stage I 要证明：
 
 1. MoE routing 后、expert kernel 前存在可用安全点。
 2. 可以从 `topk_ids` 得到当前 layer 的 active experts。
-3. 可以把 active expert 映射到本 rank 的 local expert id。
-4. 可以对 `w13_weight` / `w2_weight` 的 expert slice 发起 `cudaMemPrefetchAsync`。
-5. prefetch 受 per-layer-call 字节预算和 expert 数量预算限制。
-6. benchmark failed requests 保持 0。
+3. 可以把 global expert id 映射到本 rank 的 local expert id。
+4. 可以用 Stage H `prefetch_plan` 过滤 hot expert prefetch。
+5. 可以用 Stage H `offload_plan` 选择 cold expert，并跳过当前 step active expert。
+6. prefetch/offload 都受 per-layer-call 字节预算和 expert 数量预算限制。
+7. benchmark failed requests 保持 0。
 
-## 2. 当前实现范围
+## 2. 修改文件
 
-已实现：
+Stage I 主要修改：
 
-1. 在 `vllm/device_allocator/uvm.py` 新增 `prefetch_range_to_device(ptr, size, device)`。
-2. 在 `FusedMoE.select_experts()` 路由完成后调用 `_maybe_prefetch_uvm_expert_weights(topk_ids)`。
-3. 对 active expert 的 `w13_weight` 和 `w2_weight` slice 做 trace 或 prefetch。
-4. 输出 Stage I JSONL trace。
-5. 新增 `check_stage_i_success.py` 做一键验收。
+```text
+workloads/vllm/vllm/vllm/device_allocator/uvm.py
+workloads/vllm/vllm/vllm/model_executor/layers/fused_moe/layer.py
+workloads/vllm/run_kv_fault_ratio.sh
+workloads/vllm/check_stage_i_success.py
+docs/vllm_uvm_stage_i_weight_expert_prefetch.md
+```
 
-未实现：
+## 3. 执行边界
 
-1. CPU offload。
-2. `cudaMemAdviseSetPreferredLocation` 到 CPU。
-3. 使用 Stage H 离线 plan 限定 hot expert 白名单。
-4. 跨 layer / 跨 token 预测下一步 expert。
-5. PCIe 带宽 coordinator。
+Stage I 执行：
 
-## 3. 插入点
+1. hot expert GPU prefetch。
+2. cold expert CPU advise 或 CPU prefetch。
+3. JSONL trace。
+4. action budget。
+5. Stage H plan-gated validation。
+
+Stage I 不执行：
+
+1. Tensor storage 替换。
+2. 删除或卸载 PyTorch Parameter。
+3. KV eviction/swap。
+4. 全局 pressure coordinator。
+5. 跨 token/跨 layer 预测式 prefetch。
+
+## 4. 插入点
 
 插入点在：
 
@@ -42,47 +58,152 @@ vllm/model_executor/layers/fused_moe/layer.py
   FusedMoE.select_experts()
 ```
 
-顺序为：
+顺序：
 
 ```text
 router_logits -> topk_ids
-  -> Stage E routing trace
-  -> Stage I active expert weight prefetch
+  -> Stage E MoE routing trace
+  -> Stage I hot active expert GPU prefetch
+  -> Stage I cold inactive expert CPU advise/offload
   -> quant_method.apply / fused expert kernel
 ```
 
-这个位置的好处是：
+这个位置的优势是：
 
 1. 已经知道当前 token 会访问哪些 expert。
-2. 还没有进入 expert weight GEMM kernel。
-3. 不需要 allocator 猜测语义。
+2. 还没有进入 expert GEMM kernel。
+3. 不需要 allocator 猜测权重语义。
 4. 不改变 tensor storage。
 
-## 4. 配置项
+## 5. allocator Python wrapper
 
-通过 `run_kv_fault_ratio.sh` 注入：
+`vllm/device_allocator/uvm.py` 新增 raw range helper：
 
-```text
-VLLM_UVM_WEIGHT_PREFETCH_ENABLE=0|1
-VLLM_UVM_WEIGHT_PREFETCH_MODE=trace_only|prefetch
-VLLM_UVM_WEIGHT_PREFETCH_TRACE_FILE=<path>
-VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP=<n>
-VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER=<n>
-VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES=moe_gate_up,moe_down
-VLLM_UVM_WEIGHT_PREFETCH_DEVICE=-1
+```python
+prefetch_range_to_device(ptr, size, device)
+prefetch_range_to_cpu(ptr, size)
+advise_range_preferred_location(ptr, size, device)
 ```
 
-含义：
+其中：
 
-1. `ENABLE=1` 才启用 Stage I 逻辑。
-2. `MODE=trace_only` 只记录候选，不调用 prefetch。
-3. `MODE=prefetch` 调用 allocator `.so` 里的 `uvm_prefetch`。
-4. `MAX_BYTES_PER_STEP` 限制每次 MoE layer 调用最多 prefetch bytes。
-5. `MAX_EXPERTS_PER_LAYER` 限制每次 MoE layer 调用最多处理几个 active experts。
-6. `TARGET_ROLES` 当前支持 `moe_gate_up` 和 `moe_down`。
-7. `DEVICE=-1` 表示使用当前 CUDA device。
+1. `prefetch_range_to_device(..., device>=0)` 调用 allocator `.so` 的 `uvm_prefetch`，底层是 `cudaMemPrefetchAsync`。
+2. `prefetch_range_to_cpu(..., device=-1)` 用 `cudaMemPrefetchAsync(..., cudaCpuDeviceId/-1)` 将 range 预取到 CPU。
+3. `advise_range_preferred_location(..., device=-1)` 调用 `cudaMemAdviseSetPreferredLocation`，把 cold range 的 preferred location 设为 CPU。
 
-## 5. Trace 字段
+这些 helper 返回“调用是否已发出”。底层 CUDA error 仍由 allocator shim 打印，Stage I 用 JSONL trace 和 failed requests 做端到端安全验证。
+
+## 6. FusedMoE 实现
+
+### 6.1 active expert 识别
+
+Stage I 从 `topk_ids` 得到当前 step 的 active global expert id，再通过 `self.expert_map` 转成本 rank local expert id：
+
+```text
+topk_ids -> unique global expert ids -> expert_map -> local expert ids
+```
+
+如果没有 expert parallel map，则默认：
+
+```text
+local_expert_id = global_expert_id
+```
+
+### 6.2 weight slice 定位
+
+当前支持两类 fused MoE expert weights：
+
+```text
+w13_weight -> moe_gate_up
+w2_weight  -> moe_down
+```
+
+slice 计算方式：
+
+```text
+slice_bytes = tensor.numel() * tensor.element_size() / tensor.shape[0]
+slice_ptr = tensor.data_ptr() + local_expert_id * slice_bytes
+```
+
+这与 Stage H 对 fused tensor 按第 0 维拆 logical expert slice 的方式一致。
+
+### 6.3 Stage H plan-gated prefetch
+
+可选配置：
+
+```text
+VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE=<stage_h_plan.json>
+VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN=0|1
+```
+
+如果 `PREFETCH_PLAN_FILE` 存在，Stage I 只对 `(layer_id, expert_id)` 出现在 `prefetch_plan` 中的 active expert 发起 prefetch。
+
+如果 `REQUIRE_PLAN=1` 且没有可加载 plan，则不发 active-expert prefetch。这样验收脚本可以证明 Stage I 真正使用了 Stage H hot plan，而不是无差别预取所有 active expert。
+
+### 6.4 cold expert offload/advise
+
+可选配置：
+
+```text
+VLLM_UVM_WEIGHT_OFFLOAD_ENABLE=0|1
+VLLM_UVM_WEIGHT_OFFLOAD_MODE=trace_only|advise_cpu|prefetch_cpu
+VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE=<stage_h_plan.json>
+```
+
+执行规则：
+
+1. 只处理 Stage H `offload_plan` 中的 `(layer_id, expert_id)`。
+2. 如果该 expert 是当前 step active expert，则跳过，避免把马上要用的权重推向 CPU。
+3. 每个 `(layer_id, expert_id)` 在单个 layer 实例内只处理一次，避免 decode 阶段重复发 advise/offload。
+4. `trace_only` 只写 `trace_offload_candidate`。
+5. `advise_cpu` 发出 `cudaMemAdviseSetPreferredLocation(..., CPU)`。
+6. `prefetch_cpu` 发出 `cudaMemPrefetchAsync(..., CPU)`。
+
+默认验收使用 `advise_cpu`，因为它比真正 CPU prefetch 更温和，风险更低。
+
+## 7. 配置项
+
+runner 支持：
+
+```text
+--uvm-weight-prefetch-enable <0|1>
+--uvm-weight-prefetch-mode <trace_only|prefetch>
+--uvm-weight-prefetch-trace-file <path>
+--uvm-weight-prefetch-max-bytes-per-step <n>
+--uvm-weight-prefetch-max-experts-per-layer <n>
+--uvm-weight-prefetch-target-roles <csv>
+--uvm-weight-prefetch-device <n>
+--uvm-weight-prefetch-plan-file <path>
+--uvm-weight-prefetch-require-plan <0|1>
+--uvm-weight-offload-enable <0|1>
+--uvm-weight-offload-mode <trace_only|advise_cpu|prefetch_cpu>
+--uvm-weight-offload-plan-file <path>
+--uvm-weight-offload-max-bytes-per-step <n>
+--uvm-weight-offload-max-experts-per-layer <n>
+--uvm-weight-offload-target-roles <csv>
+```
+
+对应环境变量：
+
+```text
+VLLM_UVM_WEIGHT_PREFETCH_ENABLE
+VLLM_UVM_WEIGHT_PREFETCH_MODE
+VLLM_UVM_WEIGHT_PREFETCH_TRACE_FILE
+VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP
+VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER
+VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES
+VLLM_UVM_WEIGHT_PREFETCH_DEVICE
+VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE
+VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN
+VLLM_UVM_WEIGHT_OFFLOAD_ENABLE
+VLLM_UVM_WEIGHT_OFFLOAD_MODE
+VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE
+VLLM_UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP
+VLLM_UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER
+VLLM_UVM_WEIGHT_OFFLOAD_TARGET_ROLES
+```
+
+## 8. Trace 字段
 
 Stage I trace 文件默认为：
 
@@ -90,80 +211,127 @@ Stage I trace 文件默认为：
 vllm_uvm_weight_prefetch_stage_i.jsonl
 ```
 
-每条 action 记录包含：
+hot prefetch action：
 
-1. `layer_name`
-2. `step`
-3. `mode`
-4. `action`
-   - `trace_prefetch_candidate`
-   - `prefetch_issued`
-   - `prefetch_skipped`
-   - `budget_reject`
-   - `step_summary`
-5. `role`
-6. `local_expert_id`
-7. `ptr`
-8. `bytes`
-9. `device`
-10. `success`
+```text
+trace_prefetch_candidate
+prefetch_issued
+prefetch_skipped
+budget_reject
+step_summary
+```
 
-`step_summary` 记录包含：
+cold offload action：
 
-1. `active_local_experts`
-2. `issued_records`
-3. `issued_bytes`
-4. `attempted_bytes`
-5. `budget_reject_records`
-6. `max_bytes_per_step`
+```text
+trace_offload_candidate
+offload_advise_cpu_issued
+offload_prefetch_cpu_issued
+offload_skipped
+offload_budget_reject
+offload_step_summary
+```
 
-## 6. 验收脚本
+常见字段：
 
-推荐命令：
+```text
+layer_name
+step
+mode
+action
+role
+global_expert_id
+local_expert_id
+ptr
+bytes
+device
+success
+issued_records
+issued_bytes
+attempted_bytes
+budget_reject_records
+max_bytes_per_step
+```
+
+## 9. 检查脚本
+
+新增/升级：
+
+```text
+workloads/vllm/check_stage_i_success.py
+```
+
+默认命令：
 
 ```bash
-cd workloads/vllm
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
 ./check_stage_i_success.py
 ```
 
-默认会：
+默认流程：
 
-1. 启动单进程 vLLM server。
-2. 开启 weight map。
-3. 开启 MoE routing trace。
-4. 开启 Stage I `mode=prefetch`。
-5. 跑 1 条 benchmark 请求。
-6. 检查 Stage I prefetch trace。
+1. 运行 planning probe。
+2. 输出 weight map 和 MoE routing trace。
+3. 调用 `plan_stage_h_weight_expert_actions.py` 生成 Stage H hot/cold plan。
+4. 运行 execution probe。
+5. execution probe 使用 `--uvm-weight-prefetch-plan-file` 和 `--uvm-weight-offload-plan-file`。
+6. 开启 `--uvm-weight-prefetch-require-plan 1`，证明 prefetch 由 Stage H plan 驱动。
+7. 默认开启 cold offload `advise_cpu`。
+8. 解析 Stage I JSONL trace、metrics 和 benchmark log。
 
-也可以只验证已有日志：
+## 10. 成功标准
+
+PASS 需要：
+
+```text
+prefetch_trace_present=True
+prefetch_trace_records_present=True
+prefetch_candidates_or_issued_present=True
+prefetch_issued_present_in_prefetch_mode=True
+prefetch_step_bytes_within_budget=True
+plan_json_present=True
+prefetch_plan_records_present=True
+offload_plan_records_present=True
+offload_action_present=True
+offload_step_bytes_within_budget=True
+moe_routing_trace_present=True
+weight_map_present=True
+benchmark_no_failed_requests=True
+allocator_weight_metrics_present=True
+pool_registry_enabled=True
+runner_log_clean=True
+```
+
+如果使用：
+
+```bash
+./check_stage_i_success.py --disable-offload
+```
+
+则只验证 hot expert prefetch，不要求 cold offload action。
+
+## 11. 复用已有日志
+
+可以跳过新运行：
 
 ```bash
 ./check_stage_i_success.py \
   --skip-run \
   --prefetch-trace-jsonl /tmp/run/vllm_uvm_weight_prefetch_stage_i.jsonl \
+  --plan-json /tmp/run/vllm_stage_i_weight_expert_plan.json \
+  --moe-routing-jsonl /tmp/run/vllm_uvm_moe_routing_stage_i.jsonl \
+  --weight-map-jsonl /tmp/run/vllm_uvm_weight_regions_stage_i.jsonl \
   --bench-log /tmp/run/vllm_bench_stage_i.log
 ```
 
-## 7. 成功标准
+## 12. 最终判断
 
-`check_stage_i_success.py` PASS 需要：
+Stage I 当前已经从“active expert prefetch 最小原型”升级为完整的 Stage I 执行闭环：
 
-1. `prefetch_trace_present=True`
-2. `prefetch_trace_records_present=True`
-3. `prefetch_candidates_or_issued_present=True`
-4. `prefetch_issued_present_in_prefetch_mode=True`
-5. `prefetch_step_bytes_within_budget=True`
-6. `moe_routing_trace_present=True`
-7. `weight_map_present=True`
-8. `benchmark_no_failed_requests=True`
-9. allocator metrics 存在时：
-   - `allocator_weight_metrics_present=True`
-   - `pool_registry_enabled=True`
-
-## 8. 注意事项
-
-1. 当前 prefetch 是“当前 layer active expert”的即时预取，不是下一层/下一 token 的预测预取。
-2. 由于 prefetch 插入点紧挨 expert kernel，收益可能有限，但这是验证安全执行链路的必要第一步。
-3. 如果 trace 开销过大，可关闭 MoE routing trace，只保留 Stage I prefetch trace；验收脚本默认两者都开，方便证明链路。
-4. `uvm_prefetch` 目前不返回 CUDA error，Stage I 用 trace 里的 `prefetch_issued` 表示调用已发出，并用 failed requests 做安全判断。
-5. offload 仍然属于后续阶段，不能根据 Stage I 结果直接默认开启。
+1. hot expert prefetch executor 已实现。
+2. Stage H `prefetch_plan` 可作为 hot whitelist。
+3. cold expert `offload_plan` 可执行 trace-only、CPU advise 或 CPU prefetch。
+4. action budget 覆盖 prefetch 和 offload。
+5. 当前 step active expert 不会被 cold offload。
+6. 所有动作写入 JSONL trace。
+7. `check_stage_i_success.py` 能自动生成 plan 并验证执行是否成功。

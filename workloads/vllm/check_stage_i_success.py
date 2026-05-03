@@ -21,8 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Check whether Stage I MoE expert weight prefetch is wired. The "
-            "default run enables routing-informed expert weight slice prefetch "
-            "and validates the Stage I JSONL trace plus benchmark health."
+            "default run first generates a Stage H hot/cold expert plan, then "
+            "executes Stage I plan-gated hot prefetch and optional cold offload."
         )
     )
     parser.add_argument("--metrics-json", help="Existing summarize_gap_watch_metrics JSON.")
@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-trace-jsonl", help="Existing or new Stage I prefetch JSONL.")
     parser.add_argument("--moe-routing-jsonl", help="Existing or new MoE routing JSONL.")
     parser.add_argument("--weight-map-jsonl", help="Existing or new weight map JSONL.")
+    parser.add_argument("--plan-json", help="Existing or new Stage H plan JSON used by Stage I.")
     parser.add_argument("--bench-log", help="Existing or new benchmark log.")
     parser.add_argument("--run-dir", help="Existing or new Stage I run directory.")
     parser.add_argument("--output-json", help="Where to write the check summary JSON.")
@@ -42,7 +43,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-bytes-per-step", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--max-experts-per-layer", type=int, default=2)
     parser.add_argument("--target-roles", default="moe_gate_up,moe_down")
+    parser.add_argument(
+        "--offload-mode",
+        choices=("trace_only", "advise_cpu", "prefetch_cpu"),
+        default="advise_cpu",
+        help="Cold expert action mode driven by Stage H offload_plan.",
+    )
+    parser.add_argument("--offload-max-bytes-per-step", type=int, default=64 * 1024 * 1024)
+    parser.add_argument("--offload-max-experts-per-layer", type=int, default=1)
+    parser.add_argument("--offload-target-roles", default="moe_gate_up,moe_down")
+    parser.add_argument(
+        "--disable-offload",
+        action="store_true",
+        help="Only validate Stage I hot expert prefetch, not cold offload/advise.",
+    )
     parser.add_argument("--prompts", type=int, default=1)
+    parser.add_argument(
+        "--plan-prompts",
+        type=int,
+        default=1,
+        help="Benchmark prompts for the Stage H planning probe.",
+    )
     parser.add_argument("--request-rate", default="5")
     parser.add_argument("--output-len", default="512")
     parser.add_argument(
@@ -121,7 +142,15 @@ def parse_failed_requests(bench_log: Path | None) -> int | None:
 
 def resolve_existing_inputs(
     args: argparse.Namespace,
-) -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None, Path | None]:
+) -> tuple[
+    Path | None,
+    Path | None,
+    Path | None,
+    Path | None,
+    Path | None,
+    Path | None,
+    Path | None,
+]:
     metrics_json = Path(args.metrics_json) if args.metrics_json else None
     allocator_log = Path(args.allocator_log) if args.allocator_log else None
     prefetch_trace = (
@@ -129,6 +158,7 @@ def resolve_existing_inputs(
     )
     moe_routing_jsonl = Path(args.moe_routing_jsonl) if args.moe_routing_jsonl else None
     weight_map_jsonl = Path(args.weight_map_jsonl) if args.weight_map_jsonl else None
+    plan_json = Path(args.plan_json) if args.plan_json else None
     bench_log = Path(args.bench_log) if args.bench_log else None
     if args.run_dir:
         run_dir = Path(args.run_dir)
@@ -152,6 +182,10 @@ def resolve_existing_inputs(
             candidate = run_dir / "vllm_uvm_weight_regions_stage_i.jsonl"
             if candidate.is_file():
                 weight_map_jsonl = candidate
+        if plan_json is None:
+            candidate = run_dir / "vllm_stage_i_weight_expert_plan.json"
+            if candidate.is_file():
+                plan_json = candidate
         if bench_log is None:
             candidate = run_dir / "vllm_bench_stage_i.log"
             if candidate.is_file():
@@ -162,6 +196,7 @@ def resolve_existing_inputs(
         prefetch_trace,
         moe_routing_jsonl,
         weight_map_jsonl,
+        plan_json,
         bench_log,
     )
 
@@ -188,10 +223,112 @@ def run_experiment(
     weight_map_jsonl = Path(args.weight_map_jsonl) if args.weight_map_jsonl else (
         run_dir / "vllm_uvm_weight_regions_stage_i.jsonl"
     )
+    plan_json = Path(args.plan_json) if args.plan_json else (
+        run_dir / "vllm_stage_i_weight_expert_plan.json"
+    )
+    plan_summary_json = run_dir / "vllm_stage_i_weight_expert_plan_summary.json"
     bench_log = Path(args.bench_log) if args.bench_log else (
         run_dir / "vllm_bench_stage_i.log"
     )
     runner_log = run_dir / "stage_i_success_check_runner.log"
+    planning_allocator_log = run_dir / "vllm_uvm_allocator_trace_stage_i_planning.log"
+    planning_metrics_json = run_dir / "vllm_stage_i_allocator_metrics_planning.json"
+    planning_moe_routing_jsonl = run_dir / "vllm_uvm_moe_routing_stage_i_planning.jsonl"
+    planning_weight_map_jsonl = run_dir / "vllm_uvm_weight_regions_stage_i_planning.jsonl"
+    planning_bench_log = run_dir / "vllm_bench_stage_i_planning.log"
+    planning_runner_log = run_dir / "stage_i_planning_runner.log"
+
+    planning_cmd = [
+        "./run_kv_fault_ratio.sh",
+        "--mode",
+        "trace",
+        "--allocator-log",
+        str(planning_allocator_log),
+        "--trace-log",
+        str(run_dir / "uvm_kv_fault_stats_stage_i_planning.log"),
+        "--address-log",
+        str(run_dir / "vllm_uvm_address_regions_stage_i_planning.log"),
+        "--server-log",
+        str(run_dir / "vllm_server_stage_i_planning.log"),
+        "--bench-log",
+        str(planning_bench_log),
+        "--uvm-kv-budget-bytes",
+        "0",
+        "--uvm-weight-budget-bytes",
+        "0",
+        "--uvm-weight-map-enable",
+        "1",
+        "--uvm-weight-map-file",
+        str(planning_weight_map_jsonl),
+        "--uvm-moe-routing-trace-enable",
+        "1",
+        "--uvm-moe-routing-trace-file",
+        str(planning_moe_routing_jsonl),
+        "--uvm-weight-prefetch-enable",
+        "0",
+        "--uvm-weight-offload-enable",
+        "0",
+        "--uvm-pool-registry-enable",
+        "1",
+        "--gap-watch-metrics-summary-json",
+        str(planning_metrics_json),
+        "--prompts",
+        str(args.plan_prompts),
+        "--request-rate",
+        str(args.request_rate),
+        "--output-len",
+        str(args.output_len),
+    ]
+
+    print("===========================================================")
+    print(" Stage I Success Check: planning hot/cold expert actions")
+    print(f" Output dir: {run_dir}")
+    print(f" Plan JSON: {plan_json}")
+    print("===========================================================")
+    with planning_runner_log.open("w", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            planning_cmd,
+            cwd=SCRIPT_DIR,
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+            handle.write(line)
+        rc = process.wait()
+    if rc != 0:
+        raise SystemExit(
+            f"Stage I planning probe failed with exit code {rc}; "
+            f"log={planning_runner_log}"
+        )
+
+    subprocess.run(
+        [
+            "python3",
+            str(SCRIPT_DIR / "plan_stage_h_weight_expert_actions.py"),
+            "--weight-map",
+            str(planning_weight_map_jsonl),
+            "--moe-routing-trace",
+            str(planning_moe_routing_jsonl),
+            "--plan-json",
+            str(plan_json),
+            "--summary-json",
+            str(plan_summary_json),
+            "--target-roles",
+            args.target_roles,
+            "--hot-top-k",
+            "1024",
+            "--cold-bottom-k",
+            "1024",
+            "--require-routing",
+        ],
+        cwd=SCRIPT_DIR,
+        check=True,
+    )
 
     cmd = [
         "./run_kv_fault_ratio.sh",
@@ -231,6 +368,22 @@ def run_experiment(
         str(args.max_experts_per_layer),
         "--uvm-weight-prefetch-target-roles",
         args.target_roles,
+        "--uvm-weight-prefetch-plan-file",
+        str(plan_json),
+        "--uvm-weight-prefetch-require-plan",
+        "1",
+        "--uvm-weight-offload-enable",
+        "0" if args.disable_offload else "1",
+        "--uvm-weight-offload-mode",
+        args.offload_mode,
+        "--uvm-weight-offload-plan-file",
+        str(plan_json),
+        "--uvm-weight-offload-max-bytes-per-step",
+        str(args.offload_max_bytes_per_step),
+        "--uvm-weight-offload-max-experts-per-layer",
+        str(args.offload_max_experts_per_layer),
+        "--uvm-weight-offload-target-roles",
+        args.offload_target_roles,
         "--uvm-pool-registry-enable",
         "1",
         "--gap-watch-metrics-summary-json",
@@ -246,10 +399,13 @@ def run_experiment(
     print("===========================================================")
     print(" Stage I Success Check: running expert weight prefetch probe")
     print(f" Output dir: {run_dir}")
+    print(f" Plan JSON: {plan_json}")
     print(f" Prefetch mode: {args.mode}")
     print(f" Max bytes per step: {args.max_bytes_per_step}")
     print(f" Max experts per layer: {args.max_experts_per_layer}")
     print(f" Target roles: {args.target_roles}")
+    print(f" Offload enabled: {not args.disable_offload}")
+    print(f" Offload mode: {args.offload_mode}")
     print("===========================================================")
 
     with runner_log.open("w", encoding="utf-8") as handle:
@@ -281,6 +437,7 @@ def run_experiment(
         prefetch_trace,
         moe_routing_jsonl,
         weight_map_jsonl,
+        plan_json,
         bench_log,
         runner_log,
     )
@@ -293,9 +450,14 @@ def summarize_prefetch_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
     issued_records = 0
     prefetch_issued = 0
     trace_candidates = 0
+    offload_issued = 0
+    trace_offload_candidates = 0
     budget_rejects = 0
+    offload_budget_rejects = 0
     max_step_issued_bytes = 0
+    max_offload_step_issued_bytes = 0
     max_summary_attempted_bytes = 0
+    max_offload_summary_attempted_bytes = 0
     layers: set[str] = set()
     experts: set[tuple[str, int]] = set()
 
@@ -317,8 +479,14 @@ def summarize_prefetch_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
             prefetch_issued += 1
         if action == "trace_prefetch_candidate":
             trace_candidates += 1
+        if action in {"offload_advise_cpu_issued", "offload_prefetch_cpu_issued"}:
+            offload_issued += 1
+        if action == "trace_offload_candidate":
+            trace_offload_candidates += 1
         if action == "budget_reject":
             budget_rejects += 1
+        if action == "offload_budget_reject":
+            offload_budget_rejects += 1
         if action == "step_summary":
             max_step_issued_bytes = max(
                 max_step_issued_bytes,
@@ -328,6 +496,15 @@ def summarize_prefetch_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
                 max_summary_attempted_bytes,
                 int(record.get("attempted_bytes") or 0),
             )
+        if action == "offload_step_summary":
+            max_offload_step_issued_bytes = max(
+                max_offload_step_issued_bytes,
+                int(record.get("issued_bytes") or 0),
+            )
+            max_offload_summary_attempted_bytes = max(
+                max_offload_summary_attempted_bytes,
+                int(record.get("attempted_bytes") or 0),
+            )
 
     return {
         "prefetch_trace_records": len(records),
@@ -335,13 +512,18 @@ def summarize_prefetch_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
         "prefetch_role_counts": dict(role_counts),
         "prefetch_issued_records": prefetch_issued,
         "trace_candidate_records": trace_candidates,
+        "offload_issued_records": offload_issued,
+        "trace_offload_candidate_records": trace_offload_candidates,
         "prefetch_candidate_or_issued_records": issued_records,
         "prefetch_candidate_or_issued_bytes": issued_bytes,
         "budget_reject_records": budget_rejects,
+        "offload_budget_reject_records": offload_budget_rejects,
         "prefetch_layer_count": len(layers),
         "prefetch_expert_count": len(experts),
         "max_step_issued_bytes": max_step_issued_bytes,
+        "max_offload_step_issued_bytes": max_offload_step_issued_bytes,
         "max_summary_attempted_bytes": max_summary_attempted_bytes,
+        "max_offload_summary_attempted_bytes": max_offload_summary_attempted_bytes,
     }
 
 
@@ -352,6 +534,7 @@ def validate(
     prefetch_trace: Path,
     moe_routing_jsonl: Path | None,
     weight_map_jsonl: Path | None,
+    plan_json: Path | None,
     bench_log: Path | None,
     runner_log: Path | None,
     args: argparse.Namespace,
@@ -363,11 +546,21 @@ def validate(
     weight_trace_allocs = as_int(metrics.get("weight_trace_allocations"))
     pool_registry_enabled = metrics.get("pool_registry_enabled")
     max_step_issued_bytes = as_int(trace_summary.get("max_step_issued_bytes"))
+    max_offload_step_issued_bytes = as_int(
+        trace_summary.get("max_offload_step_issued_bytes")
+    )
     prefetch_issued_records = as_int(trace_summary.get("prefetch_issued_records"))
     trace_candidate_records = as_int(trace_summary.get("trace_candidate_records"))
+    offload_issued_records = as_int(trace_summary.get("offload_issued_records"))
+    trace_offload_candidate_records = as_int(
+        trace_summary.get("trace_offload_candidate_records")
+    )
     candidate_or_issued = as_int(
         trace_summary.get("prefetch_candidate_or_issued_records")
     )
+    plan = load_json(plan_json) if plan_json and plan_json.is_file() else {}
+    prefetch_plan_records = as_int(plan.get("prefetch_plan_records"))
+    offload_plan_records = as_int(plan.get("offload_plan_records"))
 
     checks = [
         check(
@@ -404,6 +597,53 @@ def validate(
             (
                 f"max_step_issued_bytes={max_step_issued_bytes} "
                 f"budget={args.max_bytes_per_step}"
+            ),
+        ),
+        check(
+            "plan_json_present",
+            plan_json is not None and plan_json.is_file(),
+            f"plan_json={plan_json}",
+        ),
+        check(
+            "prefetch_plan_records_present",
+            prefetch_plan_records is not None and prefetch_plan_records > 0,
+            f"prefetch_plan_records={prefetch_plan_records}",
+        ),
+        check(
+            "offload_plan_records_present",
+            args.disable_offload
+            or (offload_plan_records is not None and offload_plan_records > 0),
+            f"offload_plan_records={offload_plan_records}",
+        ),
+        check(
+            "offload_action_present",
+            args.disable_offload
+            or (
+                args.offload_mode == "trace_only"
+                and trace_offload_candidate_records is not None
+                and trace_offload_candidate_records > 0
+            )
+            or (
+                args.offload_mode != "trace_only"
+                and offload_issued_records is not None
+                and offload_issued_records > 0
+            ),
+            (
+                f"offload_mode={args.offload_mode} "
+                f"offload_issued_records={offload_issued_records} "
+                f"trace_offload_candidate_records={trace_offload_candidate_records}"
+            ),
+        ),
+        check(
+            "offload_step_bytes_within_budget",
+            args.disable_offload
+            or (
+                max_offload_step_issued_bytes is not None
+                and max_offload_step_issued_bytes <= args.offload_max_bytes_per_step
+            ),
+            (
+                f"max_offload_step_issued_bytes={max_offload_step_issued_bytes} "
+                f"budget={args.offload_max_bytes_per_step}"
             ),
         ),
         check(
@@ -464,11 +704,17 @@ def validate(
         "prefetch_trace_jsonl": str(prefetch_trace),
         "moe_routing_jsonl": str(moe_routing_jsonl) if moe_routing_jsonl else None,
         "weight_map_jsonl": str(weight_map_jsonl) if weight_map_jsonl else None,
+        "plan_json": str(plan_json) if plan_json else None,
         "bench_log": str(bench_log) if bench_log else None,
         "mode": args.mode,
+        "offload_mode": args.offload_mode,
+        "offload_enabled": not args.disable_offload,
         "max_bytes_per_step": args.max_bytes_per_step,
+        "offload_max_bytes_per_step": args.offload_max_bytes_per_step,
         "max_experts_per_layer": args.max_experts_per_layer,
         "target_roles": args.target_roles,
+        "prefetch_plan_records": prefetch_plan_records,
+        "offload_plan_records": offload_plan_records,
         "failed_requests": failed_requests,
         "weight_trace_allocations": weight_trace_allocs,
         "pool_registry_enabled": pool_registry_enabled,
@@ -482,6 +728,7 @@ def print_summary(summary: dict[str, Any], output_json: Path) -> None:
     print("===========================================================")
     print(f" Stage I Success Check: {status}")
     print(f" Prefetch trace: {summary['prefetch_trace_jsonl']}")
+    print(f" Plan: {summary['plan_json']}")
     print(f" Metrics: {summary['metrics_json']}")
     print(f" Bench log: {summary['bench_log']}")
     print("===========================================================")
@@ -494,6 +741,18 @@ def print_summary(summary: dict[str, Any], output_json: Path) -> None:
         f"bytes={summary.get('prefetch_candidate_or_issued_bytes')}"
     )
     print(
+        "- offload: "
+        f"enabled={summary.get('offload_enabled')} "
+        f"mode={summary.get('offload_mode')} "
+        f"issued={summary.get('offload_issued_records')} "
+        f"trace_candidates={summary.get('trace_offload_candidate_records')}"
+    )
+    print(
+        "- plan: "
+        f"prefetch_records={summary.get('prefetch_plan_records')} "
+        f"offload_records={summary.get('offload_plan_records')}"
+    )
+    print(
         "- prefetch_scope: "
         f"layers={summary.get('prefetch_layer_count')} "
         f"experts={summary.get('prefetch_expert_count')} "
@@ -503,7 +762,10 @@ def print_summary(summary: dict[str, Any], output_json: Path) -> None:
         "- budget: "
         f"max_step_issued_bytes={summary.get('max_step_issued_bytes')} "
         f"max_bytes_per_step={summary.get('max_bytes_per_step')} "
-        f"rejects={summary.get('budget_reject_records')}"
+        f"rejects={summary.get('budget_reject_records')} "
+        f"max_offload_step_issued_bytes={summary.get('max_offload_step_issued_bytes')} "
+        f"offload_max_bytes_per_step={summary.get('offload_max_bytes_per_step')} "
+        f"offload_rejects={summary.get('offload_budget_reject_records')}"
     )
     print(f"- action_counts={summary.get('prefetch_action_counts')}")
     print(f"- failed_requests={summary.get('failed_requests')}")
@@ -519,8 +781,14 @@ def main() -> int:
         raise SystemExit("--max-bytes-per-step must be non-negative")
     if args.max_experts_per_layer < 0:
         raise SystemExit("--max-experts-per-layer must be non-negative")
+    if args.offload_max_bytes_per_step < 0:
+        raise SystemExit("--offload-max-bytes-per-step must be non-negative")
+    if args.offload_max_experts_per_layer < 0:
+        raise SystemExit("--offload-max-experts-per-layer must be non-negative")
     if args.prompts < 0:
         raise SystemExit("--prompts must be non-negative")
+    if args.plan_prompts < 0:
+        raise SystemExit("--plan-prompts must be non-negative")
 
     run_dir = Path(args.run_dir) if args.run_dir else default_run_dir()
     (
@@ -529,6 +797,7 @@ def main() -> int:
         prefetch_trace,
         moe_routing_jsonl,
         weight_map_jsonl,
+        plan_json,
         bench_log,
     ) = resolve_existing_inputs(args)
     runner_log: Path | None = None
@@ -540,6 +809,7 @@ def main() -> int:
             prefetch_trace,
             moe_routing_jsonl,
             weight_map_jsonl,
+            plan_json,
             bench_log,
             runner_log,
         ) = run_experiment(args, run_dir)
@@ -558,6 +828,7 @@ def main() -> int:
         prefetch_trace=prefetch_trace,
         moe_routing_jsonl=moe_routing_jsonl,
         weight_map_jsonl=weight_map_jsonl,
+        plan_json=plan_json,
         bench_log=bench_log,
         runner_log=runner_log,
         args=args,
